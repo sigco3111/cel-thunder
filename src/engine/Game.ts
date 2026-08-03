@@ -308,7 +308,7 @@ export class Game implements GameContext {
     // Half-rate presentation: skip the callback entirely rather than doing the
     // work and discarding it. Simulation is not skipped — dt simply covers two
     // refreshes, which the fixed-step accumulator and the interpolating netcode
-    // both already handle. Skipping before the clock is read keeps `dt` honest.
+    // both already handle. Skipping before the clock is read keeps 'dt' honest.
     if (this.presentEvery > 1) {
       this.presentPhase = (this.presentPhase + 1) % this.presentEvery;
       if (this.presentPhase !== 0) return;
@@ -627,7 +627,7 @@ function withTimeout(fn: () => void | Promise<void>, ms: number): Promise<void> 
 /**
  * The cost ladder, most expensive first.
  *
- * `present` is a vsync divisor: 2 means render on every second refresh, which
+ * 'present' is a vsync divisor: 2 means render on every second refresh, which
  * halves the per-second GPU cost while leaving every frame landing exactly on a
  * vsync boundary — so it is *perfectly* paced, not merely fast.
  *
@@ -640,7 +640,7 @@ function withTimeout(fn: () => void | Promise<void>, ms: number): Promise<void> 
  * zero pacing error by construction.
  *
  * The divisor is only offered when the display can actually take it (see
- * `refreshHz`): halving 60 Hz gives 30, which is worse than any tier drop.
+ * 'refreshHz'): halving 60 Hz gives 30, which is worse than any tier drop.
  */
 const PERF_LADDER: ReadonlyArray<{ tier: QualityTier; scale: number; present: number }> = [
   { tier: 'ultra', scale: 1.00, present: 1 },

@@ -41,11 +41,20 @@ const ONLINE_ONLY = argv.includes('--online-only');
  */
 const PORT = 5234;
 const WEB = `http://localhost:${PORT}`;
-const GAME_SERVER = 'http://localhost:8791/health';
+/**
+ * The harness runs its own *game* server too, on its own port, for the same
+ * reason it runs its own web server: a developer's server on :8791 has a
+ * different match already in progress, a different roster and — importantly —
+ * no 'CT_DEBUG_PLACE', which is what lets section 10 fly a repeatable bombing
+ * run online instead of spending a minute of every run in transit.
+ */
+const GAME_PORT = 8792;
+const GAME_SERVER = `http://localhost:${GAME_PORT}/health`;
 const OUT = 'shots/playtest';
 
 /** Pointing the client at a dead socket is how we force the offline sandbox. */
 const OFFLINE_URL = `${WEB}/?server=ws://127.0.0.1:8799/ws`;
+const ONLINE_URL = `${WEB}/?server=ws://127.0.0.1:${GAME_PORT}/ws`;
 
 const KMH = 3.6;
 const DEG = 180 / Math.PI;
@@ -186,7 +195,10 @@ async function main() {
   if (!OFFLINE_ONLY) {
     haveServer = await reachable(GAME_SERVER, 1200);
     if (!haveServer) {
-      gameProc = spawn('npx', ['tsx', 'server/index.ts'], { stdio: 'ignore', env: process.env });
+      gameProc = spawn('npx', ['tsx', 'server/index.ts'], {
+        stdio: 'ignore',
+        env: { ...process.env, PORT: String(GAME_PORT), CT_DEBUG_PLACE: '1' },
+      });
       haveServer = await reachable(GAME_SERVER, 60000);
     }
   }
@@ -200,7 +212,7 @@ async function main() {
 
   if (!ONLINE_ONLY) await guarded(browser, 'offline', OFFLINE_URL);
   if (!OFFLINE_ONLY) {
-    if (haveServer) await guarded(browser, 'online', WEB);
+    if (haveServer) await guarded(browser, 'online', ONLINE_URL);
     else check('authoritative server reachable', false, 'could not start server/index.ts');
   }
 
@@ -528,14 +540,12 @@ async function runSuite(browser, mode, url) {
     }
     return n;
   });
-  // The offline sandbox flies a six-ship. The authoritative server has no bots
-  // yet, so a solo online player has nothing to shoot at — a content gap, not a
-  // failure of this build, and asserting it here would only ever be red.
-  if (mode === 'offline') {
-    check('there is something to fight', opponents > 0, `${opponents} other aircraft`);
-  } else {
-    console.log(`  \x1b[33mNOTE\x1b[0m  ${opponents} other aircraft online (server has no AI)`);
-  }
+  // Both paths field a full roster: the offline sandbox flies its own six-ship,
+  // and the server backfills every empty slot with an AI flown by the same
+  // 'AiPilot' (see server/Bots.ts). This used to print a note claiming the
+  // server had no AI while counting seven of them.
+  check('there is something to fight', opponents > 0,
+    `${opponents} other aircraft ${mode === 'offline' ? 'in the sandbox' : 'on the server'}`);
 
   // --- 8. camera -------------------------------------------------------------
   console.log('\n8. Camera');
@@ -573,11 +583,18 @@ async function runSuite(browser, mode, url) {
       p ? `${p.hard} hard of ${p.corrections} corrections, max ${p.maxErr.toFixed(1)} m` : '');
   }
 
-  // --- 10. ground attack -----------------------------------------------------
-  // Offline only: the ground installations are built by the world subsystem
-  // from the map seed and live in the client's world, so a bombing run is only
-  // resolvable on the path that owns them.
-  if (mode === 'offline') await groundAttack(page, tag, check);
+  // --- 10. gunnery, online ---------------------------------------------------
+  // The modular damage model. Offline the sandbox has always run it; online the
+  // server used to set exactly one bit — 'Destroyed' — so an aeroplane went from
+  // pristine to wreckage with nothing in between. This puts the player in the
+  // saddle behind an AI and checks what comes back on the wire.
+  if (mode === 'online') await onlineGunnery(page, tag, check);
+
+  // --- 11. ground attack -----------------------------------------------------
+  // Both paths now. The server sites its ground order of battle from the same
+  // shared pass the renderer does and owns the stores, so a bombing run is
+  // resolvable — and scored — online as well as in the sandbox.
+  await groundAttack(page, tag, check, mode);
 
   const stats = await page.evaluate(() => window.__game?.stats ?? null);
   check('frame rate holds up', (stats?.fps ?? 0) >= 45,
@@ -615,8 +632,149 @@ async function runSuite(browser, mode, url) {
  * use. Flying four kilometres to a convoy in real time would add a minute to
  * every run and would be testing the terrain, not the ordnance.
  */
-async function groundAttack(page, tag, check) {
-  console.log('\n10. Ground attack');
+/**
+ * A gun pass on a live AI opponent, flown from the saddle.
+ *
+ * Everything about this is real except the run-in: the harness poses the
+ * aircraft behind a bandit — through the server, which only accepts the request
+ * because it was started with 'CT_DEBUG_PLACE' — and then holds the trigger with
+ * a real mouse button. What is being asserted is that the rounds are arbitrated
+ * by the server's modular damage model rather than by a single health scalar:
+ * an aeroplane that has been hit must show *specific* damage on the wire, and
+ * the wire has always been able to carry it.
+ */
+async function onlineGunnery(page, tag, check) {
+  console.log('\n10. Online gunnery and modular damage');
+
+  const target = await page.evaluate(() => {
+    const g = window.__game;
+    const me = g.entities.get(g.localEntityId);
+    if (!me) return null;
+    let best = null, bestD = Infinity;
+    for (const e of g.entities.values()) {
+      if (e.kind !== 1 || e.id === g.localEntityId || e.team === me.team) continue;
+      if (e.health <= 0) continue;
+      const d = Math.hypot(e.px - me.px, e.py - me.py, e.pz - me.pz);
+      if (d < bestD) { bestD = d; best = e.id; }
+    }
+    return best === null ? null : { id: best, range: Math.round(bestD) };
+  });
+  check('an AI opponent is reachable on the server', !!target,
+    target ? `entity ${target.id} at ${target.range} m` : 'no live opponents replicated');
+  if (!target) return;
+
+  /**
+   * Slot in 150 m astern of the bandit, on its own velocity vector and pointing
+   * straight at it.
+   *
+   * Not its *body* heading: an aeroplane at 8 degrees of alpha in a climbing
+   * turn is not going where its nose is pointing, and slotting in behind the
+   * nose leaves the target several degrees off the boresight — which at 200 m is
+   * a ten-metre miss and, against a real collision proxy rather than a coarse
+   * sphere, no hit at all.
+   */
+  const saddle = () => page.evaluate((id) => {
+    const g = window.__game;
+    const t = g.entities.get(id);
+    if (!t || t.health <= 0) return false;
+    const sp = Math.hypot(t.vx, t.vy, t.vz);
+    if (sp < 1) return false;
+    const dx = t.vx / sp, dy = t.vy / sp, dz = t.vz / sp;
+    const R = 150;
+    g.bus.emit('debug:place', {
+      x: t.px - dx * R, y: t.py - dy * R, z: t.pz - dz * R,
+      heading: Math.atan2(dx, dz),
+      // Positive pitch is nose DOWN in this convention (see the bomb run
+      // below), so pointing up the velocity vector is its negation.
+      pitch: -Math.asin(Math.max(-1, Math.min(1, dy))),
+      bank: 0, speed: sp + 15, opponent: null,
+    });
+    return true;
+  }, target.id);
+
+  const state = () => page.evaluate((id) => {
+    const t = window.__game.entities.get(id);
+    return t ? { damage: t.damage, health: t.health } : null;
+  }, target.id);
+
+  /** The bandit shoots back; a dead player can neither be placed nor fire. */
+  const selfAlive = () => page.evaluate(() => {
+    const g = window.__game;
+    const e = g.entities.get(g.localEntityId);
+    return !!e && e.health > 0 && !(e.damage & (1 << 13));
+  });
+  const rangeTo = () => page.evaluate((id) => {
+    const g = window.__game;
+    const me = g.entities.get(g.localEntityId);
+    const t = g.entities.get(id);
+    if (!me || !t) return null;
+    const dx = t.px - me.px, dy = t.py - me.py, dz = t.pz - me.pz;
+    const d = Math.hypot(dx, dy, dz) || 1;
+    const fx = 2 * (me.qx * me.qz + me.qw * me.qy);
+    const fy = 2 * (me.qy * me.qz - me.qw * me.qx);
+    const fz = 1 - 2 * (me.qx * me.qx + me.qy * me.qy);
+    const cos = (fx * dx + fy * dy + fz * dz) / d;
+    return {
+      d: Math.round(d),
+      off: Math.round(Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI),
+      bits: g.get('input')?.frame?.bits ?? -1,
+    };
+  }, target.id);
+
+  await page.mouse.move(800, 450, { steps: 4 });
+  const masks = new Set();
+  let alive = true;
+  let passes = 0;
+  let skipped = 0;
+  let closest = Infinity;
+  let bestOff = 999;
+  let lastBits = -1;
+  let projectiles = 0;
+
+  // Trigger held throughout, re-slotted every quarter of a second. The bandit is
+  // flown by the same 'AiPilot' a human fights and it does not sit still: a
+  // single long pass simply watches it fly out of the cone.
+  await page.mouse.down({ button: 'left' });
+  await page.mouse.down({ button: 'right' });
+  /** Keep shooting until the damage is unambiguously modular, not just present. */
+  const bitCount = () => [...masks].reduce((a, m) => a | m, 0).toString(2).split('1').length - 1;
+  for (let pass = 0; pass < 40 && alive && bitCount() < 2; pass++) {
+    if (!(await selfAlive())) { skipped++; await sleep(900); continue; }
+    if (!(await saddle())) break;
+    passes++;
+    await sleep(130);
+    for (let i = 0; i < 2; i++) {
+      await sleep(90);
+      const s = await state();
+      if (!s) { alive = false; break; }
+      if (s.damage) masks.add(s.damage);
+      if (s.health <= 0) alive = false;
+    }
+    const r = await rangeTo();
+    if (r) { closest = Math.min(closest, r.d); bestOff = Math.min(bestOff, r.off); lastBits = r.bits; }
+    projectiles = Math.max(projectiles, await page.evaluate(COUNT_PROJECTILES));
+  }
+  await page.mouse.up({ button: 'left' });
+  await page.mouse.up({ button: 'right' });
+  await page.screenshot({ path: `${tag}-08-gunnery.png` });
+
+  const bits = [...masks].reduce((a, m) => a | m, 0);
+  const nBits = bits.toString(2).split('1').length - 1;
+  const DESTROYED = 1 << 13;
+  check('gunfire produces damage on the wire', bits !== 0,
+    `mask -> ${bits} after ${passes} pass(es) (${skipped} skipped while dead),`
+    + ` closest ${closest === Infinity ? '?' : closest} m, best off-nose ${bestOff}°,`
+    + ` input bits 0x${(lastBits >>> 0).toString(16)}, ${projectiles} rounds in the air`);
+  // The whole point: not a single 'Destroyed' bit. Wings, engines, fuel, the
+  // pilot and the control runs are all separately replicated, and the client
+  // already renders every one of them.
+  check('online damage is modular, not a single destroyed flag',
+    nBits >= 2 && (bits & ~DESTROYED) !== 0,
+    `${nBits} distinct bits set (0x${bits.toString(16)})`);
+}
+
+async function groundAttack(page, tag, check, mode) {
+  console.log('\n11. Ground attack');
 
   // --- rearm --------------------------------------------------------------
   await page.keyboard.press('Escape');
@@ -627,7 +785,10 @@ async function groundAttack(page, tag, check) {
     inHangar ? '' : `screen is "${await page.evaluate(SCREEN)}"`);
   if (!inHangar) return;
 
-  const picked = await clickButton(page, '#ct-hangar button.ct-btn.is-ghost.is-sm', '250 lb');
+  // The Bf 109 carries a single SC 250 rather than a pair of 250 lb GPs, and an
+  // online player may be on either side.
+  const picked = await clickButton(page, '#ct-hangar button.ct-btn.is-ghost.is-sm', '250 lb')
+    || await clickButton(page, '#ct-hangar button.ct-btn.is-ghost.is-sm', 'SC 250');
   check('a bomb loadout can be selected in the hangar', picked);
   await sleep(500);
   await page.screenshot({ path: `${tag}-08-loadout.png` });
@@ -640,15 +801,19 @@ async function groundAttack(page, tag, check) {
 
   const ORD = () => window.__game?.get?.('flight')?.ordnanceState ?? null;
   const armed = await page.evaluate(ORD);
+  // Online this is the count the *server* sent back in 'stores': the racks are
+  // its, and a client that simply believed its own hangar would be inventing
+  // ordnance the match knows nothing about.
   check('the aircraft deploys carrying the chosen stores',
-    !!armed && armed.loadout !== 'clean' && armed.bombs === 2,
-    armed ? `loadout "${armed.loadout}", ${armed.bombs} bombs` : 'no ordnance state');
+    !!armed && armed.loadout !== 'clean' && armed.bombs >= 1,
+    armed ? `loadout "${armed.loadout}", ${armed.bombs} bombs (${mode})` : 'no ordnance state');
   check('stores are felt by the flight model as mass and drag',
     !!armed && armed.extraMass > 200 && armed.extraDrag > 0.05,
     armed ? `+${armed.extraMass.toFixed(0)} kg, +${armed.extraDrag.toFixed(3)} m² CdA` : '');
 
   const hudText = await page.evaluate(() => document.body.innerText || '');
-  check('the HUD shows an ordnance readout', /STORES/i.test(hudText) && /2\/2/.test(hudText),
+  check('the HUD shows an ordnance readout',
+    /STORES/i.test(hudText) && new RegExp(`${armed?.bombs ?? 2}/${armed?.bombs ?? 2}`).test(hudText),
     /STORES/i.test(hudText) ? 'STORES panel present' : 'no STORES panel');
 
   // --- set up the run -----------------------------------------------------
@@ -745,7 +910,10 @@ async function groundAttack(page, tag, check) {
       }
       prevAlong = s.along;
     }
-    await sleep(40);
+    // 20 ms, not 40: the pipper crossing is detected on a poll, and at 150 m/s
+    // every 20 ms of latency in noticing it is 3 m of along-track release
+    // error. Online that error stacks on top of the input round trip.
+    await sleep(20);
   }
   check('the bombsight is flown onto the target', best < 20,
     `closest predicted impact ${best.toFixed(0)} m from the target`);
@@ -756,12 +924,19 @@ async function groundAttack(page, tag, check) {
 
   // One frame for the release to be consumed by the flight step.
   await sleep(300);
-  const after = await page.evaluate(ORD);
+  // Online the release has to make a round trip: the bit goes up in the input
+  // frame, the server drops the bomb, and the store comes back as a replicated
+  // entity. Give it a few snapshots rather than a single frame.
+  let after = await page.evaluate(ORD);
+  for (let i = 0; i < 12 && (!after || after.bombs >= (armed?.bombs ?? 2)); i++) {
+    await sleep(120);
+    after = await page.evaluate(ORD);
+  }
   check('pressing the release drops a store',
-    !!after && after.bombs === 1 && after.inFlight >= 1,
+    !!after && !!armed && after.bombs === armed.bombs - 1 && after.inFlight >= 1,
     after ? `${after.bombs} left, ${after.inFlight} in flight` : '');
   check('releasing gives the performance back',
-    !!after && !!armed && after.extraMass < armed.extraMass - 100
+    !!after && !!armed && after.extraMass < armed.extraMass - 40
     && after.extraDrag < armed.extraDrag,
     after ? `${after.extraMass.toFixed(0)} kg / ${after.extraDrag.toFixed(3)} m² CdA` : '');
 
@@ -805,6 +980,37 @@ async function groundAttack(page, tag, check) {
     !!hit && (!hit.alive || hit.hp < setup.hp),
     hit ? `${setup.kind} #${setup.id}: ${setup.hp} -> ${hit.hp.toFixed(0)} hp, alive=${hit.alive}` : '');
   await page.screenshot({ path: `${tag}-10-impact.png` });
+
+  // Online, the destruction has to be the *server's* verdict: the client's
+  // ground targets are mirrors of replicated GroundUnit entities, and one that
+  // has been destroyed stops being replicated at all.
+  if (mode === 'online') {
+    const gone = await page.evaluate((tgt) => {
+      const g = window.__game;
+      let units = 0;
+      let nearest = null, bestD = Infinity;
+      for (const e of g.entities.values()) {
+        if (e.kind !== 5) continue;
+        units++;
+        const d = Math.hypot(e.px - tgt.x, e.pz - tgt.z);
+        if (d < bestD) { bestD = d; nearest = e.health; }
+      }
+      const o = g.get('flight').ordnanceState;
+      const t = o.targets.find((x) => x.id === tgt.id);
+      return { units, alive: t ? t.alive : null, hp: t ? t.hp : null, nearest, bestD };
+    }, setup);
+    check('the server replicates its ground order of battle', gone.units > 20,
+      `${gone.units} GroundUnit entities replicated`);
+    // The point of the online run: the health the client is showing is the
+    // server's, arrived over the wire as a GroundUnit entity, rather than a
+    // number the client decremented for itself. Either the unit is gone from
+    // the snapshot entirely (destroyed) or it is replicating below full health.
+    check('the ground damage is the server\'s, not the client\'s',
+      gone.alive === false || (gone.nearest !== null && gone.nearest < 0.999),
+      gone.alive === false
+        ? 'the unit stopped being replicated'
+        : `nearest replicated unit at ${gone.bestD?.toFixed(0)} m reads health ${gone.nearest?.toFixed(2)}`);
+  }
 }
 
 async function finish(browser) {

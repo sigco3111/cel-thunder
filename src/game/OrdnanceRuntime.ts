@@ -184,6 +184,15 @@ export class OrdnanceRuntime {
       this.authoritative = true;
       if (typeof m?.bombs === 'number') this.bombsLeft = m.bombs;
       if (typeof m?.rockets === 'number') this.rocketsLeft = m.rockets;
+      // The racks are model geometry, not just a number: mark the stations the
+      // server has emptied so the aeroplane the player is looking at loses its
+      // bombs at the moment the server drops them. Stations empty from the
+      // highest index down, which is the order 'nextSlot' releases them in.
+      for (const sl of this.slots) {
+        const left = sl.kind === 0 ? this.bombsLeft : this.rocketsLeft;
+        sl.attached = sl.index < left;
+      }
+      this.publishStores();
       this.refreshHudCounts();
     });
   }

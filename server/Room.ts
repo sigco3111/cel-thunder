@@ -673,7 +673,29 @@ export class Room {
     }
     p.inputQueue.sort((a, b) => ((a.seq - b.seq) & 0xffff) > 30000 ? 1 : -1);
     // Cap the buffer: a client that floods gets its oldest frames dropped.
-    if (p.inputQueue.length > 12) p.inputQueue.splice(0, p.inputQueue.length - 12);
+    //
+    // Four frames, not twelve. The queue is consumed one frame per tick, so its
+    // length *is* the lag between a player doing something and the server
+    // seeing it — and a client rendering above 60 fps fills it and keeps it
+    // full, which made that lag a permanent 200 ms. Measured on a real online
+    // bombing run, that put the server's release point 25 m behind the client's
+    // bombsight solution and turned a hit into a near miss. Four frames is 66 ms
+    // of jitter absorption, which is more than a WebSocket over loopback or a
+    // healthy connection ever needs.
+    if (p.inputQueue.length > 4) {
+      const dropped = p.inputQueue.splice(0, p.inputQueue.length - 4);
+      // ...but a one-shot action lives in exactly one frame, and throwing that
+      // frame away throws the action away with it. This is not an edge case: a
+      // client rendering at 120 Hz produces two input frames per 60 Hz server
+      // tick, the queue is consumed one frame per tick, so the trim runs
+      // continuously and discards every other frame. A bomb release therefore
+      // reached the server about half the time — which is exactly how it
+      // presented, as an intermittently dead pickle button. Carry the latching
+      // bits forward onto the oldest surviving frame instead.
+      let latched = 0;
+      for (let i = 0; i < dropped.length; i++) latched |= dropped[i].bits & LATCHED_BITS;
+      if (latched && p.inputQueue.length) p.inputQueue[0].bits |= latched;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1866,6 +1888,15 @@ const _poseQ = q();
  * alone, so these are latched per entity and OR-ed back in afterwards.
  */
 const FLIGHT_OWNED_BITS = DamageBits.GearBroken | DamageBits.Aileron;
+
+/**
+ * Input bits that represent a discrete action rather than a held control, and
+ * so must survive the jitter buffer being trimmed. Everything else is a state
+ * the next frame will restate anyway.
+ */
+const LATCHED_BITS = InputBits.DropBomb | InputBits.FireRocket
+  | InputBits.GearToggle | InputBits.FlapsUp | InputBits.FlapsDown
+  | InputBits.Radiator | InputBits.Bail;
 
 /** Reused input record for the per-tick damage evolution. */
 const _dmgStep = {

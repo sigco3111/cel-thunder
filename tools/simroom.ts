@@ -9,7 +9,13 @@
  * three minutes per experiment.
  *
  * Usage:  npx tsx tools/simroom.ts [--minutes 3] [--roster 4] [--seed 1337]
- *                                  [--no-ground] [--json]
+ *                                  [--diag] [--no-ground] [--json]
+ *
+ * '--diag' additionally samples every pilot once a second and histograms what
+ * it believes it is doing — mode, range to its target and how far off the nose
+ * that target is. That is what separates "the bots cannot shoot" from "the bots
+ * never get close enough to shoot", and the two want completely different
+ * fixes.
  */
 import { Room } from '../server/Room';
 import { makeEnv, makeGroundWar, makeGroundUnits } from '../server/world';

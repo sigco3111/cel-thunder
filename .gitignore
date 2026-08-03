@@ -6,3 +6,6 @@ shots/
 !shots/.gitkeep
 tools/_scratch/
 *.log
+
+# stray agent scratch files
+.onlineprobe.mjs
