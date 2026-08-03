@@ -1102,9 +1102,16 @@ function buildPine(): THREE.BufferGeometry {
     [-1.7, 9.9, 1.2, 2.0, 0.42],
     [0.3, 12.1, 0.4, 1.7, 0.50],
   ];
+  // A Scots pine's crown is carried on two or three long limbs that leave the
+  // bole almost horizontally near the top — the shape that makes a pine
+  // unmistakable in silhouette against a sky, and the reason the negative space
+  // under this species is worth having at all.
+  limb(b, 0, 8.6, 0, 2.0, 9.9, -0.9, 0.30, 0.13, 0x342715, 1.0);
+  limb(b, 0, 9.0, 0, -1.8, 10.0, 1.2, 0.28, 0.12, 0x342715, 1.0);
+  limb(b, 0, 9.4, 0, 0.3, 11.9, 0.4, 0.26, 0.11, 0x342715, 1.0);
   for (let i = 0; i < blobs.length; i++) {
     const [x, y, z, r, flat] = blobs[i];
-    blob(b, x, y, z, r, flat, 0x53793f, 0.98 + i * 0.05);
+    blob(b, x, y, z, r, flat, 0x426231, 0.98 + i * 0.05);
   }
   return b.build();
 }
@@ -1126,12 +1133,20 @@ function buildOak(): THREE.BufferGeometry {
     [-0.6, 8.9, 1.5, 1.85, 0.82],
     [2.1, 8.3, -1.4, 1.60, 0.88],
   ];
+  // The fork. An oak's bole divides at about a third of the tree's height into
+  // three or four heavy limbs, and each limb carries one of the crown lobes —
+  // so these are aimed at the lobe centres above rather than scattered. This is
+  // what turns "five spheres above a stick" into a tree.
+  for (const [x, y, z] of blobs.slice(1)) {
+    limb(b, 0, 4.6, 0, x * 0.86, y - 0.9, z * 0.86, 0.40, 0.17, 0x30251a, 1.0);
+  }
+  limb(b, 0, 4.6, 0, 0.2, 7.2, -0.2, 0.44, 0.20, 0x30251a, 1.0);
   for (let i = 0; i < blobs.length; i++) {
     const [x, y, z, r, fl] = blobs[i];
     // Narrow albedo spread. 0.82-1.08 across lobes stacks on top of a
     // three-band cel ramp, and the two together put a near-white facet next to
     // a near-black one inside a ten-pixel tree.
-    blob(b, x, y, z, r, fl, 0x5a8640, 0.97 + i * 0.04);
+    blob(b, x, y, z, r, fl, 0x476f2f, 0.97 + i * 0.04);
   }
   return b.build();
 }
@@ -1161,7 +1176,7 @@ function buildPoplar(): THREE.BufferGeometry {
   ];
   for (let i = 0; i < blobs.length; i++) {
     const [x, y, z, r, tall] = blobs[i];
-    blob(b, x, y, z, r, tall, 0x628f46, 0.98 + i * 0.05);
+    blob(b, x, y, z, r, tall, 0x4e7636, 0.98 + i * 0.05);
   }
   return b.build();
 }
@@ -1206,9 +1221,15 @@ function blob(
   // flat plateau of colour. Ramping the vertex colour with height inside each
   // lobe puts the form back into the albedo, where the ramp cannot flatten it,
   // and it survives all the way down to a ten-pixel impostor.
+  // 0.70 + 0.48 -> 0.62 + 0.34. The ceiling matters more than the floor: the
+  // sun lands on a canopy through a three-band toon ramp whose top plateau is
+  // 1.0, and at key level 3 an albedo already scaled up by 1.18 clips. Clipped
+  // facets are how a crown ends up as a cluster of near-white shards ringed in
+  // black ink, which is the "crumpled paper" note. Lowering the ceiling below
+  // unity puts the crown back inside the range the ramp can shade.
   const yTone = (y: number): number => {
     const f = (y - (cy - r * stretch)) / Math.max(0.001, 2 * r * stretch);
-    return mul * (0.70 + 0.48 * clamp01(f));
+    return mul * (0.62 + 0.34 * clamp01(f));
   };
   // Rings at t = 1 .. T-1 only; the poles are apexes, not rings.
   const rings: number[][][] = [];
@@ -1217,7 +1238,15 @@ function blob(
     const phi = (t / T) * Math.PI;
     for (let s = 0; s < S; s++) {
       const th = (s / S) * Math.PI * 2 + t * 0.37;
-      const j = 0.80 + tHash(cx + s * 3.1 + t * 7.7, cz + t * 2.3 + r) * 0.42;
+      // 0.80..1.22 -> 0.90..1.12. The radial jitter is what gives the crown an
+      // irregular silhouette, but it also sets how far apart two neighbouring
+      // facet normals are — and the screen-space edge pass draws a crease
+      // wherever they differ, so a strongly jittered lobe forty pixels across
+      // comes back as a wireframe of every quad in it. Halving the jitter keeps
+      // the outline irregular (the silhouette is a chain of many facets, so it
+      // accumulates) while the interior creases fall below the pass's normal
+      // threshold and the crown reads as one mass again.
+      const j = 0.90 + tHash(cx + s * 3.1 + t * 7.7, cz + t * 2.3 + r) * 0.22;
       row.push([
         cx + Math.sin(phi) * Math.cos(th) * r * j,
         cy + Math.cos(phi) * r * j * stretch,
@@ -1239,7 +1268,7 @@ function blob(
       const a = rings[t][s], bb = rings[t][s1], c = rings[t + 1][s1], d = rings[t + 1][s];
       // A little azimuthal jitter on top of the vertical ramp, so a crown is
       // dappled rather than banded.
-      const dap = 0.94 + tHash(cx + s * 5.7, cz + t * 9.1 + r) * 0.14;
+      const dap = 0.96 + tHash(cx + s * 5.7, cz + t * 9.1 + r) * 0.09;
       b.color(base).shade(yTone((a[1] + c[1]) * 0.5) * dap);
       // CCW from outside: upper-s, upper-s1, lower-s1, lower-s.
       b.quad(a[0], a[1], a[2], bb[0], bb[1], bb[2], c[0], c[1], c[2], d[0], d[1], d[2]);
@@ -1269,20 +1298,103 @@ function blob(
 function bole(
   b: MeshBuilder, h: number, rBottom: number, rTop: number, base: number, sides = 5,
 ): void {
+  // Four stations up the bole rather than two, and the profile between them is
+  // not a straight line.
+  //
+  // A trunk drawn as a single linear taper is a cone, and a cone reads as a
+  // lathe-turned stick — "straight untapered cylinder trunks with no bark and
+  // no root flare" has been the note on this asset for five rounds. Three
+  // things make a real bole read, and all three are free here:
+  //
+  //   ROOT FLARE — the buttress where the trunk meets the ground. It is the
+  //     single strongest cue, because it is the part a viewer at ground level
+  //     is closest to, and because it is what visually PLANTS the tree instead
+  //     of leaving it standing on the terrain like a pin in a map.
+  //   CONVEX TAPER — real boles lose most of their diameter in the first third
+  //     and then run nearly parallel. A linear taper loses it evenly, which is
+  //     what makes a cone.
+  //   PER-STATION SWAY — a couple of degrees of lean, alternating, so no trunk
+  //     in the stand is a plumb line.
+  const STA = [0.0, 0.055, 0.34, 1.0];
+  const rAt = (t: number): number => {
+    // Flare below the first station, then a 0.55-power taper: two thirds of the
+    // diameter is gone by a third of the height.
+    if (t <= STA[1]) return rBottom * (1.62 - 0.62 * (t / STA[1]));
+    const u = (t - STA[1]) / (1 - STA[1]);
+    return rBottom + (rTop - rBottom) * Math.pow(u, 0.55);
+  };
+  const lean = (t: number, k: number): number =>
+    Math.sin(t * 2.1 + k) * rBottom * 0.42 * t * t;
+  for (let seg = 0; seg < STA.length - 1; seg++) {
+    const t0 = STA[seg], t1 = STA[seg + 1];
+    const y0 = t0 * h, y1 = t1 * h;
+    const r0 = rAt(t0), r1 = rAt(t1);
+    const ox0 = lean(t0, 0.7), oz0 = lean(t0, 2.4);
+    const ox1 = lean(t1, 0.7), oz1 = lean(t1, 2.4);
+    for (let i = 0; i < sides; i++) {
+      const a0 = (i / sides) * Math.PI * 2;
+      const a1 = ((i + 1) / sides) * Math.PI * 2;
+      const c0 = Math.cos(a0), s0 = Math.sin(a0);
+      const c1 = Math.cos(a1), s1 = Math.sin(a1);
+      // Per-stave, per-segment tone. A five-sided bole with one flat colour is
+      // a pole; varying it between staves AND up the trunk reads as bark
+      // without a texture, and the flare picks up the darkest values because
+      // that is where the moss and the shadow of the litter layer are.
+      b.color(base).shade((0.72 + 0.16 * t0) * (1 + ((i * 7) % 5) * 0.062));
+      b.quad(
+        ox0 + c0 * r0, y0, oz0 + s0 * r0,
+        ox1 + c0 * r1, y1, oz1 + s0 * r1,
+        ox1 + c1 * r1, y1, oz1 + s1 * r1,
+        ox0 + c1 * r0, y0, oz0 + s1 * r0,
+      );
+    }
+  }
+}
+
+/**
+ * A tapered limb between two points — the branch fork the tree asset has never
+ * had.
+ *
+ * Two or three of these running from the top of the bole out into the crown
+ * cost about sixty triangles and do something no amount of work on the canopy
+ * lobes can: they connect the trunk to the foliage. Without them the crown is a
+ * cluster of spheres hovering above a stick, which is precisely why the note
+ * reads "floating polygon shards" — the shards are not floating because of a
+ * geometry bug, they are floating because there is nothing holding them up.
+ */
+function limb(
+  b: MeshBuilder,
+  x0: number, y0: number, z0: number,
+  x1: number, y1: number, z1: number,
+  r0: number, r1: number, base: number, mul = 1.0, sides = 4,
+): void {
+  const dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  const ax = dx / len, ay = dy / len, az = dz / len;
+  // Any vector not parallel to the axis will do for the first tangent.
+  let ux = 0, uy = 1, uz = 0;
+  if (Math.abs(ay) > 0.9) { ux = 1; uy = 0; }
+  // t = normalize(u x a), n = a x t
+  let tx = uy * az - uz * ay, ty = uz * ax - ux * az, tz = ux * ay - uy * ax;
+  const tl = Math.hypot(tx, ty, tz) || 1;
+  tx /= tl; ty /= tl; tz /= tl;
+  const nx = ay * tz - az * ty, ny = az * tx - ax * tz, nz = ax * ty - ay * tx;
   for (let i = 0; i < sides; i++) {
     const a0 = (i / sides) * Math.PI * 2;
     const a1 = ((i + 1) / sides) * Math.PI * 2;
     const c0 = Math.cos(a0), s0 = Math.sin(a0);
     const c1 = Math.cos(a1), s1 = Math.sin(a1);
-    // Per-stave tone. A five-sided bole with one flat colour is a pole; a
-    // little variation between staves reads as bark without a texture.
-    b.color(base).shade(0.82 + ((i * 7) % 5) * 0.052);
-    b.quad(
-      c0 * rBottom, 0, s0 * rBottom,
-      c0 * rTop, h, s0 * rTop,
-      c1 * rTop, h, s1 * rTop,
-      c1 * rBottom, 0, s1 * rBottom,
-    );
+    const p = (
+      bx: number, by: number, bz: number, r: number, c: number, s: number,
+    ): [number, number, number] => [
+      bx + (tx * c + nx * s) * r,
+      by + (ty * c + ny * s) * r,
+      bz + (tz * c + nz * s) * r,
+    ];
+    const A = p(x0, y0, z0, r0, c0, s0), B = p(x1, y1, z1, r1, c0, s0);
+    const C = p(x1, y1, z1, r1, c1, s1), D = p(x0, y0, z0, r0, c1, s1);
+    b.color(base).shade(mul * (0.74 + ((i * 5) % 4) * 0.07));
+    b.quad(A[0], A[1], A[2], B[0], B[1], B[2], C[0], C[1], C[2], D[0], D[1], D[2]);
   }
 }
 

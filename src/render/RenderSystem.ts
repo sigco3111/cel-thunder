@@ -4,7 +4,7 @@ import {
   LAYER_COCKPIT, LAYER_DEFAULT, LAYER_INK, celGlobals, updateCelGlobals,
 } from './CelMaterial';
 import {
-  disposeRT, makeRT, updateFrameInfo, type FrameInfo,
+  disposeRT, makeRT, prewarmPass, updateFrameInfo, type FrameInfo,
 } from './passes/PassCore';
 import { DepthNormalPass } from './passes/DepthNormalPass';
 import { InkPass } from './passes/InkPass';
@@ -268,6 +268,7 @@ export class RenderSystem implements Subsystem {
     this.bloom.setThreshold(1.6, 0.35);
 
     this.shadowRig.init(ctx);
+    this.prewarmQualityVariants(ctx);
     this.applyQuality(ctx, true);
 
     ctx.bus.on('quality', () => { this.currentQuality = null; });
@@ -342,6 +343,44 @@ export class RenderSystem implements Subsystem {
   // -------------------------------------------------------------------------
   // Quality
   // -------------------------------------------------------------------------
+
+  /**
+   * Compiles every quality variant of every tier-dependent pass, at boot.
+   *
+   * Four of the passes specialise on '#define's that change with the quality
+   * tier (ink taps, AO directions and steps, DOF taps, motion-blur taps), so
+   * each tier the adaptive governor moved to linked fresh programs the instant
+   * it arrived — a stall, caused by the very mechanism that exists to remove
+   * stalls, and one that lands in the middle of whatever was already going
+   * badly enough to trigger it.
+   *
+   * Warming all of them here is what lets the performance ladder in 'Game'
+   * prefer tier changes over internal-resolution changes: a tier change is now
+   * a cache hit, whereas a resolution change has to reallocate a dozen
+   * half-float render targets and genuinely costs ~50 ms.
+   */
+  private prewarmQualityVariants(ctx: GameContext): void {
+    const tiers: QualityTier[] = ['low', 'medium', 'high', 'ultra'];
+    for (const t of tiers) {
+      this.ink.setQuality(t);
+      this.ao.setQuality(t);
+      this.dof.setQuality(t);
+      this.motionBlur.setQuality(t);
+      prewarmPass(this.renderer, this.ink.material);
+      prewarmPass(this.renderer, this.motionBlur.material);
+      this.ao.prewarm(this.renderer);
+      this.dof.prewarm(this.renderer);
+    }
+    // The tier-invariant passes only ever have one program each, but the first
+    // frame is a bad time to link them too.
+    prewarmPass(this.renderer, this.grade.material);
+    prewarmPass(this.renderer, this.fxaa.material);
+    // Leave the passes describing the tier we are actually about to run.
+    this.ink.setQuality(ctx.quality);
+    this.ao.setQuality(ctx.quality);
+    this.dof.setQuality(ctx.quality);
+    this.motionBlur.setQuality(ctx.quality);
+  }
 
   private applyQuality(ctx: GameContext, force = false): void {
     if (!force && ctx.quality === this.currentQuality) return;

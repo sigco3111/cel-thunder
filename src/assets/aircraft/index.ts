@@ -33,6 +33,9 @@ export {
 
 export type { AircraftModel, DamageParts, BuildOptions } from './build';
 
+export { buildStores, storeName, storePrefix, STORE_PREFIX } from './ordnance';
+export type { StorePiece } from './ordnance';
+
 export { FuselageProfile } from './fuselage';
 export { WingPlan } from './wing';
 export { naca, foilContour, foilsFor } from './naca';

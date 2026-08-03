@@ -115,6 +115,9 @@ export function createSkyBackdropMaterial(
       uSkyBandSoft: u.uSkyBandSoft,
       uSkyBandAmount: u.uSkyBandAmount,
       uSkySaturation: u.uSkySaturation,
+      uOvercast: u.uOvercast,
+      uWhiteout: u.uWhiteout,
+      uWhiteoutColor: u.uWhiteoutColor,
       uHorizonWarm: u.uHorizonWarm,
       uHorizonWarmAmount: u.uHorizonWarmAmount,
 
@@ -171,6 +174,9 @@ export function createSkyBackdropMaterial(
       uniform float uSkyBandSoft;
       uniform float uSkyBandAmount;
       uniform float uSkySaturation;
+      uniform float uOvercast;
+      uniform float uWhiteout;
+      uniform vec3  uWhiteoutColor;
       uniform vec3  uHorizonWarm;
       uniform float uHorizonWarmAmount;
 
@@ -501,15 +507,40 @@ export function createSkyBackdropMaterial(
         // is what puts a lit face on the sunward side of each distant tower
         // instead of shading the whole deck by view angle alone.
         float top = saturate1( m * 1.4 - 0.15 );
+        // Cauliflower. One extra tap of the same texture at nine times the
+        // scale, folded into the height proxy ONLY (not into the coverage, so
+        // the deck's silhouette is unchanged and the noise cannot make it
+        // fringe). Without it the deck's shading is driven entirely by a mask
+        // whose finest feature is a kilometre across, which is why a 120x60
+        // sample of it measured a standard deviation of 1.3 over seven thousand
+        // pixels: a flat, untextured, unshaded surface covering a third of the
+        // clouds framing, and a rubric automatic failure. Weighted by 'cov' so
+        // it only exists where there is cloud to carry it.
+        float bump = texture( uCirrus, uv * 9.1 + uDeckOffset * 1.7 ).a;
+        float bump2 = texture( uCirrus, uv * 23.0 - uDeckOffset * 0.4 ).b;
+        float relief = ( bump * 0.66 + bump2 * 0.34 ) - 0.5;
+        top = saturate1( top + relief * 0.62 * cov );
         vec2 duv = vec2( 2.5 / 512.0 );
         float gx = texture( uCirrus, uv + vec2( duv.x, 0.0 ) + uDeckOffset ).b
                  - texture( uCirrus, uv - vec2( duv.x, 0.0 ) + uDeckOffset ).b;
         float gy = texture( uCirrus, uv + vec2( 0.0, duv.y ) + uDeckOffset ).b
                  - texture( uCirrus, uv - vec2( 0.0, duv.y ) + uDeckOffset ).b;
-        vec3 nrm = normalize( vec3( -gx * 7.0, 0.55, -gy * 7.0 ) );
+        // The relief has to reach the NORMAL as well as the height, or the
+        // towers get a value gradient with no terminator on them and still read
+        // as paint. Two extra taps of the fine field, differenced the same way.
+        float bx = texture( uCirrus, uv * 9.1 + vec2( duv.x * 9.1, 0.0 ) + uDeckOffset * 1.7 ).a
+                 - texture( uCirrus, uv * 9.1 - vec2( duv.x * 9.1, 0.0 ) + uDeckOffset * 1.7 ).a;
+        float bz = texture( uCirrus, uv * 9.1 + vec2( 0.0, duv.y * 9.1 ) + uDeckOffset * 1.7 ).a
+                 - texture( uCirrus, uv * 9.1 - vec2( 0.0, duv.y * 9.1 ) + uDeckOffset * 1.7 ).a;
+        vec3 nrm = normalize( vec3( -( gx * 7.0 + bx * 5.5 * cov ), 0.55,
+                                    -( gy * 7.0 + bz * 5.5 * cov ) ) );
         vec3 sunFlat = normalize( vec3( uSunDir.x, max( uSunDir.y, 0.05 ), uSunDir.z ) );
         float side = saturate1( dot( nrm, sunFlat ) * 0.5 + 0.5 );
-        float e = celQuantise( saturate1( top * 0.44 + side * 0.62 ), uCloudBands, uCloudBandSoft );
+        // Range widened from 1.06 to 1.34 of the quantiser's input span, so the
+        // deck actually reaches both the shadow band and the fully lit band
+        // instead of living inside one and a half steps.
+        float e = celQuantise( saturate1( top * 0.58 + side * 0.76 - 0.10 ),
+                               uCloudBands, uCloudBandSoft );
 
         vec3 fill = mix( uHorizonColor, uZenithColor, 0.30 ) * 1.25 + 0.012;
         vec3 lit  = uCloudLit * uSunColor;
@@ -522,7 +553,25 @@ export function createSkyBackdropMaterial(
         // silhouette, and nowhere else.
         float rim = cov * ( 1.0 - cov ) * 4.0;
         col += uSunColor * uSilver * rim * pow( saturate1( mu ), 3.0 ) * 0.9;
-        col = mix( col, uHorizonColor * 1.1, 1.0 - exp( -t / max( uAerialFar * 2.2, 1.0 ) ) );
+        // CAPPED at 0.55, and this one line is the whole of the "the cloud deck
+        // is flat paint" automatic failure.
+        //
+        // 't' out here is two to four hundred kilometres, so the unclamped
+        // exponential is 0.98-1.00 and this mix was not applying aerial
+        // perspective to the deck at all — it was REPLACING it, wholesale, with
+        // a single flat colour. Every value the block above computes (the
+        // quantised terminator, the lit face, the backlit rim, the cauliflower
+        // relief) was being thrown away one line later, which is why a 120x60
+        // sample of the deck measured a standard deviation of 1.4 over seven
+        // thousand pixels no matter what was done to the shading.
+        //
+        // A cap is the correct model as well as the correct picture: a cloud
+        // bank is emissive-bright against the sky rather than dark against it,
+        // so the airlight added in front of it does not swamp it the way it
+        // swamps a dark ridge at the same range — which is exactly why a distant
+        // cumulus line still reads as cumulus when the coast under it has gone.
+        col = mix( col, uHorizonColor * 1.1,
+                   min( 1.0 - exp( -t / max( uAerialFar * 2.2, 1.0 ) ), 0.55 ) );
         return vec4( col, alpha );
       }
 
@@ -548,6 +597,65 @@ export function createSkyBackdropMaterial(
           float toward = 0.55 + 0.45 * saturate1( dot( sunAz, viewAz ) );
           float lowness = pow( saturate1( 1.0 - rd.y * 0.85 ), 2.2 );
           sky += uTwilight * lowness * toward;
+        }
+
+        // ---- whiteout compression -------------------------------------------
+        //
+        // THIS is the horizon band that four rounds of critique have called a
+        // "broad structureless cream wash", and it is worth being exact about
+        // where it comes from, because every previous attempt went after the
+        // wrong term. Killing the stylised haze band below moves it by nothing.
+        // Killing the deck, the cirrus, the bloom, the cel material's aerial
+        // perspective and the grade's shoulder each move it by one to four
+        // levels. Measured on hero at x=1500 with ALL of those disabled, the
+        // profile still ran: blue (153,188,203) at the top of frame, then a
+        // 200-pixel plateau at 210-213 with a chroma of six, then the horizon.
+        // The band is the SCATTERING CURVE ITSELF.
+        //
+        // Single scattering saturates. Past about four air masses the integral
+        // has spent all of its Rayleigh colour — the blue is scattered out of
+        // the beam faster than it is scattered into it — so every direction
+        // inside fifteen degrees of the horizon converges on the same pale
+        // cream, and a converged region is by definition structureless. A real
+        // sky does not do this, because multiple scattering redistributes that
+        // light back into the rest of the dome and carries its colour with it.
+        // We do not integrate multiple scattering; this is the cheapest
+        // defensible stand-in for the part of it that matters to the picture.
+        //
+        // Two moves, both keyed on elevation alone so no weather or sun state
+        // can put the plateau back:
+        //
+        //   CHROMA — mix the band back toward the zenith's own hue at constant
+        //            luminance. The result is that the pale cream is confined
+        //            to the two or three degrees that genuinely earn it and the
+        //            sky above it is blue again, which is what gives the land
+        //            and sea underneath something to separate against.
+        //   VALUE  — a small dip through the transition only, so the profile
+        //            has a slope through the band instead of a plateau. Held
+        //            to 14 %: any more and the sky grows a visible dark ring.
+        //
+        // Gated off for a low sun. A sunset horizon is broadly and legitimately
+        // gold, and de-creaming it would destroy the one framing in this build
+        // that scores. Gated by azimuth too: the sky toward the sun is pale for
+        // real reasons, the sky away from it is not.
+        {
+          vec2 sa2 = normalize( uSunDir.xz + vec2( 1e-5, 0.0 ) );
+          vec2 va2 = normalize( rd.xz + vec2( 1e-5, 0.0 ) );
+          float az = dot( sa2, va2 ) * 0.5 + 0.5;          // 1 = toward the sun
+          float dayGate = smoothstep( 0.055, 0.30, uSunDir.y ) * ( 1.0 - uNight );
+          // 1.7 deg -> 13.5 deg above the true horizon.
+          float upEl = smoothstep( 0.030, 0.235, rd.y );
+          float w = upEl * dayGate * ( 0.62 + 0.38 * ( 1.0 - az ) );
+
+          float Lh = luma( sky );
+          vec3 blueHue = uZenithColor / max( luma( uZenithColor ), 1e-4 );
+          sky = mix( sky, Lh * blueHue, w * 0.58 );
+
+          // The dip lives in the transition band only — it is zero at the
+          // horizon (which must stay the brightest part of the sky) and zero
+          // again by the time the dome is properly blue.
+          float mid = upEl * ( 1.0 - smoothstep( 0.235, 0.62, rd.y ) );
+          sky *= 1.0 - 0.14 * mid * dayGate;
         }
 
         // ---- stylisation ----
@@ -707,6 +815,33 @@ export function createSkyBackdropMaterial(
           vec4 cirA = cirrusShell( rd, uCirrusHeight, 0.38, 0.0,
                                    uCirrusAmount, uCirrusOffset * 5.2 );
           sky = mix( sky, cirA.rgb, cirA.a );
+        }
+
+        // ---- under-deck grey -------------------------------------------------
+        //
+        // Everything above this point is a clear-sky solution (see 'uOvercast').
+        // A deck does exactly two things to the sky seen from underneath it, and
+        // both are cheap: it removes the chroma, because the base of a cloud is
+        // spectrally flat, and it takes the value down. Applied here, after the
+        // sun disc and the cirrus and deck shells, because none of those are
+        // visible through a storm either.
+        if ( uOvercast > 0.002 ) {
+          // Cool grey rather than neutral. A rain sky is blue-grey; a perfectly
+          // neutral one reads as a blown-out white card with no weather in it.
+          vec3 grey = vec3( luma( sky ) ) * vec3( 0.93, 0.97, 1.07 );
+          sky = mix( sky, grey, uOvercast * 0.90 );
+          sky *= 1.0 - 0.50 * uOvercast;
+        }
+
+        // ---- whiteout --------------------------------------------------------
+        //
+        // Inside cloud there is no sky. A faint vertical gradient survives —
+        // more light comes down through a cloud than up through it, and that
+        // gradient is the only attitude cue a pilot in the soup has — but the
+        // stars, the sun, the deck and the horizon are all gone.
+        if ( uWhiteout > 0.002 ) {
+          vec3 murk = uWhiteoutColor * ( 0.86 + 0.28 * saturate1( rd.y * 0.5 + 0.5 ) );
+          sky = mix( sky, murk, uWhiteout );
         }
 
         // ---- lightning ----

@@ -95,7 +95,8 @@ export class UiSystem implements Subsystem {
   private synth: EntityState = newEntityState();
   private synthActive = false;
   private unsubs: (() => void)[] = [];
-  private respawnSeconds = 8;
+  /** Must match 'OfflineSandbox.RESPAWN_DELAY' / the server's match rules. */
+  private respawnSeconds = 5;
 
   // -------------------------------------------------------------------------
   // Boot
@@ -224,7 +225,7 @@ export class UiSystem implements Subsystem {
       savePrefs(this.prefs);
       this.menu.setInfo('aircraft', spec.name);
     };
-    this.hangar.onDeploy = (spec, livery) => this.deploy(spec, livery);
+    this.hangar.onDeploy = (spec, livery, loadout) => this.deploy(spec, livery, loadout);
 
     this.pause.onSelect = (id) => {
       if (id === 'resume') { sfx('ui:back'); this.closePause(); }
@@ -240,7 +241,7 @@ export class UiSystem implements Subsystem {
       if (!this.death.canRespawn) { sfx('ui:error'); return; }
       sfx('ui:confirm');
       this.death.hide();
-      this.deploy(this.spec ?? this.hangar.current, this.prefs.livery);
+      this.deploy(this.spec ?? this.hangar.current, this.prefs.livery, this.hangar.currentLoadout);
     };
     this.death.onHangar = () => { this.death.hide(); this.setScreen('hangar'); };
     this.matchEnd.onContinue = () => { this.matchEnd.hide(); this.setScreen('hangar'); };
@@ -281,12 +282,12 @@ export class UiSystem implements Subsystem {
     on('net:kill', (m) => {
       this.hud.killLine(m.killer, m.victim, m.weapon, m.killerTeam, m.victimTeam,
         this.ctx.localTeam, this.prefs.playerName);
-      if (m.killer === this.prefs.playerName) {
+      if (isLocalName(m.killer, this.prefs.playerName)) {
         this.hud.popups.push('AIRCRAFT DESTROYED', 100, true);
         this.hud.center.hit('kill');
         sfx('kill:confirm');
       }
-      if (m.victim === this.prefs.playerName) this.onDeath(m.killer, m.weapon);
+      if (isLocalName(m.victim, this.prefs.playerName)) this.onDeath(m.killer, m.weapon);
     });
     on('net:chat', (m) => this.hud.chat.push(m.from, m.text, m.team, this.ctx.localTeam));
     on('net:spawned', (m) => this.onSpawned(m));
@@ -304,6 +305,10 @@ export class UiSystem implements Subsystem {
 
     // --- optional producer channels --------------------------------------
     on('hud:telemetry', (p) => this.setTelemetry(p));
+    // Stores readout + bombsight solution, produced by FlightSystem's ordnance
+    // runtime. Pushed rather than polled: the impact prediction is a real
+    // ballistic integration and runs on its own schedule.
+    on('hud:ordnance', (p) => this.hud.setOrdnance(p ?? null));
     on('hud:lead', (p) => this.setLead(p.x, p.y, p.visible ?? true, p.range ?? 0, p.onTarget ?? false, p.tof ?? 0));
     on('hud:hit', (p) => this.hitMarker(p?.kind ?? 'hit'));
     on('hud:input', (p) => { this.inputBits = p?.bits ?? 0; });
@@ -523,7 +528,7 @@ export class UiSystem implements Subsystem {
     if (s !== 'flight') this.closePause();
   }
 
-  private deploy(spec: AircraftSpec, livery: number): void {
+  private deploy(spec: AircraftSpec, livery: number, loadout = 'clean'): void {
     sfx('ui:confirm');
     this.spec = spec;
     this.prefs.lastAircraft = spec.id;
@@ -533,8 +538,10 @@ export class UiSystem implements Subsystem {
     this.telemetry.refill();
     this.death.hide();
     this.setScreen('flight');
-    this.ctx.bus.emit('ui:spawn', { aircraft: spec.id, livery, typeId: aircraftIndex(spec.id) });
-    this.net?.requestSpawn(spec.id);
+    this.ctx.bus.emit('ui:spawn', {
+      aircraft: spec.id, livery, loadout, typeId: aircraftIndex(spec.id),
+    });
+    this.net?.requestSpawn(spec.id, loadout);
     this.hud.notices.show('deploy', `${spec.name} — cleared for take-off`, '', 3);
   }
 
@@ -550,6 +557,17 @@ export class UiSystem implements Subsystem {
     if (!this.ctx.localEntityId && m?.entityId) this.ctx.localEntityId = m.entityId;
     this.death.hide();
     this.setScreen('flight');
+    // Explicitly, and NOT via 'setScreen'. The death screen is an overlay, not
+    // a screen, so on respawn 'this.screen' is already 'flight' and setScreen
+    // short-circuits before it re-emits the modal state — leaving 'ui:modal'
+    // latched true from 'onDeath', which suspends the input subsystem. The
+    // aeroplane then respawns with the controls dead and the player cannot fly
+    // it again for the rest of the session.
+    //
+    // The bug is older than the death screen ever firing: offline, the killfeed
+    // name never matched the local player, so 'onDeath' was unreachable and
+    // this could not be hit. Making death work is what surfaced it.
+    this.ctx.bus.emit('ui:modal', this.isModal());
     this.wasAlive = true;
     this.lastDamage = 0;
   }
@@ -680,9 +698,14 @@ export class UiSystem implements Subsystem {
       case EventKind.HitArmour:
         if (e.a === localId) {
           this.damageFrom(e.x, e.y, e.z);
-        } else if (this.directHitT <= 0 && this.target && e.a === this.target.id) {
-          // No explicit hit report from the combat system: infer one when the
-          // impact lands on the contact we are currently tracking.
+        } else if (this.directHitT <= 0 && e.b === localId) {
+          // Gate on "I fired the round", not on "I have this contact locked".
+          // The event already carries the shooter, so the lock was never
+          // needed — and gating on it meant that every hit on anything the
+          // player had not explicitly targeted produced the hit *sound* (which
+          // is not gated) with no marker to go with it. Landing shots on an
+          // untracked bandit is the single most common thing that happens in a
+          // furball, and it was the case with the weakest feedback.
           this.hud.center.hit(e.kind === EventKind.HitArmour ? 'armour' : 'hit');
           sfx('hit:marker');
           this.hud.popups.push('HIT', 10);
@@ -947,6 +970,21 @@ export class UiSystem implements Subsystem {
     this.hangar.viewer.dispose();
     this.root.remove();
   }
+}
+
+/**
+ * Whether a killfeed name refers to the local player.
+ *
+ * Online the server sends the player's chosen name, so a plain comparison is
+ * right. Offline the sandbox has no idea what the player called themselves and
+ * labels them 'You' — while 'prefs.playerName' defaults to something like
+ * 'Pilot417'. The two never matched, which meant that in single player the kill
+ * banner, the kill-confirm sting, the 'kill' hit marker and the death screen
+ * were all silently switched off. Every one of those features existed and was
+ * correct; they were being asked the wrong question.
+ */
+function isLocalName(name: string | undefined, playerName: string): boolean {
+  return !!name && (name === playerName || name === 'You');
 }
 
 /** Re-exported so integrators can type against the roster without a new import. */

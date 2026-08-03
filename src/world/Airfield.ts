@@ -100,7 +100,13 @@ export function buildAirfield(site: AirfieldSite, seed: number): AirfieldBuild {
    * of taxiway is what made every non-runway surface read as a flat grey quad;
    * a fixed metric repeat keeps the slab joints the right size everywhere.
    */
-  const CONC_REPEAT = 30;
+  // 30 -> 60 m. The bay size is unchanged (the texture doubles its bay count
+  // to match); what changes is how often the whole pattern repeats. With a 30 m
+  // tile the apron showed the same sixteen bays over and over, and a repeating
+  // group of sixteen is a super-lattice — which is what the eye was actually
+  // tracing when it called the concrete a wireframe grid. Sixty-four bays per
+  // repeat over a 110 m apron means the pattern never closes inside the frame.
+  const CONC_REPEAT = 60;
   const cslab = (a0: number, a1: number, b0: number, b1: number) => {
     strip(conc, a0, a1, b0, b1,
       b0 / CONC_REPEAT, b1 / CONC_REPEAT, a0 / CONC_REPEAT, a1 / CONC_REPEAT, PY);
@@ -417,36 +423,106 @@ function buildBowser(b: MeshBuilder, x: number, y: number, z: number, yaw: numbe
 }
 
 /** A stylised parked fighter — silhouette only; the hero models live elsewhere. */
+/**
+ * Dispersal scenery: an aeroplane standing on a hardstand, seen from 300 m up.
+ *
+ * The previous version was a fuselage bar of constant section and two
+ * constant-chord wing bars, which from the air is a plus sign — the critique
+ * called it "a crude white cruciform placeholder" and it was right. Almost none
+ * of what makes an aeroplane recognisable from above is detail; it is PLANFORM,
+ * and specifically three things: the wing tapers to a tip, the tailplane is much
+ * smaller than the wing and set well aft, and the fuselage is widest at the
+ * cockpit and narrows both ways. Built as four tapered quads plus a nose and a
+ * fin, this is 40 triangles and reads as an aeroplane at every range the
+ * hardstands are ever seen from.
+ *
+ * It also carries a real value structure — sunlit upper camouflage against a
+ * pale underside against a near-black canopy — so it separates from the concrete
+ * it stands on instead of silhouetting as one white shape.
+ */
 function buildParkedAircraft(british: boolean): THREE.BufferGeometry {
   const b = new MeshBuilder();
-  const body = british ? 0x5c6b4a : 0x6d6f5c;
-  const under = british ? 0x8fa3b3 : 0x93a5b0;
+  const body = british ? 0x35402c : 0x3f4436;
+  const bodyB = british ? 0x4e4630 : 0x51533f;   // the second camouflage colour
+  const under = british ? 0x6d7e8c : 0x707d86;
+
+  /**
+   * A tapered horizontal surface: root chord at the centreline, tip chord at
+   * span/2, with sweep on the leading edge. Drawn as an upper and a lower skin
+   * so the underside can carry its own colour.
+   */
+  const panel = (
+    y: number, zRoot: number, cRoot: number, span: number, cTip: number,
+    sweep: number, thick: number, top: number, bot: number,
+  ) => {
+    const hs = span * 0.5;
+    for (const s of [-1, 1]) {
+      const xr = 0, xt = s * hs;
+      const zrF = zRoot + cRoot * 0.5, zrA = zRoot - cRoot * 0.5;
+      const ztF = zRoot - sweep + cTip * 0.5, ztA = zRoot - sweep - cTip * 0.5;
+      b.color(top);
+      // Upper skin. Winding flipped with 's' so both halves face +Y.
+      if (s > 0) {
+        b.quad(xr, y + thick, zrF, xt, y + thick, ztF, xt, y + thick, ztA, xr, y + thick, zrA);
+      } else {
+        b.quad(xr, y + thick, zrA, xt, y + thick, ztA, xt, y + thick, ztF, xr, y + thick, zrF);
+      }
+      b.color(bot);
+      if (s > 0) {
+        b.quad(xr, y, zrA, xt, y, ztA, xt, y, ztF, xr, y, zrF);
+      } else {
+        b.quad(xr, y, zrF, xt, y, ztF, xt, y, ztA, xr, y, zrA);
+      }
+      // Leading edge, so the wing has a thickness at its most visible margin.
+      b.color(top);
+      b.quad(xr, y, zrF, xt, y, ztF, xt, y + thick, ztF, xr, y + thick, zrF);
+    }
+  };
+
+  // Fuselage: three sections, widest and tallest at the cockpit, tapering to
+  // the tailwheel. Boxes are fine here — what was wrong before was that there
+  // was only one of them.
   b.color(body);
-  // fuselage
-  b.box(0, 1.55, 0.2, 1.15, 1.35, 8.4);
-  b.color(body).shade(0.9);
-  b.cone(0, 1.55, 4.3, 0.62, 1.3, 8);
-  // wings
-  b.color(body).shade(1.05);
-  b.box(0, 1.15, 0.4, 10.4, 0.30, 2.1);
-  b.color(under);
-  b.box(0, 1.02, 0.4, 10.0, 0.10, 1.9);
-  // tail
-  b.color(body).shade(0.95);
-  b.box(0, 1.35, -3.9, 3.6, 0.22, 1.1);
-  b.box(0, 2.2, -4.0, 0.20, 1.6, 1.3);
-  // canopy
-  b.color(0x2b3a44);
-  b.box(0, 2.35, 0.9, 0.85, 0.62, 2.3);
-  // spinner + prop disc edge-on
-  b.color(0x33352e);
-  b.cone(0, 1.55, 5.0, 0.34, 0.9, 7);
-  // gear
-  b.color(0x2a2c28);
-  b.cylinder(-1.6, 0.0, 1.4, 0.42, 0.42, 0.26, 8, true, true, Math.PI / 2);
-  b.cylinder(1.6, 0.0, 1.4, 0.42, 0.42, 0.26, 8, true, true, Math.PI / 2);
-  b.box(-1.6, 0.6, 1.4, 0.16, 1.1, 0.16);
-  b.box(1.6, 0.6, 1.4, 0.16, 1.1, 0.16);
+  b.box(0, 1.50, 2.5, 1.02, 1.20, 3.6);
+  b.color(bodyB);
+  b.box(0, 1.52, -0.4, 1.14, 1.34, 2.4);
+  b.color(body).shade(0.94);
+  b.box(0, 1.42, -3.0, 0.72, 0.98, 3.2);
+  // Cowling and spinner.
+  b.color(bodyB).shade(0.92);
+  b.box(0, 1.52, 4.5, 0.92, 1.06, 0.6);
+  b.color(0x2f3128);
+  b.cone(0, 1.52, 4.8, 0.30, 0.86, 8);
+
+  // Wing: 11.2 m span, 2.6 m root chord tapering to 1.05 m, 0.9 m of leading
+  // edge sweep. Those are close to a Hurricane's and they are what the shape
+  // is read from.
+  panel(1.06, 0.9, 2.6, 11.2, 1.05, 0.9, 0.26, body, under);
+  // Tailplane: a third of the span, well aft.
+  panel(1.34, -4.1, 1.35, 4.0, 0.62, 0.35, 0.16, bodyB, under);
+
+  // Fin and rudder — the one vertical the planform needs to stop being flat.
+  b.color(body).shade(1.02);
+  b.box(0, 2.05, -4.25, 0.16, 1.30, 1.55);
+  b.color(bodyB);
+  b.box(0, 2.60, -4.6, 0.14, 0.62, 0.85);
+
+  // Canopy: the darkest thing on the aeroplane, and the cue that tells a
+  // viewer which end is the front.
+  b.color(0x24313a);
+  b.box(0, 2.20, 1.5, 0.78, 0.56, 2.0);
+  b.color(0x1b242b);
+  b.box(0, 2.14, 0.1, 0.70, 0.44, 0.9);
+
+  // Undercarriage, splayed as a tail-dragger's is.
+  b.color(0x24261f);
+  b.cylinder(-1.55, 0.0, 1.9, 0.44, 0.44, 0.24, 8, true, true, Math.PI / 2);
+  b.cylinder(1.55, 0.0, 1.9, 0.44, 0.44, 0.24, 8, true, true, Math.PI / 2);
+  b.color(0x2f3129);
+  b.box(-1.45, 0.62, 1.9, 0.18, 1.1, 0.28);
+  b.box(1.45, 0.62, 1.9, 0.18, 1.1, 0.28);
+  b.color(0x24261f);
+  b.cylinder(0, 0.0, -4.9, 0.20, 0.20, 0.14, 6, true, true, Math.PI / 2);
   return b.build();
 }
 
@@ -600,8 +676,8 @@ function buildRunwayTexture(designator: number, rng: Rng): THREE.DataTexture {
 function buildConcreteTexture(rng: Rng): THREE.DataTexture {
   const N = 512;
   const data = new Uint8Array(N * N * 4);
-  /** Bays are 7.5 m square in a 30 m repeat, so 4 x 4 to the tile. */
-  const BAYS = 4;
+  /** Bays are 7.5 m square in a 60 m repeat, so 8 x 8 to the tile. */
+  const BAYS = 8;
   const bay = N / BAYS;
 
   const put = (x: number, yy: number, v: number, tintR = 1.0, tintG = 1.0, tintB = 1.0) => {
@@ -615,11 +691,25 @@ function buildConcreteTexture(rng: Rng): THREE.DataTexture {
   for (let j = 0; j < N; j++) {
     for (let i = 0; i < N; i++) {
       const bi = (i / bay) | 0, bj = (j / bay) | 0;
-      // Each bay was poured on a different day. Kept to a few per cent: the
-      // cue is that the slabs differ AT ALL, and pushing it further turns an
-      // apron into a bathroom floor.
+      // Each bay was poured on a different day.
+      //
+      // 13 -> 34, and that ratio against the joint contrast below is the whole
+      // fix for the "regular diagonal grid across the entire concrete" note
+      // that has stood for three rounds. It was never a mesh: the apron is two
+      // triangles. It was a LATTICE OF EQUAL-CONTRAST LINES over slabs that
+      // were all the same value, and any such lattice reads as wireframe. The
+      // eye groups by the strongest repeating cue in the region — make the
+      // bays differ from each other by more than the joints differ from the
+      // bays, and the same joints stop being a grid and start being what they
+      // are, the edges of individually poured squares.
       const age = h2(bi * 13 + 7, bj * 29 + 3);
-      let v = 116 + (age - 0.5) * 13;
+      let v = 116 + (age - 0.5) * 34;
+
+      // Patches: a batch of bays relaid or repaired together. A real apron was
+      // bombed, filled and extended, so it is never one pour — and a
+      // multi-bay-scale variation is also what stops the 30 m texture repeat
+      // reading as a repeat, because it crosses bay boundaries.
+      v += (fbm2(i * 0.0075 + 610, j * 0.0075 + 240, 2) - 0.5) * 26;
 
       // Aggregate and float marks.
       v += (fbm2(i * 0.055, j * 0.055, 3) - 0.5) * 15;
@@ -627,11 +717,25 @@ function buildConcreteTexture(rng: Rng): THREE.DataTexture {
 
       // Expansion joints, with tar sealant. Slightly wandering so they do not
       // read as a pixel-perfect grid.
+      //
+      // Contrast dropped from 26 to a per-line 6..17, and roughly a fifth of
+      // the lines are dropped outright — bays poured in pairs, or a joint that
+      // has silted up and grassed over and no longer reads from the air. An
+      // incomplete grid cannot be traced, and a grid the eye cannot trace is
+      // not a grid.
       const jitter = (n2(i * 0.02, j * 0.02) - 0.5) * 3.0;
-      const du = Math.min((i % bay) + jitter, bay - (i % bay) - jitter);
-      const dv = Math.min((j % bay) + jitter, bay - (j % bay) - jitter);
+      const iu = i % bay, iv = j % bay;
+      const du = Math.min(iu + jitter, bay - iu - jitter);
+      const dv = Math.min(iv + jitter, bay - iv - jitter);
+      // Which of the two families of lines is nearer decides whose strength
+      // this pixel uses, so a strong vertical joint can cross a missing
+      // horizontal one.
+      const vertNear = du < dv;
+      const lineId = vertNear ? bi + (iu * 2 > bay ? 1 : 0) : bj + (iv * 2 > bay ? 1 : 0);
+      const lineH = h2(vertNear ? lineId * 71 + 5 : 17, vertNear ? 23 : lineId * 53 + 11);
+      const jointStr = lineH < 0.20 ? 0.0 : 6 + lineH * 11;
       const joint = Math.min(du, dv);
-      if (joint < 2.2) v -= 26 * (1 - joint / 2.2);
+      if (joint < 2.2) v -= jointStr * (1 - joint / 2.2);
 
       // Cracks radiating from a few bay corners.
       const cr = fbm2(i * 0.017 + 40, j * 0.017 + 90, 3);

@@ -163,6 +163,64 @@ export interface LiverySpec {
   pattern: 'splinter' | 'blotch' | 'wave' | 'solid' | 'mottle';
 }
 
+/**
+ * A rack of identical bombs.
+ *
+ * 'fill' is the real explosive fraction of the type rather than a generic
+ * guess, because it varies enormously between nations and is the single number
+ * that decides how big the hole is: British GP bombs of 1942 ran barely 28 %
+ * Amatol, US AN-M types about 51 % TNT/Composition B, and the German SC series
+ * over 50 % of a far more energetic Trialen/Fp 60-40 filling. A 250 kg SC 250
+ * therefore carries more than twice the charge of a 250 lb GP that weighs half
+ * as much, which is exactly why the Jabo 109 was worth the drag penalty.
+ */
+export interface BombLoad {
+  name: string;
+  count: number;
+  /** All-up weight of one bomb, kg. */
+  kg: number;
+  /** Explosive filler as a fraction of all-up weight. */
+  fill: number;
+  /** Body diameter, m — sets both the drag area and the model geometry. */
+  diameter: number;
+  /** Overall length, m. */
+  length: number;
+  /** Body-space carriage points (metres, +X right, +Y up, +Z forward). */
+  mounts: [number, number, number][];
+}
+
+/** A set of identical unguided rockets on rails or stub pylons. */
+export interface RocketLoad {
+  name: string;
+  count: number;
+  /** All-up launch weight of one round, kg. */
+  kg: number;
+  /** Warhead filler, grams of TNT equivalent. */
+  he: number;
+  diameter: number;
+  length: number;
+  /** Motor thrust, N, and burn time, s — chosen to reproduce the real Δv. */
+  thrust: number;
+  burnTime: number;
+  /** Propellant mass burned off during the boost, kg. */
+  propellant: number;
+  mounts: [number, number, number][];
+}
+
+/**
+ * One selectable stores configuration. The clean fighter loadout is implicit
+ * (see 'loadoutsFor'), so this list only ever describes what is *hung on* the
+ * aeroplane.
+ */
+export interface Loadout {
+  id: string;
+  name: string;
+  /** Two-to-six character tag for the HUD readout. */
+  short: string;
+  bombs?: BombLoad;
+  rockets?: RocketLoad;
+}
+
 export interface AircraftSpec {
   id: string;
   name: string;
@@ -177,10 +235,128 @@ export interface AircraftSpec {
   damage: DamageSpec;
   geom: GeometrySpec;
   livery: LiverySpec;
-  /** Ordnance loadouts. */
-  bombs?: { name: string; count: number; kg: number; mounts: [number, number, number][] };
-  rockets?: { name: string; count: number; kg: number; he: number; mounts: [number, number, number][] };
+  /**
+   * The aircraft's headline strike fit — the one the hangar card and the
+   * ordnance helpers in 'shared/combat/ordnance.ts' describe when nobody has
+   * chosen anything. Always the same object as one of the entries in
+   * 'loadouts'.
+   */
+  bombs?: BombLoad;
+  rockets?: RocketLoad;
+  /** Every stores configuration this airframe can be armed with, clean aside. */
+  loadouts?: Loadout[];
 }
+
+// ---------------------------------------------------------------------------
+// Ordnance
+// ---------------------------------------------------------------------------
+//
+// Masses and fillings are the real ones. Carriage points are on the airframe's
+// own hardpoints: wing racks just outboard of the undercarriage bay, ventral
+// racks on the fuselage centreline, rocket rails under the outer wing panel
+// where they clear the propeller arc and the gear doors.
+
+/** RAF 250 lb GP Mk IV: 113 kg all-up, 32 kg of Amatol — a famously mean 28 %. */
+const BOMB_250LB: BombLoad = {
+  name: '250 lb GP Mk IV', count: 2, kg: 113, fill: 0.28,
+  diameter: 0.273, length: 1.42,
+  mounts: [[-1.95, -0.74, 0.18], [1.95, -0.74, 0.18]],
+};
+
+/** RAF 500 lb GP Mk IV on the Spitfire's centreline crutch. */
+const BOMB_500LB_UK: BombLoad = {
+  name: '500 lb GP Mk IV', count: 1, kg: 227, fill: 0.29,
+  diameter: 0.343, length: 1.78,
+  mounts: [[0, -0.86, 0.10]],
+};
+
+/** SC 250: 250 kg, 130 kg of Fp 60/40 — over half its weight is charge. */
+const BOMB_SC250: BombLoad = {
+  name: 'SC 250', count: 1, kg: 250, fill: 0.52,
+  diameter: 0.368, length: 1.64,
+  mounts: [[0, -0.92, 0.24]],
+};
+
+/** Four SC 50 on the ER 4 adapter under the ETC 500 rack. */
+const BOMB_SC50: BombLoad = {
+  name: 'SC 50', count: 4, kg: 50, fill: 0.48,
+  diameter: 0.20, length: 1.10,
+  mounts: [[-0.26, -0.86, 0.56], [0.26, -0.86, 0.56], [-0.26, -0.86, -0.06], [0.26, -0.86, -0.06]],
+};
+
+/** US AN-M64: 227 kg with 121 kg of Composition B. */
+const BOMB_500LB_US: BombLoad = {
+  name: 'AN-M64 500 lb', count: 2, kg: 227, fill: 0.53,
+  diameter: 0.360, length: 1.45,
+  mounts: [[-2.05, -0.82, 0.26], [2.05, -0.82, 0.26]],
+};
+
+/** Navy Type 97 No. 6 — the Zero's standard 60 kg wing bomb. */
+const BOMB_60KG: BombLoad = {
+  name: 'Type 97 No. 6', count: 2, kg: 60, fill: 0.38,
+  diameter: 0.205, length: 1.06,
+  mounts: [[-1.55, -0.70, 0.16], [1.55, -0.70, 0.16]],
+};
+
+/** FAB-100: 100 kg, 44 kg of TNT/amatol. */
+const BOMB_FAB100: BombLoad = {
+  name: 'FAB-100', count: 2, kg: 100, fill: 0.44,
+  diameter: 0.267, length: 0.96,
+  mounts: [[-1.40, -0.70, 0.20], [1.40, -0.70, 0.20]],
+};
+
+/**
+ * 5 in HVAR: 63.5 kg all-up, a 20.4 kg GP head with 3.4 kg of Composition B
+ * (≈ 4.4 kg TNT-equivalent). The motor burns 11.1 kg of ballistite in 1.1 s,
+ * which at 22 kN gives the historical 420 m/s velocity increment.
+ */
+const ROCKET_HVAR: RocketLoad = {
+  name: '5 in HVAR', count: 6, kg: 63.5, he: 4400,
+  diameter: 0.127, length: 1.83,
+  thrust: 22000, burnTime: 1.1, propellant: 11.1,
+  mounts: [
+    [-1.60, -0.60, 0.20], [-2.15, -0.62, 0.16], [-2.70, -0.64, 0.12],
+    [1.60, -0.60, 0.20], [2.15, -0.62, 0.16], [2.70, -0.64, 0.12],
+  ],
+};
+
+/**
+ * RS-82: 6.8 kg off the rail, a 6.2 kg head with 360 g of TNT. 1.1 kg of
+ * powder in 0.7 s gives the documented ~350 m/s.
+ */
+const ROCKET_RS82: RocketLoad = {
+  name: 'RS-82', count: 4, kg: 6.8, he: 360,
+  diameter: 0.082, length: 0.60,
+  thrust: 3400, burnTime: 0.7, propellant: 1.1,
+  mounts: [
+    [-1.30, -0.54, 0.10], [-1.85, -0.56, 0.06],
+    [1.30, -0.54, 0.10], [1.85, -0.56, 0.06],
+  ],
+};
+
+const SPITFIRE_LOADOUTS: Loadout[] = [
+  { id: 'b250x2', name: '2 × 250 lb GP', short: '2×250', bombs: BOMB_250LB },
+  { id: 'b500', name: '1 × 500 lb GP', short: '500LB', bombs: BOMB_500LB_UK },
+];
+
+const BF109_LOADOUTS: Loadout[] = [
+  { id: 'sc250', name: '1 × SC 250', short: 'SC250', bombs: BOMB_SC250 },
+  { id: 'sc50x4', name: '4 × SC 50', short: '4×SC50', bombs: BOMB_SC50 },
+];
+
+const P51_LOADOUTS: Loadout[] = [
+  { id: 'b500x2', name: '2 × 500 lb AN-M64', short: '2×500', bombs: BOMB_500LB_US },
+  { id: 'hvar6', name: '6 × HVAR', short: '6×HVAR', rockets: ROCKET_HVAR },
+];
+
+const ZERO_LOADOUTS: Loadout[] = [
+  { id: 'b60x2', name: '2 × 60 kg', short: '2×60', bombs: BOMB_60KG },
+];
+
+const LA5_LOADOUTS: Loadout[] = [
+  { id: 'fab100x2', name: '2 × FAB-100', short: '2×100', bombs: BOMB_FAB100 },
+  { id: 'rs82x4', name: '4 × RS-82', short: '4×RS82', rockets: ROCKET_RS82 },
+];
 
 // ---------------------------------------------------------------------------
 
@@ -231,6 +407,8 @@ const spitfire: AircraftSpec = {
     ellipticalWing: true,
   },
   livery: { camoA: 0x4a5c3a, camoB: 0x6b5a3c, under: 0x9fb4c4, accent: 0xb03a2e, insignia: 'britain', pattern: 'wave' },
+  bombs: BOMB_250LB,
+  loadouts: SPITFIRE_LOADOUTS,
 };
 
 const bf109: AircraftSpec = {
@@ -279,6 +457,8 @@ const bf109: AircraftSpec = {
     ellipticalWing: false,
   },
   livery: { camoA: 0x6f7a5c, camoB: 0x8b9375, under: 0x9db6c6, accent: 0xf0d060, insignia: 'germany', pattern: 'mottle' },
+  bombs: BOMB_SC250,
+  loadouts: BF109_LOADOUTS,
 };
 
 const p51: AircraftSpec = {
@@ -327,6 +507,9 @@ const p51: AircraftSpec = {
     ellipticalWing: false,
   },
   livery: { camoA: 0xb8bcc0, camoB: 0xd4d8dc, under: 0xc8ccd0, accent: 0xe03c31, insignia: 'usa', pattern: 'solid' },
+  bombs: BOMB_500LB_US,
+  rockets: ROCKET_HVAR,
+  loadouts: P51_LOADOUTS,
 };
 
 const zero: AircraftSpec = {
@@ -375,6 +558,8 @@ const zero: AircraftSpec = {
     ellipticalWing: false,
   },
   livery: { camoA: 0x4f5b3f, camoB: 0x5d6a49, under: 0xa8a58c, accent: 0xc8342a, insignia: 'japan', pattern: 'blotch' },
+  bombs: BOMB_60KG,
+  loadouts: ZERO_LOADOUTS,
 };
 
 const la5: AircraftSpec = {
@@ -419,6 +604,9 @@ const la5: AircraftSpec = {
     ellipticalWing: false,
   },
   livery: { camoA: 0x3f4a3a, camoB: 0x2c3540, under: 0x8fa6b8, accent: 0xd03a2e, insignia: 'ussr', pattern: 'splinter' },
+  bombs: BOMB_FAB100,
+  rockets: ROCKET_RS82,
+  loadouts: LA5_LOADOUTS,
 };
 
 export const AIRCRAFT: AircraftSpec[] = [spitfire, bf109, p51, zero, la5];
@@ -432,3 +620,64 @@ export const aircraftByIndex = (i: number) => AIRCRAFT[i] ?? AIRCRAFT[0];
 
 /** Teams: 0 = Allies (britain/usa/ussr), 1 = Axis (germany/japan). */
 export const nationTeam = (n: Nation): number => (n === 'germany' || n === 'japan' ? 1 : 0);
+
+// ---------------------------------------------------------------------------
+// Loadouts
+// ---------------------------------------------------------------------------
+
+/** The implicit fighter fit every aircraft has: guns and nothing else. */
+export const CLEAN_LOADOUT: Loadout = { id: 'clean', name: 'Clean', short: 'CLEAN' };
+
+/** Every loadout the player may pick, clean first. Never empty. */
+export function loadoutsFor(spec: AircraftSpec): Loadout[] {
+  return spec.loadouts && spec.loadouts.length
+    ? [CLEAN_LOADOUT, ...spec.loadouts]
+    : [CLEAN_LOADOUT];
+}
+
+/** Resolve a loadout id against an airframe, falling back to clean. */
+export function loadoutById(spec: AircraftSpec, id: string | undefined): Loadout {
+  if (!id || id === CLEAN_LOADOUT.id) return CLEAN_LOADOUT;
+  return spec.loadouts?.find((l) => l.id === id) ?? CLEAN_LOADOUT;
+}
+
+/** Total carried mass of a loadout with every store still aboard, kg. */
+export function loadoutMass(l: Loadout): number {
+  return (l.bombs ? l.bombs.kg * l.bombs.count : 0)
+    + (l.rockets ? l.rockets.kg * l.rockets.count : 0);
+}
+
+/**
+ * Parasite drag of a loadout, split into the part that goes away when the
+ * stores do and the part that does not.
+ *
+ * Both are a drag *area* (Cd·A, m²) so the flight model can simply add them to
+ * the airframe's own parasite area. A bomb or rocket hung in the airstream is a
+ * bluff body with a big interference field around its rack: 0.45 on frontal
+ * area is the usual figure for a finned store on a pylon, and each rack, crutch
+ * or rail adds a fixed lump of its own that is still there after release —
+ * which is why a fighter that has just dropped is faster than it was but never
+ * quite as fast as a clean one.
+ *
+ * Sanity check: two 250 lb bombs on a Spitfire come to 0.45 × 2 × π(0.1365)² +
+ * 2 × 0.012 = 0.077 m² against a clean parasite area of 0.0229 × 22.48 =
+ * 0.515 m². At constant power that is a 4.7 % speed loss, about 27 km/h off
+ * 570 — which is what the pilot's notes for the bomb-carrying Mk IX say.
+ */
+export function loadoutDrag(l: Loadout): { store: number; rack: number } {
+  let store = 0;
+  let rack = 0;
+  if (l.bombs) {
+    const frontal = Math.PI * (l.bombs.diameter * 0.5) ** 2;
+    store += 0.45 * frontal * l.bombs.count;
+    rack += 0.012 * l.bombs.count;
+  }
+  if (l.rockets) {
+    const frontal = Math.PI * (l.rockets.diameter * 0.5) ** 2;
+    // A rocket is slimmer and better faired than a bomb but sits on a rail that
+    // stays behind, so proportionally more of its drag is permanent.
+    store += 0.42 * frontal * l.rockets.count;
+    rack += 0.009 * l.rockets.count;
+  }
+  return { store, rack };
+}

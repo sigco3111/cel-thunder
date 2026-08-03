@@ -56,6 +56,7 @@ import { attachCockpitLighting, buildCockpit, buildCockpitAtlas, cockpitLightRig
 import { buildPropeller, createPropDiscMaterial } from './propeller';
 import { buildGear } from './gear';
 import { buildDetails } from './details';
+import { buildStores, STORE_PREFIX, storeName } from './ordnance';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -120,6 +121,18 @@ export interface AircraftModel {
 
   /** All objects sharing a part name, across every LOD level. */
   parts: Map<string, THREE.Object3D[]>;
+
+  /**
+   * Shows exactly the external stores this aeroplane is carrying and hides
+   * everything else, across every LOD.
+   *
+   * The template holds the union of every loadout the type can carry, so this
+   * is how one pooled airframe serves a clean fighter, a Jabo with an SC 250
+   * and the same Jabo two seconds after it has pickled. Indices are positions
+   * in the loadout's own mount list; passing empty arrays strips the aeroplane
+   * back to bare racks.
+   */
+  setStores(loadoutId: string, bombs: readonly number[], rockets: readonly number[]): void;
 
   // mutable animation state
   propAngle: number;
@@ -994,6 +1007,20 @@ function buildLevel(
     grp.add(eye);
   }
 
+  // ---- external stores -----------------------------------------------------
+  // Hidden by default: an aeroplane is clean until something arms it. The
+  // presentation layer turns on exactly the stores its entity is carrying (see
+  // 'setStores'), so one template serves every loadout.
+  if (d.level <= 1) {
+    for (const s of buildStores(spec, d.level)) {
+      ownedGeoms.push(s.geometry);
+      const sm = mesh(s.geometry, mats.hull, s.part);
+      sm.layers.enable(LAYER_INK);
+      sm.visible = false;
+      grp.add(sm);
+    }
+  }
+
   // ---- lights and markers --------------------------------------------------
   if (det) {
     for (const l of det.lights) {
@@ -1184,9 +1211,31 @@ function instantiate(tpl: Template): AircraftModel {
     needles,
     damageParts: dp,
     parts,
+    setStores: makeSetStores(parts),
     propAngle: 0,
     wheelAngle: 0,
     decals: [],
+  };
+}
+
+/**
+ * Bound once per instance so callers do not have to know the part-naming
+ * convention — and so the convention stays private to this module even though
+ * the presentation layer resolves the builder late, through a glob.
+ */
+function makeSetStores(
+  parts: Map<string, THREE.Object3D[]>,
+): AircraftModel['setStores'] {
+  return (loadoutId, bombs, rockets) => {
+    const want = new Set<string>();
+    for (const i of bombs) want.add(storeName(loadoutId, 'b', i));
+    for (const i of rockets) want.add(storeName(loadoutId, 'r', i));
+    const prefix = STORE_PREFIX;
+    for (const [k, list] of parts) {
+      if (!k.startsWith(prefix)) continue;
+      const on = want.has(k);
+      for (let i = 0; i < list.length; i++) list[i].visible = on;
+    }
   };
 }
 

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { AircraftSpec } from '../../shared/aircraft';
+import { loadoutById, type AircraftSpec } from '../../shared/aircraft';
 import { createCelMaterial, addOutline, celGlobals, type CelMaterial } from '../../render/CelMaterial';
 import { hash2 } from '../../shared/math';
 import {
@@ -61,6 +61,8 @@ export class HangarViewer {
   builder: AircraftBuilder | null = null;
   /** The shipping model instance currently on the stand, if any. */
   private built: AircraftModel | null = null;
+  /** Loadout hung on the model on the stand. */
+  private loadoutId = 'clean';
 
   constructor(parent: HTMLElement) {
     this.canvas = document.createElement('canvas');
@@ -176,6 +178,30 @@ export class HangarViewer {
     // plate. The plate is wider than it is tall, so the horizontal margin is
     // still generous at this distance.
     this.dist = sphere.radius / Math.sin(this.camera.fov * 0.5 * Math.PI / 180) * 0.86;
+    this.applyStores();
+  }
+
+  /**
+   * Hangs the selected ordnance on the aeroplane on the stand.
+   *
+   * Choosing a loadout blind is choosing a number; seeing two 250-pounders
+   * appear under the wings is choosing an aeroplane. It also gives the player
+   * the one thing the stat card cannot — an honest look at what the thing is
+   * going to be dragging through the sky.
+   */
+  setLoadout(loadoutId: string): void {
+    if (this.loadoutId === loadoutId) return;
+    this.loadoutId = loadoutId;
+    this.applyStores();
+  }
+
+  private applyStores(): void {
+    const m = this.built;
+    const spec = this.currentSpec;
+    if (!m || !spec || typeof m.setStores !== 'function') return;
+    const l = loadoutById(spec, this.loadoutId);
+    const idx = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
+    m.setStores(l.id, idx(l.bombs?.count ?? 0), idx(l.rockets?.count ?? 0));
   }
 
   private clearModel(): void {

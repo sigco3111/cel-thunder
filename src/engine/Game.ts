@@ -112,6 +112,82 @@ export class Game implements GameContext {
   private frameMs = 16.7;
   private governorCooldown = 0;
 
+  // --- frame pacing ----------------------------------------------------------
+  private prevRawMs = 16.7;
+  /**
+   * Fraction of recent frames paced differently from their predecessor — the
+   * actual signal behind "micro-stutter", and the one thing the old governor
+   * could not see.
+   *
+   * It compared a *smoothed* frame time against fixed millisecond thresholds
+   * (down above 22 ms, up below 12.5). That cannot detect a frame graph
+   * alternating between one and two refresh intervals, which is what a GPU
+   * sitting just over budget actually produces: at 120 Hz a 10 ms frame
+   * renders as 8.3, 16.6, 8.3, 16.6 — an 89 fps average that reads as
+   * constant judder, whose 12.5 ms mean sits in the old dead band forever, so
+   * the governor parked on 'ultra' and never moved again. At 60 Hz the
+   * identical failure lands on 16.7/33.3 for a "53 fps" average.
+   *
+   * The test is deliberately **scale-free** — a proportional difference, not
+   * an absolute one — so it needs no estimate of the display's refresh rate
+   * (which the browser will not report, and which cannot be recovered from a
+   * running minimum: one freak short frame after a stall drags a minimum to
+   * the floor and never lets go). It reads zero for a frame rate locked to
+   * *any* rate, which is correct, because a locked 60 feels perfect.
+   */
+  private pacingMiss = 0;
+  /** Index into PERF_LADDER — the single monotonic cost knob. */
+  private rung = 1;
+  /** Render on every Nth refresh. 1 = every one. See PERF_LADDER. */
+  private presentEvery = 1;
+  private presentPhase = 0;
+  /**
+   * Measured display refresh, Hz. Taken from the median of the first second of
+   * frame intervals rather than assumed, because the half-rate rungs are only
+   * safe above ~100 Hz and guessing wrong halves a 60 Hz display to 30.
+   */
+  private refreshHz = 60;
+  private refreshSamples: number[] = [];
+  /** Seconds of clean pacing required before trying the next rung up. */
+  private stepUpDelay = INITIAL_STEP_UP_DELAY;
+  /** Seconds of clean pacing accumulated so far. */
+  private cleanFor = 0;
+  /** Seconds of unstable pacing accumulated so far. */
+  private unstableFor = 0;
+  /** ctx.time of the last step *up*, so an undone climb can be told from a descent. */
+  private lastClimbAt = -1e9;
+  /**
+   * When each rung last proved itself unable to hold cadence.
+   *
+   * Without this the governor hunts: scene cost swings by tens of per cent as
+   * the aeroplane crosses a cloud bank or the furball, so a rung looks clean,
+   * gets climbed into, immediately fails, and gets dropped again — measured,
+   * seven changes in twenty-eight seconds. Every one of those reallocates the
+   * composer's render targets, so the hunting *is* the stutter. Remembering
+   * that a rung has already been tried and failed makes the search converge
+   * instead of cycling.
+   */
+  private rungFailedAt: number[] = [];
+
+  /**
+   * Opt-in per-subsystem CPU profiler (?profile=1).
+   *
+   * Off by default and costing one boolean test per frame when off, because
+   * 'performance.now()' twice per subsystem per hook is 22 calls a frame and
+   * that is not free. On, it fills a ring the smoothness harness reads to
+   * attribute a slow frame to the system that actually caused it — guessing
+   * which of eleven subsystems spiked is exactly how frame-pacing bugs survive
+   * for months.
+   */
+  profiling = false;
+  readonly profile: {
+    names: string[];
+    /** Ring of [frameMs, ...perSubsystemMs] rows, newest last. */
+    rows: number[][];
+    cap: number;
+  } = { names: [], rows: [], cap: 1200 };
+  private profRow: number[] = [];
+
   constructor(container: HTMLElement) {
     this.container = container;
 
@@ -153,6 +229,10 @@ export class Game implements GameContext {
 
     addEventListener('resize', this.onResize);
     document.addEventListener('visibilitychange', this.onVisibility);
+
+    try {
+      this.profiling = new URLSearchParams(location.search).has('profile');
+    } catch { /* no location (worker/test) — stay off */ }
   }
 
   register(sys: Subsystem): this {
@@ -200,6 +280,11 @@ export class Game implements GameContext {
     }
 
     this.subsystems = survivors;
+    // Make the live state agree with the starting rung. Without this the
+    // governor believes it is on rung 1 while the renderer is configured for
+    // whatever the field initialisers happened to say, and the first thing the
+    // player sees is a configuration nothing chose.
+    this.applyRung();
     onProgress?.(1, this.failedSubsystems.length ? 'ready (degraded)' : 'ready');
     this.onResize();
   }
@@ -220,6 +305,15 @@ export class Game implements GameContext {
     if (!this.running) return;
     this.rafId = requestAnimationFrame(this.loop);
 
+    // Half-rate presentation: skip the callback entirely rather than doing the
+    // work and discarding it. Simulation is not skipped — dt simply covers two
+    // refreshes, which the fixed-step accumulator and the interpolating netcode
+    // both already handle. Skipping before the clock is read keeps `dt` honest.
+    if (this.presentEvery > 1) {
+      this.presentPhase = (this.presentPhase + 1) % this.presentEvery;
+      if (this.presentPhase !== 0) return;
+    }
+
     const now = performance.now();
     // Clamp to avoid physics explosions after a tab stall.
     const rawDt = (now - this.lastTime) / 1000;
@@ -233,16 +327,64 @@ export class Game implements GameContext {
     const rawMs = Math.min(1000, rawDt * 1000);
     if (this.frame < 3) this.frameMs = rawMs || 16.7;
     else this.frameMs += (rawMs - this.frameMs) * 0.07;
+    this.trackPacing(rawMs);
+
+    // Establish the display's refresh rate before the governor is allowed to
+    // consider a half-rate rung. Sampled while presentEvery is still 1, and the
+    // median rejects the compile stalls that pollute the first second.
+    if (this.presentEvery === 1 && this.refreshSamples.length < 90 && this.frame > 10) {
+      this.refreshSamples.push(rawMs);
+      if (this.refreshSamples.length === 90) {
+        const sorted = this.refreshSamples.slice().sort((a, b) => a - b);
+        const median = sorted[45];
+        if (median > 1) this.refreshHz = Math.round(1000 / median);
+        // The rung was chosen before the refresh rate was known, so a half-rate
+        // rung could not take effect. Re-apply it now that it can.
+        this.applyRung();
+      }
+    }
 
     // Counters accumulate across every pass of this frame (see the constructor).
     this.renderer.info.reset();
 
-    for (const s of this.subsystems) this.safeCall(s, 'update');
-    for (const s of this.subsystems) this.safeCall(s, 'lateUpdate');
+    if (this.profiling) {
+      this.profileFrame(rawMs);
+    } else {
+      for (const s of this.subsystems) this.safeCall(s, 'update');
+      for (const s of this.subsystems) this.safeCall(s, 'lateUpdate');
+    }
 
     this.sampleStats();
     this.governor();
   };
+
+  /** Timed variant of the update sweep. See 'profiling'. */
+  private profileFrame(rawMs: number): void {
+    const p = this.profile;
+    if (p.names.length !== this.subsystems.length * 2) {
+      p.names = [
+        ...this.subsystems.map((s) => `${s.name}.u`),
+        ...this.subsystems.map((s) => `${s.name}.l`),
+      ];
+      p.rows.length = 0;
+    }
+    const row = this.profRow.length === p.names.length + 1
+      ? this.profRow : (this.profRow = new Array(p.names.length + 1).fill(0));
+    row[0] = rawMs;
+    const n = this.subsystems.length;
+    for (let i = 0; i < n; i++) {
+      const t = performance.now();
+      this.safeCall(this.subsystems[i], 'update');
+      row[1 + i] = performance.now() - t;
+    }
+    for (let i = 0; i < n; i++) {
+      const t = performance.now();
+      this.safeCall(this.subsystems[i], 'lateUpdate');
+      row[1 + n + i] = performance.now() - t;
+    }
+    if (p.rows.length >= p.cap) p.rows.shift();
+    p.rows.push(row.slice());
+  }
 
   private safeCall(s: Subsystem, hook: 'update' | 'lateUpdate'): void {
     const fn = s[hook];
@@ -283,28 +425,130 @@ export class Game implements GameContext {
     st.frame = this.frame;
   }
 
+  /** Maintains the pacing-instability signal. See 'pacingMiss'. */
+  private trackPacing(rawMs: number): void {
+    const a = rawMs;
+    const b = this.prevRawMs;
+    this.prevRawMs = a;
+    // Proportional, so it means the same thing on a 60 and a 144 Hz panel:
+    // a step of 40 % between neighbouring frames is a dropped vsync, whereas
+    // ordinary frame-to-frame noise on a locked cadence is a few per cent.
+    const off = Math.abs(a - b) > 0.4 * Math.min(a, b) ? 1 : 0;
+    // ~30-frame memory: long enough not to fire on one hiccup, short enough
+    // that the governor can react inside a second.
+    this.pacingMiss += (off - this.pacingMiss) * 0.035;
+  }
+
   /**
-   * Adaptive quality: if we sit under budget for a while, step up; if we blow
-   * the budget, step down immediately. Keeps 60 fps on mid-range hardware
-   * without the player touching settings.
+   * Adaptive quality, tuned for *consistency* rather than for an average.
+   *
+   * Cost is a single monotonic ladder (PERF_LADDER) rather than two
+   * independent knobs, so "one step cheaper" is always well defined and the
+   * governor cannot walk sideways into a more expensive configuration — which
+   * is exactly what a tier drop that also restored the render scale used to do.
+   *
+   * Direction is decided by pacing, not by frame rate:
+   *
+   *  - unstable -> the frame straddles a vsync boundary and the player is
+   *    seeing judder. Step down. This is urgent; converge quickly.
+   *  - clean for a sustained stretch -> try one step up.
+   *  - anything else -> hold.
+   *
+   * The required clean stretch **doubles every time a step up is undone**, so
+   * a machine that sits right on a boundary settles instead of yo-yoing
+   * between two tiers forever. Yo-yoing is worse than either endpoint: each
+   * change reallocates render targets and re-specialises shader programs, so
+   * an indecisive governor manufactures the very hitches it exists to prevent.
    */
   private governor(): void {
     this.governorCooldown -= this.dt;
+    // Let boot and the first shader compiles clear before believing anything.
+    if (this.frame < 150) { this.cleanFor = 0; this.unstableFor = 0; return; }
+
+    const bad = this.pacingMiss > 0.16 || this.frameMs > 40;
+    const clean = this.pacingMiss < 0.05;
+    this.cleanFor = clean ? this.cleanFor + this.dt : 0;
+    this.unstableFor = bad ? this.unstableFor + this.dt : 0;
+    // Spend quality only on a problem that has persisted. Scene cost swings by
+    // tens of per cent as the aeroplane flies past a cloud bank or into the
+    // middle of the furball, and a governor that reacts to a 30-frame average
+    // chases those transients all the way to the bottom of the ladder and is
+    // still there long after the view has cleared. Something genuinely broken
+    // (half the frames off-cadence) still gets an immediate response.
+    const unstable = this.unstableFor > 1.5 || this.pacingMiss > 0.5;
+
     if (this.governorCooldown > 0) return;
 
-    const tiers: QualityTier[] = ['low', 'medium', 'high', 'ultra'];
-    const i = tiers.indexOf(this.quality);
-    if (this.frameMs > 22 && i > 0) {
-      this.quality = tiers[i - 1];
-      this.bus.emit('quality', this.quality);
-      this.governorCooldown = 3;
-    } else if (this.frameMs < 12.5 && i < tiers.length - 1) {
-      this.quality = tiers[i + 1];
-      this.bus.emit('quality', this.quality);
-      this.governorCooldown = 6;
-    } else {
-      this.governorCooldown = 1;
+    if (unstable && this.rung < PERF_LADDER.length - 1) {
+      this.rungFailedAt[this.rung] = this.time;
+      this.rung++;
+      // Only a step down that *undoes a recent climb* is evidence of
+      // indecision. Penalising the initial descent as well — which an earlier
+      // version did — drove the backoff to its ceiling before the governor had
+      // found its level even once, and it then never climbed back.
+      if (this.time - this.lastClimbAt < UNDO_WINDOW) {
+        this.stepUpDelay = Math.min(MAX_STEP_UP_DELAY, this.stepUpDelay * 2);
+      }
+      this.applyRung();
+      this.governorCooldown = this.pacingMiss > 0.4 ? 1.2 : 2.0;
+      return;
     }
+
+    if (this.rung > 0 && this.cleanFor >= this.stepUpDelay) {
+      // Do not climb back into something already known not to work. The
+      // quarantine expires so a genuinely transient load (one long furball, a
+      // storm cell) does not cost image quality for the rest of the match.
+      const failedAt = this.rungFailedAt[this.rung - 1];
+      if (failedAt !== undefined && this.time - failedAt < RUNG_QUARANTINE) {
+        this.governorCooldown = 2;
+        this.cleanFor = 0;
+        return;
+      }
+      this.rung--;
+      this.lastClimbAt = this.time;
+      this.applyRung();
+      this.governorCooldown = 1.5;
+      return;
+    }
+
+    this.governorCooldown = 0.5;
+  }
+
+  private applyRung(): void {
+    const r = PERF_LADDER[this.rung];
+    this.presentEvery = r.present > 1 && this.refreshHz >= MIN_HZ_FOR_HALF_RATE ? r.present : 1;
+    this.presentPhase = 0;
+    this.settings.renderScale = r.scale;
+    if (this.quality !== r.tier) {
+      this.quality = r.tier;
+      this.bus.emit('quality', this.quality);
+    }
+    // Judge the new configuration on its own evidence. Carrying the old EMA
+    // across a change made every step down look as bad as the one before it
+    // for another half second, which is how the governor used to overshoot
+    // several rungs past the one that had already fixed the problem.
+    this.pacingMiss = 0;
+    this.cleanFor = 0;
+    this.unstableFor = 0;
+  }
+
+  /**
+   * Live pacing numbers, for the HUD overlay and the smoothness harness.
+   * 'missRate' near zero is the goal; the average frame rate is not.
+   */
+  get pacing(): {
+    missRate: number; rung: number; renderScale: number; stepUpDelay: number;
+    presentEvery: number; refreshHz: number; quality: QualityTier;
+  } {
+    return {
+      missRate: this.pacingMiss,
+      rung: this.rung,
+      renderScale: this.settings.renderScale,
+      stepUpDelay: this.stepUpDelay,
+      presentEvery: this.presentEvery,
+      refreshHz: this.refreshHz,
+      quality: this.quality,
+    };
   }
 
   private onResize = (): void => {
@@ -363,6 +607,63 @@ function withTimeout(fn: () => void | Promise<void>, ms: number): Promise<void> 
     );
   });
 }
+
+/**
+ * The single cost ladder, most expensive first. The governor only ever moves
+ * one step along it, so cost is monotonic by construction.
+ *
+ * **Tier first, resolution only at the bottom.** Changing the internal
+ * resolution reallocates a dozen half-float render targets, which measures at
+ * about 50 ms — a worse hitch than the judder being corrected, and it lands
+ * during the first seconds of play when the governor is still searching. A tier
+ * change costs nothing by comparison, because 'RenderSystem' compiles every
+ * tier's shader variants at boot, so the change is a program-cache hit.
+ *
+ * So the tiers are walked first and cover most of the range on their own
+ * (measured at 1080p: ultra 14.6 ms, high 13.7, medium 10.8, low 8.3). Only a
+ * machine that still cannot hold cadence at 'low' — where there is no tier left
+ * to give up — pays for a reallocation, and then at most twice.
+ */
+/**
+ * The cost ladder, most expensive first.
+ *
+ * `present` is a vsync divisor: 2 means render on every second refresh, which
+ * halves the per-second GPU cost while leaving every frame landing exactly on a
+ * vsync boundary — so it is *perfectly* paced, not merely fast.
+ *
+ * The half-rate rungs sit ABOVE the tier drops deliberately. On a 120 Hz panel
+ * the governor used to hold cadence by walking ultra -> high -> medium -> low,
+ * which buys 120 fps at the cost of SSAO, depth of field and motion blur. For
+ * this game that is the wrong trade: it is a stylised renderer whose whole
+ * point is the image, and a locked 60 with the full composer looks far better
+ * than an unlocked 120 without it. Both are equally smooth — a locked 60 has
+ * zero pacing error by construction.
+ *
+ * The divisor is only offered when the display can actually take it (see
+ * `refreshHz`): halving 60 Hz gives 30, which is worse than any tier drop.
+ */
+const PERF_LADDER: ReadonlyArray<{ tier: QualityTier; scale: number; present: number }> = [
+  { tier: 'ultra', scale: 1.00, present: 1 },
+  { tier: 'ultra', scale: 1.00, present: 2 },
+  { tier: 'high', scale: 1.00, present: 2 },
+  { tier: 'high', scale: 1.00, present: 1 },
+  { tier: 'medium', scale: 1.00, present: 1 },
+  { tier: 'low', scale: 1.00, present: 1 },
+  { tier: 'low', scale: 0.85, present: 1 },
+  { tier: 'low', scale: 0.72, present: 1 },
+];
+
+/** Below this refresh rate, halving the presentation rate is not an option. */
+const MIN_HZ_FOR_HALF_RATE = 100;
+
+/** Clean seconds required before the first attempt to climb the ladder. */
+const INITIAL_STEP_UP_DELAY = 6;
+/** Ceiling on the backoff, so a machine can still recover after a long fight. */
+const MAX_STEP_UP_DELAY = 60;
+/** A step down within this long of a step up counts as undoing it. */
+const UNDO_WINDOW = 30;
+/** How long a rung stays quarantined after it failed to hold cadence. */
+const RUNG_QUARANTINE = 75;
 
 function errorText(err: unknown): string {
   if (err instanceof Error) return err.message || String(err);

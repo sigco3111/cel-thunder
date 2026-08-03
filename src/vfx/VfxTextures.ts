@@ -714,15 +714,33 @@ const RAMP_TABLE: Record<number, Stop[]> = {
    * air and greys out. Driving it the other way — darker as it thins — is what
    * made the tail of the column vanish instead of dissolving.
    */
+  /*
+   * The two dark ramps also carry a HUE progression, and it is doing real work.
+   *
+   * Fresh soot is warm: it is carbon straight out of a flame, it is the darkest
+   * thing in the frame, and it sits a few metres from a fire that is throwing
+   * orange light onto it. Old soot is cool: it has dispersed into air that is
+   * lit by the sky and nothing else, so it takes the sky's colour. Authoring
+   * both ends as the same lavender-grey is what produced the two notes against
+   * this effect at once — "cool grey-lavender with no relationship to the warm
+   * fire beside it" and "no core", because a plume whose head and tail are the
+   * same hue AND the same value has no gradient for the eye to follow down it.
+   *
+   * The fresh end is also nearly a stop darker than it was. Measured against
+   * the terrain it is drawn over — (43,58,84) on the damage framing — the old
+   * head of the column rendered at (62,70,94): LIGHTER than the ground, by
+   * fifteen levels, which is the wrong side of it. Smoke over sunlit land is a
+   * dark shape. It has to be authored as one.
+   */
   [RAMP.SmokeBlack]: [
-    [0.00, 0x3d3e46, 1.00], [0.15, 0x42434c, 0.94], [0.31, 0x494a54, 0.78],
-    [0.47, 0x52535e, 0.56], [0.63, 0x5c5e69, 0.34], [0.78, 0x666875, 0.16],
-    [0.90, 0x6e7180, 0.05], [0.97, 0x757888, 0.0],
+    [0.00, 0x2b2724, 1.00], [0.15, 0x33302c, 0.97], [0.31, 0x3e3c39, 0.84],
+    [0.47, 0x4a4948, 0.61], [0.63, 0x565759, 0.37], [0.78, 0x62646b, 0.17],
+    [0.90, 0x6b6e79, 0.05], [0.97, 0x727684, 0.0],
   ],
   [RAMP.SmokeGrey]: [
-    [0.00, 0x706b64, 0.96], [0.18, 0x78736c, 0.90], [0.35, 0x827d76, 0.74],
-    [0.52, 0x8c8780, 0.53], [0.68, 0x96918a, 0.32], [0.82, 0x9e9993, 0.15],
-    [0.92, 0xa5a09a, 0.05], [0.97, 0xa9a49e, 0.0],
+    [0.00, 0x584f45, 0.98], [0.18, 0x63594e, 0.93], [0.35, 0x72695f, 0.78],
+    [0.52, 0x827a72, 0.56], [0.68, 0x908a85, 0.34], [0.82, 0x9b9694, 0.16],
+    [0.92, 0xa3a0a1, 0.05], [0.97, 0xa7a4a7, 0.0],
   ],
   // Coolant/steam: bright and cool, and it dies fast — a holed radiator throws
   // a thin white plume that is gone within a couple of fuselage lengths.

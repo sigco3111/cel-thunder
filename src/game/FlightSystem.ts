@@ -11,9 +11,11 @@ import {
   readFlightScalar, newFlightTransform,
   type FlightModule, type FlightState, type FlightTransform,
 } from './externals';
-import { createFlightState as fbCreate, stepFlight as fbStep } from './fallback/fallbackFlight';
+import { isWeatherId, type WeatherId } from '../shared/environment';
 import { InputBridge } from './inputBridge';
 import { OfflineSandbox, type DebugPlacement } from './OfflineSandbox';
+import { OrdnanceRuntime } from './OrdnanceRuntime';
+import { flightSpecFor } from './loadout';
 
 /**
  * Client-side prediction, reconciliation and the offline sandbox.
@@ -108,7 +110,13 @@ const _qIdent: Q = q();
 export class FlightSystem implements Subsystem {
   readonly name = 'flight';
 
-  /** True once a real flight model has been resolved (shared or fallback). */
+  /**
+   * The shared flight model. There is no client-side stand-in any more: the
+   * model in 'src/shared/flight' is the one the server integrates, and a client
+   * predicting with anything else is not predicting, it is guessing. If it
+   * cannot be resolved this subsystem fails its init loudly and 'Game' boots
+   * without it.
+   */
   private model!: FlightModule;
   private usingShared = false;
 
@@ -118,6 +126,22 @@ export class FlightSystem implements Subsystem {
   private bridge = new InputBridge();
 
   private sandbox: OfflineSandbox | null = null;
+
+  /**
+   * Air-to-ground stores. Owned here because this is the one subsystem that
+   * has the local aircraft's state in both modes — the sandbox's actor offline,
+   * the predicted flight state online — and because carrying ordnance changes
+   * the mass and the drag the model integrates with.
+   */
+  private ordnance = new OrdnanceRuntime();
+  /** Loadout chosen in the hangar, applied on the next spawn. */
+  private pendingLoadout = 'clean';
+  /**
+   * The spec handed to 'stepFlight'. Identical to 'localSpec' when clean, and a
+   * higher-cd0 variant while stores are aboard — see 'loadout.ts' for why the
+   * penalty has to travel on the spec rather than on the state.
+   */
+  private localFlightSpec: AircraftSpec | null = null;
 
   // --- local prediction ------------------------------------------------------
   private localFlight: FlightState | null = null;
@@ -138,26 +162,51 @@ export class FlightSystem implements Subsystem {
 
   async init(ctx: GameContext): Promise<void> {
     this.ctx = ctx;
-    this.env = getClientEnv(ctx.mapSeed);
     this.debug = resolveDebugFlag();
 
-    const ext = await loadExternals(ctx.mapSeed);
-    if (ext.flight) {
-      this.model = ext.flight;
-      this.usingShared = true;
-    } else {
-      this.model = { createFlightState: fbCreate, stepFlight: fbStep };
-      this.usingShared = false;
-      console.warn('[flight] shared flight model unavailable — using the client fallback');
-    }
-
     this.net = ctx.get<NetSystem>('net');
+    // The air has to be built for the match weather *before* the first
+    // prediction step: the wind field and the turbulence amplitude are both
+    // functions of it, and the server integrates against exactly the same pair
+    // of numbers. Getting this wrong does not look like weather, it looks like
+    // a permanent rubber-band.
+    this.env = getClientEnv(ctx.mapSeed, this.matchWeather());
+
+    const ext = await loadExternals(ctx.mapSeed);
+    if (!ext.flight) {
+      throw new Error(
+        'shared flight model (src/shared/flight) did not resolve — refusing to fly a stand-in',
+      );
+    }
+    this.model = ext.flight;
+    this.usingShared = true;
+
+    // A new match can bring new weather, and the air the model integrates
+    // against has to follow it or client and server diverge.
+    ctx.bus.on('net:environment', (p: { weather?: string }) => {
+      if (isWeatherId(p?.weather)) this.env.setWeather(p.weather);
+    });
     this.bridge.attach(ctx.get('input'));
 
     ctx.bus.on('net:spawned', (m: { entityId: number; aircraft?: string }) => {
       this.onSpawned(m.entityId, m.aircraft);
     });
     ctx.bus.on('net:offline', () => this.startSandbox());
+
+    // --- ordnance ----------------------------------------------------------
+    this.ordnance.init(ctx, this.env);
+    // The hangar announces the chosen loadout before the spawn lands; the
+    // spawn is what arms it, so that the stores are always in step with an
+    // aeroplane that actually exists.
+    ctx.bus.on('ui:spawn', (m: { loadout?: string }) => {
+      this.pendingLoadout = m?.loadout ?? 'clean';
+    });
+    ctx.bus.on('net:spawned', (m: { aircraft?: string }) => {
+      const spec = (m?.aircraft && AIRCRAFT_BY_ID[m.aircraft])
+        || this.localSpec || this.sandbox?.playerSpec || null;
+      this.ordnance.setLoadout(spec, this.pendingLoadout);
+      this.localFlightSpec = null;
+    });
 
     // Screenshot framings ask for a posed situation (see CameraSystem.
     // debugFraming). Only the sandbox can honour it — online the server owns
@@ -181,6 +230,12 @@ export class FlightSystem implements Subsystem {
       (window as unknown as Record<string, unknown>).__flight = this;
       console.info('[flight] prediction debug enabled (?flightdebug=1)');
     }
+  }
+
+  /** Match weather from the netcode, defaulting to the fair-weather sky. */
+  private matchWeather(): WeatherId {
+    const w = (this.net as unknown as { weather?: unknown } | undefined)?.weather;
+    return isWeatherId(w) ? w : 'scattered';
   }
 
   private startSandbox(): void {
@@ -215,8 +270,14 @@ export class FlightSystem implements Subsystem {
     // if a server appears mid-session.
     const sent = this.net ? this.net.sendInput(frame) : { ...frame, seq: 0 };
 
+    // Stores first: mass and drag have to be on the aeroplane before it is
+    // integrated, not a frame behind it.
+    this.applyStores();
+
     if (this.sandbox) {
       this.sandbox.step(dt, sent);
+      this.ordnance.update(dt, sent.bits);
+      this.publishOrdnance();
       return;
     }
 
@@ -227,7 +288,7 @@ export class FlightSystem implements Subsystem {
 
     // --- predict ------------------------------------------------------------
     (this.localFlight as Record<string, unknown>).damage = this.localEntity.damage;
-    this.model.stepFlight(this.localFlight, this.localSpec, sent, this.env, dt);
+    this.model.stepFlight(this.localFlight, this.flightSpec(), sent, this.env, dt);
     this.pushHistory(sent.seq);
 
     // --- decay the visual correction ---------------------------------------
@@ -237,6 +298,45 @@ export class FlightSystem implements Subsystem {
     this.errQ.x = _qc.x; this.errQ.y = _qc.y; this.errQ.z = _qc.z; this.errQ.w = _qc.w;
 
     this.publish(ctx, sent);
+
+    // After 'publish', so the runtime reads this frame's transform rather than
+    // the previous one when it works out where a bomb released now would land.
+    this.ordnance.update(dt, sent.bits);
+    this.publishOrdnance();
+  }
+
+  // -------------------------------------------------------------------------
+  // Stores
+  // -------------------------------------------------------------------------
+
+  /**
+   * Hands the carried mass to the flight state and the carriage drag to the
+   * spec the model integrates against.
+   *
+   * 'extraMass' is a field the shared model already honours in 'updateMass'.
+   * Drag has no equivalent — 'dmg.extraDrag' is rebuilt from the damage bits
+   * at the top of every step — so it travels on a variant spec instead. See
+   * 'loadout.ts'.
+   */
+  private applyStores(): void {
+    const mass = this.ordnance.extraMass;
+    const cdArea = this.ordnance.extraDragArea;
+    if (this.sandbox) {
+      this.sandbox.setPlayerStores(mass, cdArea);
+      return;
+    }
+    const f = this.localFlight as Record<string, unknown> | null;
+    if (f && typeof f.extraMass === 'number') f.extraMass = mass;
+    this.localFlightSpec = this.localSpec ? flightSpecFor(this.localSpec, cdArea) : null;
+  }
+
+  /** The spec to integrate against this frame — loaded variant or the clean one. */
+  private flightSpec(): AircraftSpec {
+    return this.localFlightSpec ?? this.localSpec!;
+  }
+
+  private publishOrdnance(): void {
+    this.ctx.bus.emit('hud:ordnance', this.ordnance.hudState);
   }
 
   /** Creates the local flight state the first time the server tells us where we are. */
@@ -317,7 +417,9 @@ export class FlightSystem implements Subsystem {
     for (let i = 0; i < pending.length; i++) {
       const f = pending[i];
       const fdt = clamp(f.dt, 0.002, 0.05);
-      this.model.stepFlight(this.localFlight, this.localSpec, f, this.env, fdt);
+      // Same spec the live prediction uses, stores and all: replaying against
+      // the clean airframe would re-introduce the divergence on every reconcile.
+      this.model.stepFlight(this.localFlight, this.flightSpec(), f, this.env, fdt);
     }
     this.stats.replayed = pending.length;
 
@@ -462,7 +564,35 @@ export class FlightSystem implements Subsystem {
   get sandboxRoster() { return this.sandbox?.roster ?? []; }
   get sandboxShots(): number { return this.sandbox?.shotsFired ?? 0; }
 
+  /**
+   * The stores state, for the HUD and for the playability harness — which
+   * needs the bombsight solution to know when a release would actually hit
+   * what it is aiming at.
+   */
+  get ordnanceState(): {
+    loadout: string; bombs: number; rockets: number; inFlight: number;
+    extraMass: number; extraDrag: number;
+    solution: { x: number; y: number; z: number; time: number } | null;
+    targets: { id: number; kind: string; x: number; y: number; z: number; hp: number; maxHp: number; alive: boolean }[];
+  } {
+    const h = this.ordnance.hudState;
+    return {
+      loadout: this.ordnance.loadoutId,
+      bombs: this.ordnance.bombsRemaining,
+      rockets: this.ordnance.rocketsRemaining,
+      inFlight: this.ordnance.storesInFlight,
+      extraMass: this.ordnance.extraMass,
+      extraDrag: this.ordnance.extraDragArea,
+      solution: h.hasSolution ? { x: h.ix, y: h.iy, z: h.iz, time: h.fallTime } : null,
+      targets: this.ordnance.groundTargets.map((t) => ({
+        id: t.id, kind: t.kind, x: t.x, y: t.y, z: t.z,
+        hp: t.hp, maxHp: t.maxHp, alive: t.alive,
+      })),
+    };
+  }
+
   dispose(): void {
+    this.ordnance.dispose();
     this.localFlight = null;
     this.history.length = 0;
     this.sandbox = null;

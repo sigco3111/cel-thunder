@@ -81,6 +81,29 @@ export function createSkyUniforms(): SkyUniforms {
     uSkyBandSoft: { value: 0.11 },
     uSkyBandAmount: { value: 0.60 },
     uSkySaturation: { value: 1.10 },
+    /**
+     * How completely a cloud deck has taken the sky over, 0..1.
+     *
+     * The scattering integral the backdrop runs is a *clear-sky* model: it
+     * knows about air, aerosol and the sun, and nothing whatever about the
+     * eight kilometres of cumulonimbus that may be sitting between the
+     * observer and space. Left to itself it paints the same saturated cobalt
+     * zenith under a storm as over a high-pressure morning. This is the term
+     * that tells it otherwise; the sky system drives it from the weather's own
+     * sun-occlusion figure, gated on the camera being under the deck.
+     */
+    uOvercast: { value: 0 },
+    /**
+     * Whiteout: the camera is inside cloud, 0..1.
+     *
+     * The raymarcher composites the cloud layer it can see *in front of* the
+     * camera; it has nothing to say about the cloud the camera is standing in,
+     * so from inside a cumulonimbus the backdrop still paints a sky. Scene
+     * geometry is handled by the fog, and this is the same collapse applied to
+     * the one surface fog cannot reach.
+     */
+    uWhiteout: { value: 0 },
+    uWhiteoutColor: { value: new THREE.Color(0.5, 0.52, 0.56) },
     uHorizonWarm: { value: new THREE.Color(1.0, 0.845, 0.66) },
     uHorizonWarmAmount: { value: 0.42 },
 

@@ -80,6 +80,22 @@ const _cB = new THREE.Color();
 const _cC = new THREE.Color();
 const _cD = new THREE.Color();
 
+/**
+ * Pulls a colour toward a cool grey of the same luminance and darkens it, by
+ * 'k' in 0..1. The GLSL twin of this lives at the end of the sky backdrop's
+ * fragment shader; the two must move together or the sky and the fog under it
+ * disagree about what colour the weather is.
+ */
+function greyOut(c: THREE.Color, k: number): void {
+  const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+  const m = k * 0.90;
+  c.setRGB(
+    (c.r + (lum * 0.93 - c.r) * m) * (1 - 0.50 * k),
+    (c.g + (lum * 0.97 - c.g) * m) * (1 - 0.50 * k),
+    (c.b + (lum * 1.07 - c.b) * m) * (1 - 0.50 * k),
+  );
+}
+
 export class SkySystem implements Subsystem {
   readonly name = 'sky';
 
@@ -156,6 +172,12 @@ export class SkySystem implements Subsystem {
 
   private timeOfDay = 9.5;
   private lastPublishedTod = -1;
+  /** False until the first match sky has been latched, so it cuts, not fades. */
+  private matchWeatherApplied = false;
+  /** Last values pushed to the VFX layer; see 'publishAtmosphere'. */
+  private publishedRain = -1;
+  private publishedWind = -1;
+  private publishTimer = 0;
   private tier: QualityTier = 'high';
   private cloudQuality: CloudQuality = {
     renderScale: 0.5, steps: 48, lightSteps: 5, godRaySamples: 24, temporalBlend: 0.14,
@@ -466,10 +488,85 @@ export class SkySystem implements Subsystem {
       if (typeof hours === 'number' && isFinite(hours)) this.setTimeOfDay(hours);
     }));
 
-    // Seed everything so frame 0 already looks correct.
-    this.weather.set('scattered', 0);
+    // The match sky arrives from the server (or from the sandbox's own seeded
+    // pick) during the net subsystem's init, which has already completed by the
+    // time we get here. Read it directly rather than waiting for the event: the
+    // announcement was made before we existed to hear it, and a frame of
+    // 'scattered' before snapping to 'storm' is a visible pop on the first
+    // frame the player ever sees.
+    const seeded = this.readMatchEnvironment(ctx);
+    this.setTimeOfDay(seeded.timeOfDay);
+    ctx.timeOfDay = seeded.timeOfDay;
+    this.weather.set(seeded.weather, 0);
+    // Later changes — a reconnect, a new match, a late-arriving 'match'
+    // broadcast — cross-fade rather than cut.
+    this.disposers.push(ctx.bus.on('net:environment', (p: {
+      weather?: WeatherName; timeOfDay?: number;
+    }) => {
+      if (!p) return;
+      if (typeof p.timeOfDay === 'number' && isFinite(p.timeOfDay)) this.setTimeOfDay(p.timeOfDay);
+      if (p.weather) this.setWeather(p.weather, this.matchWeatherApplied ? 24 : 0);
+      this.matchWeatherApplied = true;
+    }));
+    this.matchWeatherApplied = true;
+
     this.updateSlow(ctx, 0);
+    this.publishAtmosphere(0);
     ctx.bus.emit('sky:ready', { system: this });
+  }
+
+  /**
+   * The per-match sky, read structurally off the net subsystem.
+   *
+   * Structural rather than an import of 'NetSystem' on purpose: the sky has no
+   * business depending on the netcode, and the only thing it wants is two
+   * numbers that any provider of a match could supply.
+   */
+  private readMatchEnvironment(ctx: GameContext): { weather: WeatherName; timeOfDay: number } {
+    const net = ctx.get<Subsystem & { weather?: string; matchTimeOfDay?: number }>('net');
+    const w = net?.weather;
+    const tod = net?.matchTimeOfDay;
+    return {
+      weather: (WEATHER_NAMES as readonly string[]).indexOf(w ?? '') >= 0
+        ? (w as WeatherName)
+        : 'scattered',
+      timeOfDay: typeof tod === 'number' && isFinite(tod) ? tod : ctx.timeOfDay,
+    };
+  }
+
+  /**
+   * Republishes the blended weather in the vocabulary the VFX layer speaks.
+   *
+   * VFX owns canopy rain, condensation and the wind that carries smoke, and it
+   * listens on the 'weather' channel for a camera framing's directive. Nothing
+   * was ever published there during an ordinary match, so a storm rained on the
+   * sky's own overlay and on nothing else. This closes that gap without either
+   * module importing the other.
+   *
+   * Deliberately silent while a framing directive is applied: a composed shot
+   * has already said exactly what it wants on that channel and must not be
+   * argued with. Also deliberately *not* emitting 'cloudBase', because our own
+   * 'weather' listener reads that as an incoming directive and we would end up
+   * commanding ourselves.
+   */
+  private publishAtmosphere(dt: number): void {
+    if (!this.ctx || this.directive) return;
+    const w = this.weather.current;
+    const rain = clamp(w.rain, 0, 1);
+    const humidity = clamp(0.42 + w.coverage * 0.55 + w.rain * 0.35, 0.15, 1.35);
+    this.publishTimer -= dt;
+    // Republished on a slow heartbeat as well as on change, because the sky
+    // initialises *before* VFX does: a one-shot announcement at init is made to
+    // an empty room, and a settled sky then never changes again, so the canopy
+    // stayed dry for the entire match. Two seconds is imperceptible on a
+    // weather transition and costs one bus emit.
+    if (this.publishTimer > 0
+      && Math.abs(rain - this.publishedRain) < 0.01
+      && Math.abs(w.windSpeed - this.publishedWind) < 0.25) return;
+    this.publishTimer = 2;
+    this.publishedRain = rain;
+    this.publishedWind = w.windSpeed;
+    this.ctx.bus.emit('weather', { rain, humidity, windSpeed: w.windSpeed });
   }
 
   update(ctx: GameContext): void {
@@ -590,6 +687,9 @@ export class SkySystem implements Subsystem {
     this.weather.update(dt);
     const w = this.weather.current;
     this.applyDirective(w);
+    // Keep the VFX layer's rain, humidity and wind on the same weather we are.
+    // Rate-limited inside, so a settled sky costs one pair of compares.
+    this.publishAtmosphere(dt);
 
     // ---- ephemeris -------------------------------------------------------
     computeEphemeris(
@@ -706,6 +806,32 @@ export class SkySystem implements Subsystem {
     _cC.setRGB(
       Math.max(_cC.r, 0.075 * twP), Math.max(_cC.g, 0.070 * twP), Math.max(_cC.b, 0.098 * twP));
 
+    // ---- under-deck grey -------------------------------------------------
+    //
+    // 'sunOcclusion' already says how much of the direct beam the deck eats.
+    // The *sky* has to lose the same amount of chroma and value, or standing
+    // under a storm gives the cobalt zenith of a clear morning — the single
+    // most obviously wrong thing this sky can do, and the reason 'storm' has
+    // never been shippable. Faded out as the camera climbs through the deck,
+    // because above the top the clear-sky solution is simply correct again.
+    //
+    // Suppressed entirely while a camera framing owns the sky: a framing states
+    // the picture it wants, and it authored that picture against the clear-sky
+    // solution. Nothing the screenshot harness captures changes because of this.
+    const overcast = this.directive
+      ? 0
+      : clamp(1 - w.sunOcclusion, 0, 1)
+        * clamp(1 - (camAlt - w.cloudTop) / 1400, 0, 1)
+        * day;
+    u.uOvercast.value = overcast;
+    if (overcast > 0.002) {
+      // Same two moves the backdrop makes, applied to the colours the fog, the
+      // aerial perspective and the cel shadow ramp are built from, so the world
+      // under the deck agrees with the sky over it.
+      greyOut(_cB, overcast);
+      greyOut(_cC, overcast);
+    }
+
     (u.uZenithColor.value as THREE.Color).copy(_cB);
     (u.uHorizonColor.value as THREE.Color).copy(_cC);
 
@@ -744,10 +870,44 @@ export class SkySystem implements Subsystem {
       .multiplyScalar(0.55 + 0.45 * day);
 
     // ---- fog and aerial perspective for everything else -----------------
+    //
+    // Inside cloud the atmosphere is not "hazy", it is opaque: real in-cloud
+    // visibility is tens of metres. Without this the aeroplane flies through a
+    // solid cumulonimbus with the coastline still legible twenty kilometres
+    // away and the whole thing reads as a broken shader rather than as weather.
+    // Held at ~260 m rather than the honest 50 m because the player still has
+    // to be able to fly the aeroplane and read their own wingtips; the point is
+    // "get out of this cloud", not "you are now blind".
+    //
+    // 'cameraCloudDensity' is last frame's value — it is computed at the end of
+    // this function — which is exactly right: a one-frame lag on a quantity
+    // that takes half a second to cross is invisible, and sampling the CPU
+    // density field twice per frame is not free.
+    //
+    // Off while a camera framing owns the sky, like the rest of the ambient
+    // weather machine: framings place themselves clear of their own deck and
+    // must not be second-guessed.
+    const inCloud = this.directive ? 0 : smoothstep(0.06, 0.30, this.cameraCloudDensity);
+    const fogDensity = w.fogDensity + inCloud * (0.0038 - w.fogDensity);
+    // The colour of a whiteout is the cloud's own lit colour: skylight plus
+    // whatever the sun is managing to push through, never the horizon's blue.
+    if (inCloud > 0.002) {
+      _cD.setRGB(
+        _cC.r * 0.35 + ctx.sunColor.r * ctx.sunIntensity * 0.10 + 0.100,
+        _cC.g * 0.35 + ctx.sunColor.g * ctx.sunIntensity * 0.10 + 0.105,
+        _cC.b * 0.35 + ctx.sunColor.b * ctx.sunIntensity * 0.10 + 0.115,
+      );
+      _cC.lerp(_cD, inCloud * 0.9);
+      (u.uWhiteoutColor.value as THREE.Color).copy(_cD);
+    }
+    // 0.97 rather than 1: a hair of the underlying sky left in keeps the murk
+    // from being a single flat value, which is what a debug fill looks like.
+    u.uWhiteout.value = inCloud * 0.97;
+
     const fog = ctx.scene.fog;
     if (fog) {
       fog.color.copy(_cC);
-      if ((fog as THREE.FogExp2).isFogExp2) (fog as THREE.FogExp2).density = w.fogDensity;
+      if ((fog as THREE.FogExp2).isFogExp2) (fog as THREE.FogExp2).density = fogDensity;
     }
     celGlobals.uAerialColor.value.copy(_cC);
     // Aerosol has a ~1.2 km scale height, so a camera at altitude looks at
@@ -756,8 +916,13 @@ export class SkySystem implements Subsystem {
     // frame into one flat cyan wash, which is both wrong and the fastest way to
     // lose every depth cue the terrain has.
     const aerialLift = 1 + Math.min(camAlt / 2800, 1.9);
-    u.uAerialFar.value = w.aerialFar * aerialLift;
-    celGlobals.uAerialFar.value = w.aerialFar * aerialLift;
+    // Inside cloud the aerial-perspective distance collapses with the fog:
+    // 'uAerialFar' is what the cel materials fade to the atmosphere colour
+    // over, and leaving it at tens of kilometres is what let an aircraft in the
+    // middle of a cumulonimbus still read as a crisp silhouette.
+    const aerialFar = (w.aerialFar * aerialLift) * (1 - inCloud) + 420 * inCloud;
+    u.uAerialFar.value = aerialFar;
+    celGlobals.uAerialFar.value = aerialFar;
     celGlobals.uAerialStrength.value = 0.9;
     celGlobals.uGroundColor.value.copy(this.hemi.groundColor);
 

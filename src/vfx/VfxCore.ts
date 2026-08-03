@@ -143,8 +143,17 @@ export class VfxCore {
     // that cowling dissolves the tongue into a translucent orange wash with
     // the aircraft's own markings legible through it.
     this.fire = this.engine.add({
+      // ink 1.5 -> 0.9, soft 0.5 -> 1.3. A constant-weight dark contour drawn
+      // round an un-eroded tile is what turned every lick into the "hard-edged
+      // flat capsule painted on the wing" the critique found: the outline is
+      // the strongest cue in the stamp, and a closed one round a rounded tile
+      // reads as a pill whatever is inside it. Thinning it lets the eroded
+      // silhouette (see ParticleEngine's emissive erosion) carry the shape, and
+      // widening the soft-depth band gives the tongue the fade against the
+      // airframe the note also asks for — without going so far that the flame
+      // dissolves into a wash with the cowling's markings legible through it.
       name: 'fire', capacity: cap(6000), lit: false, additive: false,
-      ink: 1.5, steps: 4, soft: 0.5, renderOrder: 24, bloom: true,
+      ink: 0.9, steps: 4, soft: 1.3, renderOrder: 24, bloom: true,
     });
     this.flash = this.engine.add({
       name: 'flash', capacity: cap(1600), lit: false, additive: true,

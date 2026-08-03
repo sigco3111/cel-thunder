@@ -4,13 +4,13 @@ import { EntityKind, EventKind, DamageBits } from '../shared/protocol';
 import { AIRCRAFT, aircraftByIndex, type AircraftSpec } from '../shared/aircraft';
 import { loadExternals, externals, type AircraftModel } from './externals';
 import { getClientEnv, type ClientEnv } from './env';
-import { buildFallbackAircraft, disposeFallbackAircraft } from './fallback/fallbackAircraft';
 import { AircraftView, DetailTier, type ViewFx } from './AircraftView';
 import { TracerRenderer } from './visual/TracerRenderer';
 import { BulletHoleField, GroundScarField } from './visual/Decals';
 import { makeSmokeField, makeFireField, SMOKE_PRESETS, FIRE_PRESETS, type BillboardField } from './visual/Particles';
 import { DebrisField } from './visual/Debris';
 import { ParachuteField } from './visual/Parachutes';
+import { OrdnanceField } from './visual/Ordnance';
 import { updateCelGlobals } from '../render/CelMaterial';
 import type { VfxSystem } from '../vfx/VfxSystem';
 
@@ -79,6 +79,7 @@ export class EntitySystem implements Subsystem {
   private fire!: BillboardField;
   private debris!: DebrisField;
   private chutes!: ParachuteField;
+  private stores3d!: OrdnanceField;
   private fx!: ViewFx;
 
   private quality: QualityTier = 'high';
@@ -87,6 +88,9 @@ export class EntitySystem implements Subsystem {
 
   /** Entities whose wreck has already burned a scar into the ground. */
   private scarred = new Set<number>();
+
+  /** Latest stores announcement per entity, so a pooled view can be re-dressed. */
+  private stores = new Map<number, { loadout: string; bomb: number[]; rocket: number[] }>();
 
   /**
    * The VFX subsystem, resolved lazily.
@@ -130,11 +134,25 @@ export class EntitySystem implements Subsystem {
     this.chutes = new ParachuteField(this.env, 8);
     ctx.scene.add(this.chutes.group);
 
+    this.stores3d = new OrdnanceField();
+    ctx.scene.add(this.stores3d.group);
+
     this.fx = { smoke: this.smoke, fire: this.fire, debris: this.debris, holes: this.holes };
 
     await this.prewarm();
+    this.uploadToGpu(ctx);
 
     this.unsubs.push(ctx.bus.on('game:event', (e) => this.onGameEvent(e)));
+    // Which stores are still hanging on which aeroplane. Replayed on every
+    // release so the rig always matches the simulation, and remembered so a
+    // view that is acquired *after* the announcement still gets it.
+    this.unsubs.push(ctx.bus.on('game:stores', (m: {
+      entityId: number; loadout: string; bomb: number[]; rocket: number[];
+    }) => {
+      if (!m || !m.entityId) return;
+      this.stores.set(m.entityId, m);
+      this.active.get(m.entityId)?.setStores(m.loadout, m.bomb, m.rocket);
+    }));
     this.unsubs.push(ctx.bus.on('quality', (q: QualityTier) => {
       this.quality = q;
       this.qualityScale = qualityScale(q);
@@ -161,19 +179,94 @@ export class EntitySystem implements Subsystem {
     }
   }
 
+  /**
+   * Forces every pooled airframe onto the GPU while the loading screen is
+   * still up.
+   *
+   * 'prewarm' builds the geometry and the livery textures in JavaScript, which
+   * is only half the job: three uploads a buffer or a texture lazily, the first
+   * time something is actually drawn with it. So the cost of pushing ~24 vertex
+   * buffers and three 1k livery textures per airframe across to the driver was
+   * still being paid at the worst possible moment — the frame an aeroplane
+   * first came into view. Measured, that was a 75 ms lockup as the player's own
+   * aircraft appeared on deploy, and another every time a new enemy type was
+   * first seen, which is exactly the 80 ms lurch that shows up mid-fight.
+   *
+   * Drawing them once into a 4x4 target is the whole fix: it is a real draw, so
+   * every buffer and texture the material touches goes across, and at 4x4 the
+   * rasterisation is free. The scratch scene keeps the pooled holders out of
+   * the live scene graph, so nothing downstream can observe this happening.
+   */
+  private uploadToGpu(ctx: GameContext): void {
+    if (!this.allViews.length) return;
+    const scratch = new THREE.Scene();
+    const cam = new THREE.PerspectiveCamera(60, 1, 0.1, 10000);
+    const target = new THREE.WebGLRenderTarget(4, 4);
+    // Everything else this subsystem can put on screen for the first time
+    // mid-fight. Debris, the parachute and the ordnance rigs are the ones that
+    // matter: they first appear at the exact moment something is destroyed,
+    // which is the worst possible frame to stop for an upload.
+    const fields: THREE.Object3D[] = [
+      this.debris.group, this.chutes.group, this.stores3d.group, this.scars.group,
+      this.holes.mesh, this.smoke.mesh, this.fire.mesh, this.tracers.mesh,
+    ];
+    const movers: THREE.Object3D[] = [...this.allViews.map((v) => v.holder), ...fields];
+    // A pooled airframe must go back to hidden whatever it was before; the
+    // shared fields go back to exactly the visibility they had.
+    const restoreVisible: boolean[] = [
+      ...this.allViews.map(() => false), ...fields.map((f) => f.visible),
+    ];
+    const parents: Array<THREE.Object3D | null> = [];
+    try {
+      for (const o of movers) {
+        parents.push(o.parent);
+        o.visible = true;
+        scratch.add(o);
+      }
+      // Far enough back that the whole pool is inside the frustum; nothing is
+      // frustum-culled, because a culled object is never uploaded.
+      cam.position.set(0, 0, 900);
+      cam.lookAt(0, 0, 0);
+      cam.updateMatrixWorld();
+      const prev = ctx.renderer.getRenderTarget();
+      ctx.renderer.setRenderTarget(target);
+      ctx.renderer.render(scratch, cam);
+      ctx.renderer.setRenderTarget(prev);
+    } catch (err) {
+      // Never fatal: a warm cache is an optimisation, and booting without it
+      // costs one hitch, whereas failing here costs the whole subsystem.
+      console.warn('[entities] GPU pre-upload skipped', err);
+    } finally {
+      for (let i = 0; i < movers.length; i++) {
+        const o = movers[i];
+        o.visible = restoreVisible[i];
+        scratch.remove(o);
+        parents[i]?.add(o);
+      }
+      target.dispose();
+    }
+  }
+
+  /**
+   * Builds one airframe.
+   *
+   * There is no stand-in builder any more. 'src/assets/aircraft' is the only
+   * source of an aeroplane, and a failure to produce one is a failure of this
+   * subsystem — which 'Game.init' contains by dropping us and booting degraded.
+   * That is a far more honest outcome than a silent swap to programmer art that
+   * nobody notices until the screenshots come back.
+   */
   private build(typeId: number): AircraftView {
     const spec: AircraftSpec = aircraftByIndex(typeId);
     const ext = externals();
+    if (!ext.buildAircraft) {
+      throw new Error('aircraft builder (src/assets/aircraft) did not resolve');
+    }
     let model: AircraftModel;
-    if (ext.buildAircraft) {
-      try {
-        model = ext.buildAircraft(spec);
-      } catch (err) {
-        console.error(`[entities] buildAircraft("${spec.id}") threw; using the stand-in`, err);
-        model = buildFallbackAircraft(spec);
-      }
-    } else {
-      model = buildFallbackAircraft(spec);
+    try {
+      model = ext.buildAircraft(spec);
+    } catch (err) {
+      throw new Error(`buildAircraft("${spec.id}") threw: ${(err as Error)?.message ?? err}`);
     }
     const view = new AircraftView(spec, typeId, model);
     this.allViews.push(view);
@@ -205,6 +298,8 @@ export class EntitySystem implements Subsystem {
       view = this.build(t);
     }
     view.reset(entityId, team);
+    const st = this.stores.get(entityId);
+    if (st) view.setStores(st.loadout, st.bomb, st.rocket);
     this.group.add(view.holder);
     this.active.set(entityId, view);
 
@@ -222,6 +317,7 @@ export class EntitySystem implements Subsystem {
     const view = this.active.get(entityId);
     if (!view) return;
     this.active.delete(entityId);
+    this.stores.delete(entityId);
     const vfx = this.vfxSystem();
     if (vfx) vfx.entities.detach(entityId, vfx.core);
     // Any part of this rig still tumbling has to come home before the model is
@@ -353,6 +449,9 @@ export class EntitySystem implements Subsystem {
 
     // --- projectiles --------------------------------------------------------
     this.tracers.collect(ctx.entities);
+    // Bombs and rockets in flight. Rocket motors spend the shared fire and
+    // smoke budget rather than owning a particle system of their own.
+    this.stores3d.collect(ctx.entities, this.motorEmit);
 
     // --- shared fx ----------------------------------------------------------
     this.env.windAt({ x: cam.position.x, y: cam.position.y, z: cam.position.z }, _windV);
@@ -379,6 +478,24 @@ export class EntitySystem implements Subsystem {
     const v = this.active.get(owner);
     if (!v || !v.holder.visible) return null;
     return v.holder.matrixWorld;
+  };
+
+  /**
+   * Rocket motor plume: a lick of flame at the nozzle and a cordite trail.
+   *
+   * Smoke is emitted on roughly half the frames per rocket. A six-round ripple
+   * burning for a second would otherwise put four hundred puffs into a field
+   * sized for the whole match's damage smoke, and evict every burning
+   * aeroplane's plume to draw one salvo.
+   */
+  private motorEmit = (
+    x: number, y: number, z: number, dx: number, dy: number, dz: number, burn: number,
+  ): void => {
+    const v = 26 * burn;
+    this.fire.emit(x, y, z, dx * v, dy * v, dz * v, FIRE_PRESETS.engine);
+    if (Math.random() < 0.5) {
+      this.smoke.emit(x, y, z, dx * v * 0.35, dy * v * 0.35, dz * v * 0.35, SMOKE_PRESETS.rocket);
+    }
   };
 
   private debrisEmit = (
@@ -498,6 +615,7 @@ export class EntitySystem implements Subsystem {
     this.debris.dispose();
     this.chutes.dispose();
     this.tracers.dispose();
+    this.stores3d.dispose();
     this.holes.dispose();
     this.scars.dispose();
     this.smoke.dispose();
@@ -505,8 +623,7 @@ export class EntitySystem implements Subsystem {
     const ext = externals();
     for (const v of this.allViews) {
       v.dispose();
-      if ((v.model as Record<string, unknown>).__fallback) disposeFallbackAircraft(v.model);
-      else ext.disposeAircraft?.(v.model);
+      ext.disposeAircraft?.(v.model);
     }
     this.allViews.length = 0;
     this.active.clear();

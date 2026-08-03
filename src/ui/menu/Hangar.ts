@@ -1,11 +1,15 @@
 import { el, setText, setClass, setStyle, clamp, fixed, int } from '../dom';
-import { AIRCRAFT, AIRCRAFT_BY_ID, type AircraftSpec, type Nation } from '../../shared/aircraft';
+import {
+  AIRCRAFT, AIRCRAFT_BY_ID, CLEAN_LOADOUT, loadoutMass, loadoutsFor,
+  type AircraftSpec, type Loadout, type Nation,
+} from '../../shared/aircraft';
 import { NATION_LABEL, ROLE_LABEL } from '../theme';
 import { makeRoundel } from './Emblem';
 import { HangarViewer } from './HangarViewer';
 import { performanceOf, statFraction } from './perf';
 
 const NATIONS: (Nation | 'all')[] = ['all', 'britain', 'usa', 'ussr', 'germany', 'japan'];
+const CLEAN = CLEAN_LOADOUT;
 
 interface StatRow {
   key: string;
@@ -37,12 +41,15 @@ export class Hangar {
   private stats: StatRow[] = [];
   private extra = new Map<string, HTMLElement>();
   private arms: HTMLElement;
+  private loadoutRow: HTMLElement;
+  private loadoutNote: HTMLElement;
+  private loadout: Loadout = CLEAN;
   private brEl: HTMLElement;
   private notes: HTMLElement;
   private liveryRow: HTMLElement;
   private deployBtn: HTMLButtonElement;
 
-  onDeploy: (spec: AircraftSpec, livery: number) => void = () => {};
+  onDeploy: (spec: AircraftSpec, livery: number, loadout: string) => void = () => {};
   onBack: () => void = () => {};
   onSelect: (spec: AircraftSpec, livery: number) => void = () => {};
 
@@ -130,6 +137,22 @@ export class Hangar {
     el('span', 'ct-head-rule', ah);
     this.arms = el('div', 'ct-arms', card);
 
+    // --- loadout ----------------------------------------------------------
+    // Ordnance is a *choice*, not a property of the airframe: a Spitfire with
+    // two 250 lb bombs is thirty km/h slower and cannot fight until it has
+    // dropped them, so the trade has to be made here rather than assumed.
+    const loh = el('div', 'ct-head', card);
+    el('span', '', loh, 'Loadout');
+    el('span', 'ct-head-rule', loh);
+    this.loadoutRow = el('div', 'ct-liveries ct-panel is-flat', card);
+    (this.loadoutRow as HTMLElement).style.flexWrap = 'wrap';
+    this.loadoutNote = el('div', 'ct-label', card, '');
+    (this.loadoutNote as HTMLElement).style.opacity = '0.72';
+    (this.loadoutNote as HTMLElement).style.margin = 'var(--s1) 0 var(--s2)';
+    (this.loadoutNote as HTMLElement).style.lineHeight = '1.5';
+    (this.loadoutNote as HTMLElement).style.textTransform = 'none';
+    (this.loadoutNote as HTMLElement).style.letterSpacing = '.02em';
+
     const nh = el('div', 'ct-head', card);
     el('span', '', nh, 'Doctrine');
     el('span', 'ct-head-rule', nh);
@@ -141,7 +164,7 @@ export class Hangar {
 
     const deploy = el('div', 'ct-deploy', card);
     this.deployBtn = el('button', 'ct-btn is-primary', deploy, 'Deploy') as HTMLButtonElement;
-    this.deployBtn.onclick = () => this.onDeploy(this.selected, this.livery);
+    this.deployBtn.onclick = () => this.onDeploy(this.selected, this.livery, this.loadout.id);
 
     this.buildList();
     this.setFilter('all');
@@ -230,9 +253,11 @@ export class Hangar {
       el('span', 'am', row, `${spec.rockets.kg} kg`);
     }
 
+    this.buildLoadouts(spec);
     this.writeNotes(spec, p);
     this.buildLiveries(spec);
     this.viewer.show(spec, this.livery);
+    this.viewer.setLoadout(this.loadout.id);
     this.onSelect(spec, this.livery);
   }
 
@@ -276,6 +301,39 @@ export class Hangar {
     }
   }
 
+  /**
+   * The loadout chips, and the one line of consequence that matters: how much
+   * a strike fit costs in weight, so the choice is informed rather than free.
+   */
+  private buildLoadouts(spec: AircraftSpec): void {
+    while (this.loadoutRow.firstChild) this.loadoutRow.removeChild(this.loadoutRow.firstChild);
+    const options = loadoutsFor(spec);
+    // Changing aircraft can invalidate the choice; fall back to clean.
+    if (!options.some((l) => l.id === this.loadout.id)) this.loadout = options[0];
+
+    for (const l of options) {
+      const b = el('button', 'ct-btn is-ghost is-sm', this.loadoutRow, l.name);
+      setClass(b, 'is-on', l.id === this.loadout.id);
+      if (l.id === this.loadout.id) {
+        (b as HTMLElement).style.boxShadow = 'inset 0 0 0 1px var(--accent)';
+        (b as HTMLElement).style.color = 'var(--accent)';
+      }
+      b.onclick = () => {
+        this.loadout = l;
+        this.buildLoadouts(spec);
+        this.viewer.setLoadout(l.id);
+      };
+    }
+    if (options.length <= 1) {
+      setText(this.loadoutNote, 'No external hardpoints — guns only.');
+      return;
+    }
+    const kg = loadoutMass(this.loadout);
+    setText(this.loadoutNote, kg > 0
+      ? `+${int(kg)} kg of stores — slower, heavier and less manoeuvrable until they are gone.`
+      : 'Clean — full fighter performance.');
+  }
+
   private buildLiveries(spec: AircraftSpec): void {
     while (this.liveryRow.firstChild) this.liveryRow.removeChild(this.liveryRow.firstChild);
     el('span', 'ct-label', this.liveryRow, 'Livery');
@@ -306,13 +364,15 @@ export class Hangar {
 
   get current(): AircraftSpec { return this.selected; }
   get currentLivery(): number { return this.livery; }
+  /** Loadout id the player has selected, for the deploy path and respawns. */
+  get currentLoadout(): string { return this.loadout.id; }
 
   handleKey(e: KeyboardEvent): boolean {
     const visible = this.rows.filter((r) => r.node.style.display !== 'none');
     const i = visible.findIndex((r) => r.spec === this.selected);
     if (e.code === 'ArrowDown') { this.select(visible[Math.min(visible.length - 1, i + 1)].spec); return true; }
     if (e.code === 'ArrowUp') { this.select(visible[Math.max(0, i - 1)].spec); return true; }
-    if (e.code === 'Enter') { this.onDeploy(this.selected, this.livery); return true; }
+    if (e.code === 'Enter') { this.onDeploy(this.selected, this.livery, this.loadout.id); return true; }
     return false;
   }
 

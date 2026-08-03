@@ -104,6 +104,9 @@ type ShedName =
   | 'canopyGlass' | 'spinner' | 'propBlades' | 'gearDoorL' | 'gearDoorR';
 
 /** Parts whose rest pose has to be restored when a pooled rig is recycled. */
+/** Shared empty list so stripping stores allocates nothing. */
+const EMPTY_STORES: readonly number[] = [];
+
 const POSED_PARTS = [
   'aileronLPivot', 'aileronRPivot', 'elevatorLPivot', 'elevatorRPivot',
   'rudderPivot', 'flapLPivot', 'flapRPivot',
@@ -300,10 +303,29 @@ export class AircraftView {
       this.applyAll(p, (o) => { o.visible = true; o.scale.setScalar(1); });
     }
     this.applyAll('propDisc', (o) => { o.visible = false; });
+    // A pooled airframe must not inherit the last occupant's bomb load.
+    this.setStores('clean', EMPTY_STORES, EMPTY_STORES);
     this.applyAll('pilot', (o) => {
       const baseY = o.userData.baseY as number | undefined;
       if (baseY !== undefined) o.position.setY(baseY);
     });
+  }
+
+  /**
+   * Hangs (or strips) external stores.
+   *
+   * The mesh builder owns the part-naming convention and binds a closure per
+   * instance, so this only has to find it. Models that predate the loadout
+   * work — and the stand-in airframe — simply have no such function, and an
+   * aeroplane without visible bombs is a far better failure than a crash in
+   * the render loop.
+   */
+  setStores(loadoutId: string, bombs: readonly number[], rockets: readonly number[]): void {
+    const fn = (this.model as {
+      setStores?: (id: string, b: readonly number[], r: readonly number[]) => void;
+    }).setStores;
+    if (typeof fn !== 'function') return;
+    try { fn.call(this.model, loadoutId, bombs, rockets); } catch { /* stand-in rig */ }
   }
 
   /** World transform + kinematics. Always runs, at every distance. */

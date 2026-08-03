@@ -2,8 +2,44 @@ import { el, setText, setClass, clamp } from '../dom';
 import { BINDING_GROUPS, DEFAULT_BINDINGS, DEFAULT_PREFS, keyLabel, type ControlMode, type UiPrefs, type Units } from '../store';
 import { segmented, settingRow, slider, toggle, textField, groupTitle } from './controls';
 import type { QualityTier } from '../../engine/context';
+import { isWeatherId, type WeatherId } from '../../shared/environment';
 
 type Tab = 'graphics' | 'controls' | 'audio' | 'interface';
+type WeatherChoice = 'match' | WeatherId;
+
+/** Minimal shape of the engine object 'main.ts' publishes on window. */
+interface GameHandle {
+  bus?: { emit(evt: string, payload?: unknown): void };
+  get?(name: string): unknown;
+  timeOfDay?: number;
+}
+
+function gameHandle(): GameHandle | null {
+  return (window as unknown as { __game?: GameHandle }).__game ?? null;
+}
+
+function gameBus(): GameHandle['bus'] | null {
+  return gameHandle()?.bus ?? null;
+}
+
+/** The server-chosen weather, read structurally off the net subsystem. */
+function matchWeather(): WeatherId {
+  const net = gameHandle()?.get?.('net') as { weather?: unknown } | undefined;
+  return isWeatherId(net?.weather) ? net.weather : 'scattered';
+}
+
+function matchTimeOfDay(): number {
+  const net = gameHandle()?.get?.('net') as { matchTimeOfDay?: unknown } | undefined;
+  if (typeof net?.matchTimeOfDay === 'number') return net.matchTimeOfDay;
+  const tod = gameHandle()?.timeOfDay;
+  return typeof tod === 'number' ? tod : 9.5;
+}
+
+function formatClock(hours: number): string {
+  const h = Math.floor(hours) % 24;
+  const m = Math.round((hours - Math.floor(hours)) * 60) % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
 
 /**
  * Settings. One modal, four tabs, applied live.
@@ -21,6 +57,9 @@ export class SettingsPanel {
   private listening: { key: string; node: HTMLElement } | null = null;
   private keyNodes = new Map<string, HTMLElement>();
   private rebuild: (() => void)[] = [];
+  /** Session-only sky overrides — see 'buildWeatherOverride'. */
+  private weatherChoice: WeatherChoice = 'match';
+  private todOverride: number | null = null;
 
   onChange: (prefs: UiPrefs) => void = () => {};
   onClose: () => void = () => {};
@@ -114,6 +153,8 @@ export class SettingsPanel {
     const cl = toggle(r, this.prefs.volumetricClouds, (v) => { this.prefs.volumetricClouds = v; this.commit(); });
     this.rebuild.push(() => cl.set(this.prefs.volumetricClouds));
 
+    this.buildWeatherOverride(p);
+
     groupTitle(p, 'Post-processing');
     r = settingRow(p, 'Bloom');
     const bl = slider(r, 0, 1.5, 0.05, this.prefs.bloom, (v) => v.toFixed(2),
@@ -132,6 +173,53 @@ export class SettingsPanel {
     const ow = slider(r, 0, 2, 0.05, this.prefs.outlineWidth, (v) => v.toFixed(2),
       (v) => { this.prefs.outlineWidth = v; this.commit(); }, [1]);
     this.rebuild.push(() => ow.set(this.prefs.outlineWidth));
+  }
+
+  /**
+   * Local weather and clock override.
+   *
+   * The match sky is the server's to choose (the flight model predicts against
+   * the wind it implies), so this is a *view* override: it repaints the sky the
+   * player sees without touching the air anyone integrates against. That is why
+   * it is not persisted with the rest of the prefs and why it says so on the
+   * row — a stormy sky forced here is a look, not a match.
+   *
+   * It talks to the engine through the global game object rather than a
+   * callback, because everything else on this panel is a persisted preference
+   * and threading one non-preference command through 'UiPrefs' would put a
+   * debug knob in every player's saved settings forever.
+   */
+  private buildWeatherOverride(p: HTMLElement): void {
+    const r = settingRow(p, 'Weather', {
+      desc: 'Local preview only — the server picks the weather for a match.',
+    });
+    const wx = segmented<WeatherChoice>(r, [
+      ['match', 'Match'], ['clear', 'Clear'], ['scattered', 'Cumulus'],
+      ['overcast', 'Overcast'], ['storm', 'Storm'], ['fog', 'Fog'],
+    ], this.weatherChoice, (v) => {
+      this.weatherChoice = v;
+      const bus = gameBus();
+      if (!bus) return;
+      const name = v === 'match' ? matchWeather() : v;
+      bus.emit('sky:setWeather', { name, seconds: 6 });
+    });
+    this.rebuild.push(() => wx.set(this.weatherChoice));
+
+    const rt = settingRow(p, 'Time of day', {
+      desc: 'Local preview only. Drag to move the sun; Match restores the server clock.',
+    });
+    const tod = slider(rt, 0, 24, 0.25, this.todOverride ?? matchTimeOfDay(), formatClock, (v) => {
+      this.todOverride = v;
+      gameBus()?.emit('sky:timeOfDay', v);
+    });
+    this.rebuild.push(() => tod.set(this.todOverride ?? matchTimeOfDay()));
+    const reset = el('button', 'ct-btn is-ghost is-sm', rt, 'Match');
+    reset.onclick = () => {
+      this.todOverride = null;
+      const h = matchTimeOfDay();
+      tod.set(h);
+      gameBus()?.emit('sky:timeOfDay', h);
+    };
   }
 
   private applyTierDefaults(tier: QualityTier | 'auto'): void {

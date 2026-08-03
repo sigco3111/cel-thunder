@@ -20,7 +20,9 @@ import {
   type ProxyShape, AmmoType, ModuleId, ProjectileKind, newHitResult,
 } from './types';
 import { shapeDistance, shapeClosestPoint, resolveTargetTransform } from './proxy';
-import { blastDamage, blastRadius, penetrationCapability, kineticDamage, ignitionChance } from './penetration';
+import {
+  blastDamage, blastRadius, peakBlastDamage, penetrationCapability, kineticDamage, ignitionChance,
+} from './penetration';
 
 export interface ExplosionParams {
   x: number; y: number; z: number;
@@ -296,4 +298,40 @@ export function warheadCasing(totalKg: number, heGrams: number): {
  */
 export function visualBlastRadius(heGrams: number): number {
   return blastRadius(heGrams) * 2.4;
+}
+
+/**
+ * Blast and fragment damage to something standing on the ground, at 'distance'
+ * metres from a surface burst of 'heGrams'.
+ *
+ * This deliberately does *not* reuse 'blastDamage'. That curve is tuned for
+ * aircraft: it falls as (1 − d/R)^1.6 inside a radius of 3.6·W^⅓, which is the
+ * distance at which overpressure alone will wreck a stressed-skin airframe —
+ * about 11 m for a 250 lb bomb. Ground targets are killed by a completely
+ * different mechanism and over a completely different scale. A lorry, a gun
+ * crew or a stack of ammunition is destroyed by fragments and ground shock, and
+ * the RAF's own effectiveness tables put the radius at which a 250 lb GP will
+ * disable soft-skinned transport at around 25–30 m and a 250 kg SC at nearer 45
+ * — roughly 9·W^⅓, three times the aircraft figure. Applying the aeroplane
+ * curve to a truck makes bombing an exercise in landing a direct hit, which is
+ * not what bombing was.
+ *
+ * So: an inverse-square-ish falloff over 9·W^⅓, with the same peak the shared
+ * model derives from the filling, scaled up by the 1.6× that ground shock and a
+ * reflecting surface add to a surface burst.
+ *
+ * It lives here rather than in either caller because the authoritative server
+ * and the offline sandbox both have to reach exactly the same verdict about
+ * whether a bomb destroyed a convoy.
+ */
+export function groundBlastDamage(heGrams: number, distance: number): number {
+  const kgTnt = Math.max(1e-3, heGrams * 0.001);
+  const rF = 9 * Math.cbrt(kgTnt);
+  if (distance >= rF) return 0;
+  return peakBlastDamage(heGrams) * 1.6 * (1 - distance / rF) ** 2;
+}
+
+/** Radius inside which {@link groundBlastDamage} is non-zero, metres. */
+export function groundBlastRadius(heGrams: number): number {
+  return 9 * Math.cbrt(Math.max(1e-3, heGrams * 0.001));
 }

@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import type { QualityTier } from '../../engine/context';
 import {
-  GLSL_COMMON, disposeRT, drawFullScreen, makePassMaterial, makeRT, type FrameInfo,
+  GLSL_COMMON, disposeRT, drawFullScreen, makePassMaterial, makeRT, prewarmPass,
+  type FrameInfo,
 } from './PassCore';
 
 /**
@@ -88,6 +89,11 @@ export class DofPass {
   setSize(width: number, height: number): void {
     this.rtCoc.setSize(Math.max(1, width >> 1), Math.max(1, height >> 1));
     this.rtBlur.setSize(Math.max(1, width >> 1), Math.max(1, height >> 1));
+  }
+
+  /** Compiles the current DOF_TAPS variant. See 'prewarmPass'. */
+  prewarm(renderer: THREE.WebGLRenderer): void {
+    prewarmPass(renderer, this.blurMat);
   }
 
   setQuality(q: QualityTier): void {

@@ -553,8 +553,21 @@ export function createCelMaterial(p: CelMaterialParams = {}): CelMaterial {
           // falloff is deliberately tighter than the sun rim's — a broad one
           // washes a fully backlit aircraft into a pale blob instead of
           // leaving it the dark graphic shape the shot is built around.
+          //
+          // The BROAD half of it is cut from 0.55 to 0.30 and the tight edge
+          // term is left alone. 'tight' is fres^2 at the authored power, which
+          // on a wing panel forty-five degrees off the lens is still 0.009 —
+          // small, but it is added as untinted sky radiance over the WHOLE
+          // shadowed planform at once, and eight of the ten framings put the
+          // sun 70-110 degrees off the lens with the aircraft's shaded side to
+          // camera. That is the last remaining contributor to the note that the
+          // water framing renders "a near-monochrome pale tan object with the
+          // camouflage indistinguishable" and its roundel centre as neutral
+          // grey. The silhouette-defining part of the term lives in 'edge'
+          // (exponent 14, 3e-8 on that same panel), which is untouched, so the
+          // value separation this was added for does not move.
           reflectedLight.directDiffuse +=
-            uSkyColor * ( tight * 0.55 + edge * 1.30 )
+            uSkyColor * ( tight * 0.30 + edge * 1.30 )
             * ( 1.0 - smoothstep( -0.1, 0.35, ndl ) ) * uRimStrength * 1.20;
 
           // --- underside contact darkening ----------------------------------
@@ -582,6 +595,14 @@ export function createCelMaterial(p: CelMaterialParams = {}): CelMaterial {
           float d = length( cameraPosition - vCelWorldPos );
           float aerial = 1.0 - exp( -d / max( 1.0, uAerialFar ) );
           aerial = pow( aerial, 1.35 ) * uAerialStrength;
+          // Hard near gate. The exponential is already tiny at 30 m — it is not
+          // what is bleaching the subject — but the note asking for this is
+          // right in principle and the gate costs one smoothstep: NOTHING
+          // inside a hundred metres of the lens may lose any of its albedo to
+          // the atmosphere, whatever the weather system does to uAerialFar.
+          // That makes the subject's colour a guarantee rather than a
+          // consequence of how a squall happens to be tuned.
+          aerial *= smoothstep( 100.0, 340.0, d );
           // Desaturate toward the atmosphere colour rather than simply
           // blending to it — preserves value structure at long range. Both
           // weights are held well below 1: a distant ridge that has lost all

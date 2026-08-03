@@ -681,8 +681,34 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
                          + tNoise( P.xz * 0.041 ) * 0.28
                          + tNoise( P.xz * 0.00135 ) * 0.44;
             canopy = clamp( canopy * 0.86, 0.0, 1.0 );
-            vec3 forestCol = mix( sRGB( vec3( 0.108, 0.174, 0.114 ) ), sRGB( vec3( 0.248, 0.352, 0.196 ) ), canopy );
-            g = mix( g, forestCol, forest * 0.86 );
+            // Contrast pushed hard, and the range widened at BOTH ends. The
+            // note against dogfight and hud is that everything outside the
+            // arable districts is "flat untextured dark green with no field
+            // system at all" — and it is, because those regions are woodland,
+            // where nothing else in this shader draws. Woodland is not flat:
+            // it is rides, clearings, a compartment felled last winter and a
+            // stand of conifer next to a stand of beech, and the value spread
+            // between those is larger than the spread across a whole county of
+            // fields. Squaring the mask concentrates the light values into the
+            // crowns and leaves the gaps between stands genuinely dark.
+            float stand = canopy * canopy * ( 3.0 - 2.0 * canopy );
+            vec3 forestCol = mix( sRGB( vec3( 0.074, 0.128, 0.086 ) ),
+                                  sRGB( vec3( 0.286, 0.396, 0.212 ) ), stand );
+            // Rides and clearings: a narrow band of the same noise the stands
+            // are cut from, painted as rough grass. One ridged threshold, so
+            // they come out as lines through the wood rather than as blobs.
+            //
+            // Inside the 'forest' branch, not outside it. This is an fbm — four
+            // noise taps — and the surrounding block runs on essentially every
+            // grass fragment in the frame, i.e. most of the screen in eight of
+            // the ten framings. Paying for it on open farmland where 'forest'
+            // is zero and the result is multiplied away cost enough to drop the
+            // dogfight framing a quality tier.
+            if ( forest > 0.02 ) {
+              float ride = 1.0 - smoothstep( 0.0, 0.020, abs( tFbm( P.xz * 0.0074 + 61.0 ) - 0.52 ) );
+              forestCol = mix( forestCol, sRGB( vec3( 0.296, 0.348, 0.206 ) ), ride * 0.55 );
+            }
+            g = mix( g, forestCol, forest * 0.90 );
 
             // --- farmland ------------------------------------------------
             // Cultivation is the only thing that gives low-altitude ground a
@@ -806,7 +832,17 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
               // step and it comes out the far side as posterised patches of
               // soil and drainage, which is both the truthful read and the
               // house style.
-              crop *= 1.0 + soil * ( 0.27 + 0.19 * ( 1.0 - arable ) );
+              crop *= 1.0 + soil * ( 0.34 + 0.22 * ( 1.0 - arable ) );
+              // A 240 m drainage/aspect term with NO footprint fade on it at
+              // all. Everything else inside a parcel is faded out on screen
+              // footprint because it would alias, which is correct — and which
+              // is also why a field seen from three kilometres ended up a flat
+              // slab of paint however much variation it carried up close. This
+              // octave's period is a kilometre and a half on screen at that
+              // range: it cannot alias, so it never has to be removed, and it
+              // is the only thing keeping a distant parcel from being one
+              // value. Offset per parcel so it changes across a hedge.
+              crop *= 1.0 + ( tNoise( P.xz * 0.0042 + fo * 0.31 ) - 0.5 ) * 0.21;
               crop *= 1.0 + ( tFbm( P.xz * 0.085 ) - 0.5 ) * 0.24
                     * ( 1.0 - smoothstep( 1.6, 5.0, px ) );
 
@@ -843,17 +879,34 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
                 float edgeM = pc.w * PARCEL_M
                             + ( tNoise( P.xz * 0.045 ) - 0.5 ) * 5.0
                               * ( 1.0 - smoothstep( 3.0, 11.0, px ) );
-                // Not every boundary is planted. Open holdings divided only by
-                // a change of crop are as characteristic as bocage, and mixing
-                // the two is what stops the boundary web reading as a mesh.
-                float hedged = step( 0.30, tHash( pc.xy + 331.0 ) );
+                // Not every boundary is planted, and the ones that are are not
+                // all planted the same.
+                //
+                // This is the "hard-edged flat Voronoi polygons with uniform
+                // dark-navy boundary strokes" note, and the polygons are not
+                // the problem — a cadastral parcel really is a convex-ish
+                // polygon. The problem is that every stroke around them was the
+                // same weight and the same value, and a closed web of identical
+                // lines is a stained-glass window whatever shape the cells are.
+                // Real enclosure is a mixture: thick bocage on one side of a
+                // field, a low bank on another, a wire fence that does not read
+                // from the air at all on a third, and a chalk track on a fourth.
+                // 'bt' picks between them per boundary.
+                float bt = tHash( pc.xy + 331.0 );
+                // Under 0.34: nothing planted. The field edge is then carried
+                // only by the change of crop across it, which is exactly how an
+                // open holding reads from four thousand feet.
+                float hedged = step( 0.34, bt );
                 // A minority are a metalled track with pale verges.
                 // Decorrelated from 'id' on purpose: reusing it would make
                 // every tracked boundary share a ploughing direction.
                 float track = step( 0.85, fract( id * 7.31 + id3 * 3.13 ) );
 
-                // True half-width of the planted boundary, in metres.
-                float hw = 2.6 + 2.2 * id3;
+                // True half-width of the planted boundary, in metres. Spread
+                // wide: 1.4 m is a wire fence on a bank, 6.4 m is a mature
+                // hedge with standard trees in it, and having BOTH in one
+                // frame is most of what makes the web stop reading as a mesh.
+                float hw = 1.4 + 5.0 * bt * bt;
                 // Filtered half-width. The line is never allowed to be thinner
                 // than about three quarters of a pixel, and its opacity drops
                 // in exact proportion to how far it had to be widened — so the
@@ -866,20 +919,34 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
                 float fw = max( hw, px * 0.75 );
                 float hedge = ( 1.0 - smoothstep( fw * 0.45, fw, edgeM ) )
                             * ( hw / fw ) * max( hedged, track ) * edgeFade;
+                // Three boundary materials, not two. The middle one — a grassy
+                // bank or a low earth lynchet, LIGHTER than the crop rather
+                // than darker — is the one that was missing, and it is the one
+                // that breaks the "every line in the county is the same dark
+                // navy" read most cheaply: a web made of alternating dark and
+                // pale strokes cannot be traced as a single mesh.
+                float bank = step( 0.72, fract( bt * 5.31 + 0.17 ) );
                 vec3 hedgeCol = mix(
                   sRGB( vec3( 0.163, 0.222, 0.132 ) ),      // hedge / treeline
+                  sRGB( vec3( 0.430, 0.446, 0.286 ) ),      // grassed bank
+                  bank );
+                hedgeCol = mix( hedgeCol,
                   sRGB( vec3( 0.520, 0.470, 0.372 ) ),      // chalk track
                   track );
-                // Per-boundary value spread, or every stroke in the county is
-                // the identical dark navy line and the parcels read as a
-                // stained-glass window rather than as land.
-                hedgeCol *= 0.78 + 0.46 * tHash( pc.xy + 1777.0 );
+                // Per-boundary value spread, widened from +/-23 % to +/-38 %.
+                hedgeCol *= 0.66 + 0.72 * tHash( pc.xy + 1777.0 );
                 // Headland: the turning strip a plough leaves unsown inside
                 // every boundary. Subtle, but it is the cue that says "worked".
                 float head = ( 1.0 - smoothstep( fw, fw + 14.0, edgeM ) )
                            * ( 1.0 - smoothstep( 5.0, 13.0, px ) );
                 crop = mix( crop, crop * 1.09, head * 0.5 * arable );
-                crop = mix( crop, hedgeCol, hedge * ( 0.84 - 0.26 * track ) );
+                // Per-boundary OPACITY as well as per-boundary colour. A hedge
+                // that has been laid recently is a thin dark line; one that has
+                // grown out is a solid band of scrub. Anything under about half
+                // strength reads from the air as a tonal change rather than as
+                // a stroke, which is the third of the four boundary types.
+                crop = mix( crop, hedgeCol,
+                  hedge * ( 0.84 - 0.26 * track ) * ( 0.42 + 0.58 * bt ) );
               }
               g = mix( g, crop, farm );
             }
@@ -1009,6 +1076,31 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
           gl_FragColor.rgb += ( haze - uAerialColor ) * ( ha * 0.62 );
         }
         #include <fog_fragment>
+        {
+          // --- independent value floor for the land ------------------------
+          //
+          // Same invariant the sea now enforces (see Water.ts): three separate
+          // terms — the cel material's aerial perspective, three's own fog and
+          // the tint above — all have "ground == atmosphere" as their fixed
+          // point, so however each is tuned, a distant coastline or ridge line
+          // converges on the sky and the frame loses its depth cue. Ground is
+          // always darker than the air in front of it; state that and enforce
+          // it as a ratio, which survives the tone curve as an ordering
+          // guarantee.
+          //
+          // The land's ceiling is higher than the sea's (0.88 against 0.80):
+          // a chalk down or a ripe wheat field genuinely can approach the value
+          // of a hazy sky, whereas open water at grazing incidence cannot.
+          // Weighted in only once the haze dominates, so foreground terrain and
+          // the gold mid-ground of the sunset framing are untouched.
+          float hd2 = length( cameraPosition - vWPos );
+          float ha2 = pow( 1.0 - exp( -hd2 / max( 1.0, uAerialFar ) ), 1.35 );
+          float capW = smoothstep( 0.20, 0.70, ha2 );
+          float ceilL = dot( uAerialColor, vec3( 0.2126, 0.7152, 0.0722 ) )
+                      * mix( 4.0, 0.88, capW );
+          float curL = dot( gl_FragColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
+          gl_FragColor.rgb *= min( 1.0, ceilL / max( curL, 1e-4 ) );
+        }
       `);
   };
 

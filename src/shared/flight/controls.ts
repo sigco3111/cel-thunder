@@ -119,7 +119,24 @@ export function updateControls(
 
   // Control-surface command actually delivered. A little lag keeps the cables
   // and the visual deflection from snapping instantaneously.
-  const lag = 26;
+  //
+  // 26 was a 38 ms time constant, and measured from key-down it was the largest
+  // remaining term in the control response once the input layer had been fixed:
+  // the pilot's demand reaches the model in about 5 ms, and then sat here.
+  //
+  // It was also double-counting. The *pilot's arm* is already modelled, by the
+  // slew rate on the digital axes in 'InputSystem' — roughly 110 ms to move the
+  // stick to the stop, which is about right for a human. This constant should
+  // therefore only represent the linkage between the stick and the surface, and
+  // 26 ms of cable stretch and pushrod flex is generous for that. The
+  // deflection is drawn from this value, so it is not a hidden number: the
+  // ailerons visibly take up rather than snapping.
+  //
+  // Do not push this past ~40 without re-running 'selftest.ts'. At 46 the
+  // scripted landing and sortie both fly themselves into the ground: those
+  // scripts are tuned against the airframe's closed-loop response, and making
+  // the surfaces quicker moves it.
+  const lag = 38;
   st.ctlPitch = damp(st.ctlPitch, st.demandPitch * st.authPitch, lag, dt);
   st.ctlRoll = damp(st.ctlRoll, st.demandRoll * st.authRoll, lag, dt);
   st.ctlYaw = damp(st.ctlYaw, st.demandYaw * st.authYaw, lag, dt);

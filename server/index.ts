@@ -1,10 +1,13 @@
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createServer } from 'node:http';
-import { Room, type Env, type SpawnSite } from './Room';
+import { Room } from './Room';
 import { C2S, S2C, TICK_HZ, PROTOCOL_VERSION } from '../src/shared/protocol';
-import { type V3 } from '../src/shared/math';
-import { airDensity, windAt, windField } from '../src/shared/environment';
-import { getHeightfield, type Heightfield } from '../src/world/heightfield';
+import {
+  matchEnvironment, clampTimeOfDay, isWeatherId, type MatchEnvironment,
+} from '../src/shared/environment';
+import { getHeightfield } from '../src/world/heightfield';
+import { makeEnv, makeGroundWar, makeGroundUnits } from './world';
+import { matchConfigFromEnv } from './matchRules';
 
 /**
  * Authoritative game server.
@@ -19,46 +22,58 @@ const PORT = Number(process.env.PORT ?? 8791);
 const MAX_PER_ROOM = 16;
 const MAP_SEED = 1337;
 
-// ---------------------------------------------------------------------------
-// Environment — the server's view of the world.
-//
-// Terrain MUST come from the same baked heightfield the client renders, and
-// air/wind from the same shared module the client predicts with. This used to
-// probe for free 'terrainHeight'/'terrainNormal' exports that the world module
-// never had, silently leaving the server on flat ground while the client flew
-// over 2 km mountains: the client's wheels then sat 800 m under its own
-// terrain, the undercarriage resolved a ~1e8 N contact, and the aeroplane was
-// destroyed on the first tick with the HUD reading five figures of km/h. There
-// is no fallback any more — a server that cannot load the terrain is a server
-// that cannot arbitrate, so it fails loudly instead.
-// ---------------------------------------------------------------------------
+/**
+ * Game-mode configuration, from the environment. See './matchRules' for the
+ * knobs — roster size, round length, ticket pool, whether the ground war runs
+ * at all.
+ */
+const MATCH_CONFIG = matchConfigFromEnv(process.env);
 
-/** One heightfield per seed, held for the room's lifetime. */
-function makeEnv(seed: number): Env {
-  const hf: Heightfield = getHeightfield(seed);
-  const wind = windField(seed);
-  const sites: SpawnSite[] = hf.airfields.map((a) => ({
-    x: a.x, z: a.z, elevation: a.elevation, heading: a.heading, team: a.team,
-  }));
-  if (sites.length < 2) throw new Error(`heightfield seed ${seed} produced ${sites.length} airfields`);
+/**
+ * Whether clients may pose their own aeroplane ('debugPlace').
+ *
+ * Off unless asked for. The playability harness starts its own server with it
+ * set so it can fly a repeatable bombing run without spending a minute of every
+ * test in transit; a server anybody is actually playing on must not accept it,
+ * because a client that can teleport is a client that can teleport behind you.
+ */
+const ALLOW_DEBUG_PLACE = /^(1|true|on|yes)$/i.test(process.env.CT_DEBUG_PLACE ?? '');
 
-  return {
-    airDensity,
-    windAt(p: V3, out: V3): V3 { return windAt(wind, p, out); },
-    terrainHeight(x, z) { return hf.heightAt(x, z); },
-    terrainNormal(x, z, out) { hf.normalAt(x, z, out); return out; },
-    // Wheel friction: the runway rolls, grass drags, water is a ditching.
-    surfaceType(x, z) {
-      const t = hf.typeAt(x, z);
-      return t === 'runway' ? 0 : t === 'water' ? 2 : 1;
-    },
-    airfield(team) { return sites.find((s) => s.team === team) ?? sites[0]; },
-  };
-}
-
-// ---------------------------------------------------------------------------
+// The server's view of the world — terrain, air and the flak network — lives in
+// './world.ts' so that the headless match harness builds the identical one.
 
 const rooms = new Map<string, Room>();
+
+/**
+ * Monotonic counter folded into every match seed, so that two rooms created in
+ * the same millisecond — and, more importantly, consecutive matches on a
+ * long-lived server — never draw the same sky.
+ */
+let matchCounter = 0;
+
+/**
+ * The sky for a new match.
+ *
+ * 'CT_WEATHER' and 'CT_TIME_OF_DAY' pin it, which is what makes a stormy match
+ * reproducible: without them there is no way to test the path that matters
+ * except by restarting the server until the dice cooperate.
+ */
+function pickMatchEnvironment(): MatchEnvironment {
+  const seed = (Date.now() ^ (++matchCounter * 0x9e3779b1)) >>> 0;
+  const env = matchEnvironment(seed);
+  const forcedWeather = process.env.CT_WEATHER;
+  if (forcedWeather) {
+    if (isWeatherId(forcedWeather)) env.weather = forcedWeather;
+    else console.warn(`[server] ignoring CT_WEATHER="${forcedWeather}" — not a weather id`);
+  }
+  const forcedTod = process.env.CT_TIME_OF_DAY;
+  if (forcedTod) {
+    const h = Number(forcedTod);
+    if (Number.isFinite(h)) env.timeOfDay = clampTimeOfDay(h);
+    else console.warn(`[server] ignoring CT_TIME_OF_DAY="${forcedTod}" — not a number`);
+  }
+  return env;
+}
 
 function findRoom(): Room {
   for (const r of rooms.values()) {
@@ -66,10 +81,29 @@ function findRoom(): Room {
   }
   const id = `room-${rooms.size + 1}`;
   // Every room shares the map seed: the heightfield bake costs ~0.6 s and
-  // ~17 MB, and one map is what the client is built to render anyway.
-  const r = new Room(id, MAP_SEED, 'Normandy Coast', makeEnv(MAP_SEED));
+  // ~17 MB, and one map is what the client is built to render anyway. The
+  // *weather* is per room, which is what makes consecutive matches differ.
+  const match = pickMatchEnvironment();
+  const env = makeEnv(MAP_SEED, match);
+  // The ground war is per room because the guns carry match state (ammunition,
+  // tracking, damage), even though every room shares one heightfield.
+  const ground = MATCH_CONFIG.groundWar ? makeGroundWar(MAP_SEED, env) : null;
+  // The rest of the ground order of battle. Present regardless of CT_GROUND_WAR
+  // — that switch is about whether the flak *shoots*, not about whether there
+  // is anything on the ground to bomb.
+  const units = makeGroundUnits(MAP_SEED);
+  const r = new Room(id, MAP_SEED, 'Normandy Coast', env, match, {
+    config: MATCH_CONFIG, ground, units,
+  });
   rooms.set(id, r);
-  console.log(`[server] created ${id} (seed ${MAP_SEED})`);
+  const hh = Math.floor(match.timeOfDay);
+  const mm = Math.round((match.timeOfDay - hh) * 60);
+  console.log(
+    `[server] created ${id} (seed ${MAP_SEED}, ${match.weather}, `
+    + `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}, `
+    + `${MATCH_CONFIG.rosterPerTeam} per side, ${ground ? ground.count : 0} AA, `
+    + `${units.count} ground targets)`,
+  );
   return r;
 }
 
@@ -79,6 +113,11 @@ function findRoom(): Room {
   const hf = getHeightfield(MAP_SEED);
   const fields = hf.airfields.map((a) => `${a.name} (${a.x.toFixed(0)}, ${a.z.toFixed(0)}) @ ${a.elevation.toFixed(0)} m`);
   console.log(`[server] terrain ready — ${fields.join(' | ')}`);
+  console.log(
+    `[server] mode: ground war — ${MATCH_CONFIG.rosterPerTeam} aircraft per side, `
+    + `${MATCH_CONFIG.tickets} tickets, ${(MATCH_CONFIG.matchLength / 60).toFixed(0)} min rounds, `
+    + `AA ${MATCH_CONFIG.groundWar ? 'on' : 'off'}`,
+  );
 }
 
 const http = createServer((req, res) => {
@@ -89,6 +128,7 @@ const http = createServer((req, res) => {
       rooms: rooms.size,
       players: [...rooms.values()].reduce((n, r) => n + r.players.size, 0),
       uptime: process.uptime(),
+      debugPlace: ALLOW_DEBUG_PLACE,
     }));
     return;
   }
@@ -150,6 +190,8 @@ wss.on('connection', (ws: WebSocket) => {
           serverTime: room.time,
           tickHz: TICK_HZ,
           players: [...room.players.values()].map((q) => q.info()),
+          weather: room.weather,
+          timeOfDay: room.timeOfDay,
         });
         room.broadcastJson(room.matchState());
         return;
@@ -161,11 +203,23 @@ wss.on('connection', (ws: WebSocket) => {
 
       if (msg.t === 'spawn') {
         p.chosenAircraft = String(msg.aircraft ?? p.chosenAircraft);
-        const e = room.spawnAircraft(p, p.chosenAircraft);
+        // Validated inside 'spawnAircraft' against the airframe's own table, so
+        // an invented id gets a clean aeroplane rather than a free bomb load.
+        const wanted = msg.loadout === undefined ? undefined : String(msg.loadout);
+        const e = room.spawnAircraft(p, p.chosenAircraft, wanted);
         if (e) {
-          room.sendJson(p, { t: 'spawned', entityId: e.state.id, aircraft: p.chosenAircraft });
+          room.sendJson(p, {
+            t: 'spawned', entityId: e.state.id, aircraft: p.chosenAircraft,
+            loadout: p.chosenLoadout,
+          });
           room.broadcastJson(room.matchState());
         }
+      } else if (msg.t === 'debugPlace' && ALLOW_DEBUG_PLACE) {
+        room.placeAircraft(p, {
+          x: Number(msg.x) || 0, y: Number(msg.y) || 0, z: Number(msg.z) || 0,
+          heading: Number(msg.heading) || 0, pitch: Number(msg.pitch) || 0,
+          bank: Number(msg.bank) || 0, speed: Number(msg.speed) || 120,
+        });
       } else if (msg.t === 'chat') {
         const text = String(msg.text ?? '').slice(0, 160);
         if (text) room.broadcastJson({ t: 'chat', from: p.name, text, team: p.team });

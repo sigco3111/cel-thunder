@@ -99,9 +99,19 @@ export const WEATHER_PRESETS: Record<WeatherName, WeatherParams> = {
     godRayStrength: 1,
   }),
 
-  /** Low grey sheet. Flat light, cool shadows, aircraft read as silhouettes. */
+  /**
+   * Low grey sheet. Flat light, cool shadows, aircraft read as silhouettes.
+   *
+   * The top sits below the ~2 km spawn on purpose. These decks are the only
+   * ones dense enough to be an *opaque* whiteout, and a match that begins with
+   * every player inside one is not atmospheric, it is broken: no horizon, no
+   * contacts, no ground. Deck altitudes here are chosen against where the
+   * fighting happens first and against the meteorology second — a 700-1900 m
+   * stratus sheet is entirely real, it just happens to also be the one that
+   * puts the player above it looking down at a grey floor with holes in it.
+   */
   overcast: P({
-    cloudBase: 850, cloudTop: 3400, cloudTypeBias: 0.24,
+    cloudBase: 700, cloudTop: 1900, cloudTypeBias: 0.24,
     coverage: 0.80, density: 1.05,
     shapeSize: 6200, detailSize: 350, weatherSize: 40000,
     windSpeed: 14, windDirDeg: 205, evolveRate: 0.4,
@@ -113,10 +123,20 @@ export const WEATHER_PRESETS: Record<WeatherName, WeatherParams> = {
     godRayStrength: 0.3,
   }),
 
-  /** Towering cumulonimbus, heavy rain, lightning inside the anvils. */
+  /**
+   * Towering cumulonimbus, heavy rain, lightning inside the anvils.
+   *
+   * Base raised well above the spawn and coverage pulled back from 0.84: at
+   * 620 m and 0.84 the cell structure closed up into one 7.5 km-thick opaque
+   * slab that occupied the entire combat envelope, so every storm match was
+   * flown blind from the first second and the towers — the entire point of the
+   * preset — were never once visible from outside. At 2300 m you are under the
+   * base in the rain with black anvils standing over you and canyons between
+   * the cells to climb through, which is the picture the preset was written for.
+   */
   storm: P({
-    cloudBase: 620, cloudTop: 8200, cloudTypeBias: 0.95,
-    coverage: 0.84, density: 1.35,
+    cloudBase: 2300, cloudTop: 8000, cloudTypeBias: 0.95,
+    coverage: 0.70, density: 1.35,
     shapeSize: 7400, detailSize: 380, weatherSize: 26000,
     windSpeed: 24, windDirDeg: 190, evolveRate: 1.1,
     cloudAmbient: 0.7, silver: 1.6,
@@ -127,14 +147,25 @@ export const WEATHER_PRESETS: Record<WeatherName, WeatherParams> = {
     godRayStrength: 0.8,
   }),
 
-  /** Radiation fog under a thin stratus lid — near-zero visibility at the deck. */
+  /**
+   * Radiation fog under a thin stratus lid — near-zero visibility at the deck.
+   *
+   * The interesting half of this preset is 'groundFog', not the lid: the air is
+   * flyable at altitude and unflyable on the deck, which makes ground attack a
+   * genuine decision. The lid is therefore parked above the spawn, out of the
+   * way, rather than straddling it.
+   */
   fog: P({
-    cloudBase: 1050, cloudTop: 2400, cloudTypeBias: 0.1,
+    cloudBase: 2700, cloudTop: 3700, cloudTypeBias: 0.1,
     coverage: 0.62, density: 0.7,
     shapeSize: 6800, detailSize: 360, weatherSize: 38000,
     windSpeed: 3, windDirDeg: 300, evolveRate: 0.18,
     cloudAmbient: 0.9, silver: 0.8,
-    fogDensity: 0.0000265, aerialFar: 12000, groundFog: 0.00055, groundFogHeight: 260,
+    // Thicker than it was. With the lid moved up out of the combat band this is
+    // now the only thing carrying the preset's name, and at 2.65e-5 the deck
+    // was merely a little hazy rather than something you would think twice
+    // about descending into.
+    fogDensity: 0.000036, aerialFar: 9500, groundFog: 0.00095, groundFogHeight: 340,
     hazeBoost: 2.8,
     cirrusAmount: 0.10, cirrusHeight: 8800, deckAmount: 0.5,
     rain: 0.05, lightningRate: 0, sunOcclusion: 0.55,

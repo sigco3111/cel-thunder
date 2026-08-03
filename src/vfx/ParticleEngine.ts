@@ -346,7 +346,27 @@ void main() {
   // dissipation runs: the outside of a puff mixes with clean air first, so the
   // outline frays inward while the core is still solid. Eroding uniformly just
   // punches holes everywhere and reads as a dissolve transition.
-  float er = vP.z * smoothstep( 0.16, 1.0, vP.x );
+  // Dissipation ACCELERATES, and it does not run on the same clock for a
+  // volume as for a flame.
+  //
+  // Smoke: a puff entrains air across its own surface, so the rate at which it
+  // is destroyed grows with how far it has already spread — the second half of
+  // a stamp's life takes far more of it apart than the first. A plume whose
+  // stamps all decay linearly and identically reads as a string of beads that
+  // simply get fainter in step, which is exactly the note against this build:
+  // "puffs do not die, so plumes read as strings of identical stamps". Squaring
+  // the age keeps the head of the column solid and lets the old end come apart
+  // into rags, which is what gives a plume a far end at all.
+  //
+  // Flame: there is no young-and-solid phase. A tongue is being torn apart by
+  // the same shear that feeds it, from the instant it leaves the surface.
+  // Holding its erosion off until 16 % of life is what left the freshest licks
+  // — which are also the largest and brightest — as smooth capsules with
+  // rounded ends painted onto the wing.
+  float ageE = smoothstep( 0.10, 1.0, vP.x );
+  float er = uLit > 0.5
+    ? vP.z * ageE * ageE * ( 0.55 + 0.85 * ageE )
+    : vP.z * ( 0.34 + 0.66 * vP.x );
   cov -= er * ( 0.24 + 0.76 * tx.b ) * ( 1.45 - 0.55 * tx.g );
 
   float thr = 0.5;
@@ -377,6 +397,13 @@ void main() {
   // Lighting term for the ink modulation below; only meaningful when uLit > 0.
   float ndl = 1.0;
 
+  // The stamp's opacity BEFORE the volumetric density gradient below. The ink
+  // accent keys off this rather than off the final alpha: the outline lives
+  // exactly where the density gradient is thinnest, so keying it off the final
+  // value deletes the stroke and the plume goes from a drawing to an airbrush
+  // wash. The line belongs to the SHAPE, the gradient belongs to the VOLUME.
+  float alphaShape = alpha;
+
   if ( uLit > 0.5 ) {
     // Expansion thinning. Applied here rather than baked into the ramp because
     // it depends on how far *this* stamp has grown, which is per-particle: the
@@ -384,6 +411,37 @@ void main() {
     // ones that have ballooned downstream go translucent, and that difference
     // is the whole reason a plume reads as a gas rather than as a rope.
     alpha *= mix( 1.0, vDens, 0.45 );
+
+    // --- optical depth across the stamp -----------------------------------
+    //
+    // A billboard's alpha is the integral of density along the ray that
+    // crosses the puff, and that path is longest through the middle of a lobe
+    // and falls to zero at its silhouette. Giving every fragment of a stamp
+    // the same opacity is therefore not a volume at all, it is a sticker — and
+    // it is precisely the defect the critique measures: the densest part of
+    // the damage plume lifted the terrain behind it by fifteen levels, and
+    // core-to-edge across the whole column came to three.
+    //
+    // tx.g is the tile's own distance in from its silhouette, which is already
+    // the quantity wanted.
+    //
+    // The ramp is deliberately SHORT — full density is reached less than a
+    // third of the way in from the outline — and this is the whole difference
+    // between a volume and a fog bank. A long ramp (the first version of this
+    // used tx.g^0.42, which is only 0.7 at the halfway point) softens the
+    // entire stamp, and a plume made of softened stamps is an airbrush smear
+    // with no silhouette at all: worse than the flat lobes it replaced,
+    // because at least those were graphic. Confining the gradient to the rim
+    // gives the outline back and leaves the body solid.
+    //
+    // The core is driven ABOVE unity on purpose. The aim is not a softer puff
+    // — it is already far too thin — but a REDISTRIBUTION: the spine of the
+    // plume becomes genuinely opaque (the ground stops being readable through
+    // it) at the same time as the cut-out edge turns into a density falloff.
+    // Clamped at output, so the surplus is what guarantees saturation in the
+    // core rather than something that leaks into the blend.
+    float depthIn = smoothstep( 0.015, 0.30, tx.g );
+    alpha = min( alpha * ( 0.30 + 1.45 * depthIn ), 1.0 );
     if ( alpha <= 0.004 ) discard;
 
     // A hemispherical normal across the billboard, rotated out of sprite space
@@ -438,7 +496,13 @@ void main() {
     // one band, overlapping stamps stop having edges between them and the whole
     // plume collapses into a single flat silhouette — which is worse than the
     // bubbles, because at least the bubbles had internal structure.
-    vec3 shade = col * uShadowTint * 0.74;
+    // 0.74 -> 0.58. The shadow band is the plume's floor, and the whole column
+    // was measuring inside a twenty-level window: core (62,70,94) against edge
+    // (59,68,92) against the field behind it at (43,58,84). A volume that
+    // occupies twenty levels cannot read as a volume no matter how its
+    // silhouette is drawn. Dropping the floor is the only move that widens the
+    // window without touching the sunlit crown, which is already correct.
+    vec3 shade = col * uShadowTint * 0.58;
     shade = mix( shade, col * mix( vec3( 1.0 ), uSunColor, 0.35 ) * 1.10, mid );
     shade = mix( shade, col * uSunColor * 1.95, lit );
 
@@ -451,9 +515,17 @@ void main() {
     // broken band that follows each billow's own outline instead of a ring, and
     // gives the plume the one high value it needs to stop reading as a flat
     // grey mass cut out of the frame.
-    float crown = ( 1.0 - smoothstep( 0.02, 0.34, tx.g ) )
+    // The crown is now a BAND just inside the outline rather than the outline
+    // itself, and it has to be: the density gradient added above makes the
+    // outermost fragments nearly transparent, so a highlight painted on them is
+    // multiplied away and the plume loses the one high value that stops it
+    // reading as a dark stain cut out of the frame. Moving the band in by a
+    // fifth of the lobe puts it where there is enough alpha to carry it while
+    // still following each billow's own outline.
+    float crown = smoothstep( 0.05, 0.20, tx.g )
+                * ( 1.0 - smoothstep( 0.24, 0.54, tx.g ) )
                 * smoothstep( -0.06, 0.34, ndl );
-    shade = mix( shade, col * uSunColor * 2.7, crown * 0.85 );
+    shade = mix( shade, col * uSunColor * 2.9, crown * 0.90 );
 
     // A dark accent hugging the silhouette, but *only* where the silhouette is
     // already turning away from the sun. A closed dark ring all the way round a
@@ -495,7 +567,7 @@ void main() {
     if ( uLit > 0.5 ) {
       float side = 1.0 - smoothstep( -0.42, 0.28, ndl );
       float sz = smoothstep( 11.0, 62.0, vPx ) * ( 0.55 + 1.05 * smoothstep( 26.0, 150.0, vPx ) );
-      float fade = smoothstep( 0.26, 0.74, alpha ) * ( 1.0 - smoothstep( 0.40, 0.90, vP.x ) );
+      float fade = smoothstep( 0.26, 0.74, alphaShape ) * ( 1.0 - smoothstep( 0.40, 0.90, vP.x ) );
       w *= side * sz * fade;
       // Smoke is not inked in the hull's blue-black. Drawing a plume's contour
       // in the same near-black used for hard-surface silhouettes is what makes

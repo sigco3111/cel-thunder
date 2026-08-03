@@ -575,6 +575,30 @@ function patchWaterShader(shader: THREE.WebGLProgramParametersWithUniforms): voi
         // Schlick, biased so the horizon goes properly mirror-like.
         gFresnel = 0.02 + 0.98 * pow( 1.0 - clamp( dot( N, V ), 0.0, 1.0 ), 4.2 );
 
+        // --- geometric masking at grazing incidence --------------------------
+        //
+        // Flat-surface Fresnel says the sea at 89 degrees is a perfect mirror,
+        // so the far water renders at exactly the radiance of the sky it
+        // reflects and the coastline stops existing. Measured on hero: sky
+        // (184,191,187) against sea (184,190,185) — one level, across the whole
+        // right half of the frame, for four consecutive rounds.
+        //
+        // What flat Fresnel leaves out is geometry. A wind-roughened surface
+        // seen almost edge-on is largely self-shadowed: most of the facets that
+        // would send sky into the eye are hidden behind the crest in front of
+        // them, so the MEAN reflectance over the slope distribution falls well
+        // below the flat value. That is the Smith masking term of any
+        // microfacet model, and it is the reason a photograph of the sea always
+        // shows the water a shade darker than the sky above it no matter how
+        // hazy the day is. Putting it back is simultaneously the physics fix and
+        // the art-direction fix: the horizon becomes a line again.
+        //
+        // Keyed on grazing angle and on sea state — glass water really does
+        // mirror the sky, chop does not.
+        float grazeM = 1.0 - clamp( dot( N, V ), 0.0, 1.0 );
+        gFresnel *= 1.0 - ( 0.30 + 0.22 * uSeaState )
+                  * smoothstep( 0.55, 0.97, grazeM );
+
         // Glitter mask: high-frequency sparkle that breaks the sun path into
         // individual glints in the near field and averages into a continuous
         // sheet further out, which is what the eye actually sees.
@@ -689,5 +713,35 @@ function patchWaterShader(shader: THREE.WebGLProgramParametersWithUniforms): voi
         gl_FragColor.rgb += ( haze - uAerialColor ) * ( ha * 0.62 );
       }
       #include <fog_fragment>
+      {
+        // --- independent value floor for the sea ---------------------------
+        //
+        // The last of the three terms that were converging the water on the
+        // sky. Aerial perspective blends toward uAerialColor, three's fog
+        // blends toward the same horizon colour again, and the reflection above
+        // is the sky by construction — so however each one is tuned, their
+        // fixed point is "sea == sky" and the coastline dies at exactly the
+        // distance where the picture needs it most.
+        //
+        // The fix is not to weaken any of them. It is to state the invariant
+        // the picture actually depends on and enforce it: THE SEA IS NEVER
+        // BRIGHTER THAN A FIXED FRACTION OF THE ATMOSPHERE IN FRONT OF IT.
+        // That is true of every photograph of a coastline ever taken, and
+        // because it is a ratio applied in scene-referred light it survives the
+        // tone curve, the shoulder and the LUT as an ordering guarantee rather
+        // than as a number that has to be re-tuned per grade.
+        //
+        // Applied only where the haze has actually taken over (it must not
+        // touch near water, whose sun path is legitimately the brightest thing
+        // in the sunset framing), and as a scale on the whole colour so the
+        // hue is untouched.
+        float hd2 = length( cameraPosition - vWWorld );
+        float ha2 = pow( 1.0 - exp( -hd2 / max( 1.0, uAerialFar ) ), 1.35 );
+        float capW = smoothstep( 0.16, 0.62, ha2 );
+        float ceilL = dot( uAerialColor, vec3( 0.2126, 0.7152, 0.0722 ) )
+                    * mix( 4.0, 0.80, capW );
+        float curL = dot( gl_FragColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
+        gl_FragColor.rgb *= min( 1.0, ceilL / max( curL, 1e-4 ) );
+      }
     `);
 }

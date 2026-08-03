@@ -190,6 +190,15 @@ export function applyDamage(
   const t = hit.time;
   const by = hit.ownerId, byE = hit.shooterEntity;
   st.lastHitTime = t;
+  // Remember the most recent attacker, not merely the one whose round happened
+  // to be the last. Half of everything this model produces kills *later*: a
+  // spar with holes in it folds the next time the pilot pulls, a wounded pilot
+  // bleeds out, a fire burns through a control run, a hit ammunition tray cooks
+  // off eight seconds after the burst that started it. 'stepDamage' raises all
+  // of those and has no other way to know who to credit, so without this every
+  // one of them was scored as an accident — which is exactly what a match of AI
+  // shooting each other down looked like: a kill feed full of "the ground".
+  if (by !== 0 || byE !== 0) { st.killer = by; st.killerEntity = byE; }
 
   // A pure ricochet off armour is worth reporting even though it does almost
   // nothing — the "clang" is important feedback.

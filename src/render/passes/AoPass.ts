@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import type { QualityTier } from '../../engine/context';
 import {
   GLSL_COMMON, GLSL_VIEWPOS, disposeRT, drawFullScreen, makePassMaterial, makeRT,
-  type FrameInfo,
+  prewarmPass, type FrameInfo,
 } from './PassCore';
 
 /**
@@ -64,6 +64,12 @@ export class AoPass {
     const h = Math.max(1, height >> 1);
     this.rtA.setSize(w, h);
     this.rtB.setSize(w, h);
+  }
+
+  /** Compiles the current AO_DIRS/AO_STEPS variant. See 'prewarmPass'. */
+  prewarm(renderer: THREE.WebGLRenderer): void {
+    prewarmPass(renderer, this.aoMat);
+    prewarmPass(renderer, this.blurMat);
   }
 
   setQuality(q: QualityTier): void {

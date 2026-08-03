@@ -98,9 +98,14 @@ export const DEFAULT_MOUSE_AIM: MouseAimConfig = {
   gLimitFactor: 0.86,       // pull to 86 % of the wings-off limit, not past it
   negGLimit: 2.2,
   stallMargin: 0.88,
-  attitudeGain: 3.6,
+  // Outer-loop gains. These decide how urgently the nose chases the reticle,
+  // and they are the single biggest contributor to whether mouse aim reads as
+  // "planted" or as "floaty". The inner loop is feed-forward dominated, so the
+  // outer loop can be driven harder than a pure-PID cascade would tolerate
+  // before it starts to overshoot.
+  attitudeGain: 4.3,
   attitudeIGain: 1.3,
-  rollGain: 4.4,
+  rollGain: 5.4,
   ratePGain: 1.9,
   rateIGain: 1.4,
   levelAssist: 0.55,
@@ -121,6 +126,19 @@ export interface AimOutput {
 }
 
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * How much of the ROLL axis the player takes for a given stick deflection.
+ *
+ * Deliberately super-linear: 45 % of the travel already claims the whole axis,
+ * so a decisive input is obeyed decisively while the shallow bottom of the
+ * range is still available for trimming the director rather than overriding it.
+ *
+ * Roll only — see the blend at the end of 'update' for why pitch and yaw stay
+ * linear.
+ */
+const MANUAL_GAIN = 2.2;
+const authority = (m: number): number => Math.min(1, Math.abs(m) * MANUAL_GAIN);
 
 const _e = new THREE.Vector3();
 const _axis = new THREE.Vector3();
@@ -218,6 +236,11 @@ export class MouseAimController {
     const spec = view.spec;
     const aero = spec.aero;
 
+    // Player intent, resolved up front: the wing leveller further down has to
+    // know about it before it decides how hard to fight for level wings.
+    const mp = clampSym(manualPitch), mr = clampSym(manualRoll), my = clampSym(manualYaw);
+    const rollAuthority = authority(mr);
+
     // ---------------------------------------------------------------------
     // 1. Constrain the reticle to the cone in front of the nose.
     // ---------------------------------------------------------------------
@@ -290,7 +313,13 @@ export class MouseAimController {
     // back, and it simply flew into the ground from there.
     const pitchAttitude = Math.asin(clampSym(view.forward.y));
     const levelValid = Math.abs(pitchAttitude) < 1.05;
-    const levelErr = levelValid ? bankAngle * this.cfg.levelAssist : 0;
+    // Stand down while the player is rolling deliberately. A leveller that
+    // keeps pulling for wings-level against a held roll key is not an
+    // assistant, it is a second pilot with different ideas, and the player
+    // feels it as controls that mush and then snap back.
+    const levelErr = levelValid
+      ? bankAngle * this.cfg.levelAssist * (1 - rollAuthority)
+      : 0;
 
     this.rollError = rollAim * aimAuthority + levelErr * (1 - aimAuthority);
 
@@ -458,10 +487,25 @@ export class MouseAimController {
     // 7. Blend in direct player input. Manual authority scales with how hard
     //    the player is pushing, so a nudge biases the autopilot and a full
     //    deflection owns the axis outright.
+    //
+    //    Authority rises FASTER than deflection does. With a 1:1 mapping a
+    //    quarter-deflection stick left the director holding three quarters of
+    //    the axis, and since the director's job at that moment is usually to
+    //    level the wings, the two were pulling against each other: measured,
+    //    the commanded aileron went the *wrong way* for the first ~100 ms of a
+    //    deliberate roll input and sometimes never crossed over at all. A
+    //    quarter of a deflection is not a nudge, it is an instruction.
     // ---------------------------------------------------------------------
-    const mp = clampSym(manualPitch), mr = clampSym(manualRoll), my = clampSym(manualYaw);
+    // Pitch and yaw keep the 1:1 blend. The fast ramp belongs to roll alone,
+    // and deliberately so: on pitch, the share the director retains is what
+    // keeps the g limiter and the stall protection in the loop, and handing the
+    // axis over at 45 % deflection let a full pull take the aeroplane straight
+    // through the buffet — measured, "climb when told to" turned into a 36
+    // degree nose-down departure. Roll has no such protection to bypass; what
+    // it had was a wing leveller arguing with the player, which is what the
+    // faster ramp is there to end.
     out.pitch = clampSym(elevator * (1 - Math.abs(mp)) + mp);
-    out.roll = clampSym(aileron * (1 - Math.abs(mr)) + mr);
+    out.roll = clampSym(aileron * (1 - rollAuthority) + mr);
     out.yaw = clampSym(rudder * (1 - Math.abs(my)) + my);
 
     return out;

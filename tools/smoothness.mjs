@@ -178,6 +178,11 @@ async function main() {
   // the player actually waits for: event dispatch, input sampling, the flight
   // director, the physics step and the publish into the entity table.
   console.log('\n3. Input responsiveness');
+  // Measure from a settled aeroplane. Running straight out of the combat phase
+  // sampled a machine that was mid-departure, damaged or dead, which put ~10 ms
+  // of run-to-run spread on the result for reasons that have nothing to do with
+  // the control chain.
+  await sleep(2500);
   await page.evaluate(() => {
     const w = window;
     // Quaternion helpers, body-frame: d = conj(a) * b.
@@ -280,7 +285,9 @@ async function main() {
 
   const lat = [];
   const curves = [];
-  for (let i = 0; i < 6; i++) {
+  // Ten samples, not six: the median of six carried about +-3 ms of noise,
+  // which is the same size as the effect being measured.
+  for (let i = 0; i < 10; i++) {
     await page.evaluate(() => window.__latArm());
     await sleep(150);                       // let the pre-input rate estimate settle
     await page.keyboard.down('KeyA');       // armed first, pressed second

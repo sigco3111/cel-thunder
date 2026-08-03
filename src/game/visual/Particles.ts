@@ -319,6 +319,17 @@ export const SMOKE_PRESETS = {
     size: 2.6, growth: 34, life: 7.5, buoyancy: 4.2, drag: 0.7,
     color: c(0x121110), colorEnd: c(0x585149), alpha: 0.82, spin: 0.5,
   } as EmitOptions,
+  /**
+   * Rocket motor exhaust: a dense white cordite trail that hangs in the air
+   * behind the salvo. Ballistite burns clean and bright, nothing like the oily
+   * black of a fuel fire, and it is the visual signature of a rocket attack —
+   * so it is long-lived and barely buoyant, and it drifts with the wind rather
+   * than rising.
+   */
+  rocket: {
+    size: 0.8, growth: 9.0, life: 2.6, buoyancy: 0.5, drag: 2.4,
+    color: c(0xd8dade), colorEnd: c(0xa8adb4), alpha: 0.38, spin: 1.6,
+  } as EmitOptions,
   /** Debris trail. */
   debris: {
     size: 0.35, growth: 2.6, life: 1.2, buoyancy: 0.6, drag: 3.0,

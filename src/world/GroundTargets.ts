@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import { createCelMaterial, createOutlineMaterial, addOutlinesRecursive } from '../render/CelMaterial';
-import { Rng } from '../shared/math';
-import { COARSE_N, COARSE_STEP, MAP_HALF, SEA_LEVEL, type Heightfield } from './heightfield';
+import { type Heightfield } from './heightfield';
 import { MeshBuilder } from './buildUtils';
 import { applyPavementOffset } from './Airfield';
+import {
+  groundSiting, type GroundUnitSite, type RiverSpan, type TargetKind,
+} from './groundSites';
 
 /**
  * Inverted-hull outline material that is correct on *rotated* instances.
@@ -41,7 +43,7 @@ function instancedOutlineMaterial(width: number, color: number): THREE.ShaderMat
  * trucks, wagons, gun pits — are instanced across the whole map.
  */
 
-export type TargetKind = 'aa' | 'truck' | 'bridge' | 'factory' | 'railyard' | 'depot';
+export type { TargetKind };
 
 export interface GroundTarget {
   id: number;
@@ -72,7 +74,11 @@ const _zero = new THREE.Matrix4().makeScale(0, 0, 0);
 export function buildGroundTargets(
   hf: Heightfield, seed: number, teamCentres: { x: number; z: number }[],
 ): GroundTargetsBuild {
-  const rng = new Rng((seed ^ 0x517cc1b7) >>> 0 || 1);
+  // Where everything stands is decided by 'groundSites.ts', which the
+  // authoritative server calls too. Nothing in this file re-derives a position:
+  // that is the whole point — the guns, lorries and installations a player can
+  // see are, by construction, the ones the server arbitrates.
+  const siting = groundSiting(hf, seed, teamCentres);
   const group = new THREE.Group();
   group.name = 'groundTargets';
   group.matrixAutoUpdate = false;
@@ -149,87 +155,24 @@ export function buildGroundTargets(
     return t;
   };
 
-  // ------------------------------------------------------------------
-  // Flak: rings around each airfield plus a scattered belt between them
-  // ------------------------------------------------------------------
-  // 'padT() >= 1.6' is the same guard the vegetation scatterer uses. Without it
-  // the r = 700..1500 m annulus overlaps the 990 x 480 m flattened pad and the
-  // taxiway/apron block, and because the pad is dead flat the slope test passes
-  // cleanly — so an 88 flush on the tarmac at the runway threshold was not an
-  // unlucky roll, it was the expected outcome for several guns per map.
-  const clearOfWorks = (x: number, z: number): boolean =>
-    hf.padT(x, z) >= 1.6 && hf.siteT(x, z) >= 1.25;
-
-  for (let team = 0; team < teamCentres.length; team++) {
-    const c = teamCentres[team];
-    for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * Math.PI * 2 + rng.range(-0.2, 0.2);
-      const r = rng.range(700, 1500);
-      const x = c.x + Math.cos(a) * r, z = c.z + Math.sin(a) * r;
-      if (hf.heightAt(x, z) < SEA_LEVEL + 3 || hf.slopeAt(x, z) > 0.30) continue;
-      if (!clearOfWorks(x, z)) continue;
-      const y = hf.heightAt(x, z);
-      const g = place(aaBatch, 'aaGuns', 'aa', team, x, y, z, a + Math.PI, 7, 260);
-      if (g) placePit(x, y, z, a + rng.range(-0.4, 0.4));
-    }
-  }
-  // Contested belt down the middle of the map.
-  const mid = {
-    x: (teamCentres[0].x + teamCentres[1].x) * 0.5,
-    z: (teamCentres[0].z + teamCentres[1].z) * 0.5,
+  const batchOf: Record<string, THREE.InstancedMesh> = {
+    aaGuns: aaBatch, trucks: truckBatch, lightArmour: tankBatch, wagons: wagonBatch,
   };
-  for (let i = 0; i < 14; i++) {
-    const x = mid.x + rng.range(-9000, 9000);
-    const z = mid.z + rng.range(-9000, 9000);
-    if (hf.heightAt(x, z) < SEA_LEVEL + 4 || hf.slopeAt(x, z) > 0.28) continue;
-    if (!clearOfWorks(x, z)) continue;
-    const y = hf.heightAt(x, z);
-    const g = place(aaBatch, 'aaGuns', 'aa', 2, x, y, z, rng.range(0, 6.28), 7, 220);
-    if (g) placePit(x, y, z, rng.range(0, 6.28));
-  }
+  const placeUnit = (u: GroundUnitSite): void => {
+    const t = place(batchOf[u.batch], u.batch, u.kind, u.team,
+      u.x, u.y, u.z, u.yaw, u.radius, u.hp);
+    if (t && u.kind === 'aa') placePit(u.x, u.y, u.z, u.pitYaw);
+  };
+
+  // Flak pits, the lorry column and its escorting armour, in siting order.
+  for (const u of siting.units) placeUnit(u);
+
+  const staticParts: { name: string; b: MeshBuilder }[] = [];
+  /** Everything that lies flat on graded ground — needs the depth bias. */
+  const slabB = new MeshBuilder();
 
   // ------------------------------------------------------------------
-  // Truck convoy on the road between the two fields
-  // ------------------------------------------------------------------
-  // The curve here is the *same* one the terrain shader paints (see
-  // 'roadDistance' in terrainMaterial.ts), so the column drives on the road
-  // surface rather than through standing wheat. The lateral scatter is a lane
-  // width, not 60 m, and the heading follows the tangent of the wander rather
-  // than the straight chord — a convoy pointing 12 degrees off its own road is
-  // as obvious from 1000 m as no road at all.
-  {
-    const ax = teamCentres[0].x, az = teamCentres[0].z;
-    const bx = teamCentres[1].x, bz = teamCentres[1].z;
-    const dx = bx - ax, dz = bz - az;
-    const len = Math.hypot(dx, dz) || 1;
-    const nx = -dz / len, nz = dx / len;
-    const roadOff = (t: number) => Math.sin(t * 9.1) * 420 + Math.sin(t * 3.3) * 900;
-    let placed = 0;
-    for (let i = 0; i < 90 && placed < 26; i++) {
-      const t = 0.22 + (i / 90) * 0.56;
-      const off = roadOff(t);
-      // Tangent of the wandered curve, in world units per unit t.
-      const dOff = (roadOff(t + 1e-3) - roadOff(t - 1e-3)) / 2e-3;
-      const tanX = dx + nx * dOff, tanZ = dz + nz * dOff;
-      const lane = rng.range(-3.0, 3.0);
-      const x = ax + dx * t + nx * (off + lane);
-      const z = az + dz * t + nz * (off + lane);
-      const y = hf.heightAt(x, z);
-      if (y < SEA_LEVEL + 4 || hf.slopeAt(x, z) > 0.22) continue;
-      if (!clearOfWorks(x, z)) continue;
-      const yaw = Math.atan2(tanX, tanZ) + rng.range(-0.05, 0.05);
-      place(truckBatch, 'trucks', 'truck', 2, x, y, z, yaw, 4.5, 90);
-      placed++;
-      if (placed % 5 === 0) {
-        // Armour pulled off onto the verge, not driving abreast in the field.
-        const ox = x + nx * 8.5, oz = z + nz * 8.5;
-        place(tankBatch, 'lightArmour', 'truck', 2, ox, hf.heightAt(ox, oz), oz, yaw, 4.0, 150);
-      }
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // Factory complex — sited on flat ground near a river
+  // Factory complex
   // ------------------------------------------------------------------
   //
   // Each installation gets its OWN merged mesh. Merging the factory, the rail
@@ -239,74 +182,48 @@ export function buildGroundTargets(
   // installation set twice (the inverted-hull outline shares the bounds) and
   // drew all of it into every shadow cascade. Five extra draw calls against a
   // 1200 budget buys tight bounds for each.
-  const staticParts: { name: string; b: MeshBuilder }[] = [];
-  /** Everything that lies flat on graded ground — needs the depth bias. */
-  const slabB = new MeshBuilder();
-
-  const facB = new MeshBuilder();
-  {
-    const site = findFlatSite(hf, rng, mid.x, mid.z, 12000, 60, 500, 0.10);
-    if (site) {
-      // Grade the ground to the footprint the geometry actually occupies
-      // (the apron is 190 x 130 m and the perimeter wall reaches 95 m), so the
-      // slab corners are neither buried nor cantilevered into the air.
-      const y = hf.flattenSite(site.x, site.z, 108, 78, site.yaw);
-      buildFactory(facB, slabB, site.x, y, site.z, site.yaw, rng);
-      staticParts.push({ name: 'factory', b: facB });
-      targets.push({
-        id: nextId++, kind: 'factory', team: 2,
-        x: site.x, y, z: site.z, radius: 95, hp: 2400, maxHp: 2400,
-        batch: 'static', slot: -1, alive: true,
-      });
-    }
+  if (siting.factory) {
+    const f = siting.factory;
+    const facB = new MeshBuilder();
+    buildFactory(facB, slabB, f.x, f.y, f.z, f.yaw, f.extra);
+    staticParts.push({ name: 'factory', b: facB });
+    targets.push({
+      id: nextId++, kind: 'factory', team: 2,
+      x: f.x, y: f.y, z: f.z, radius: f.radius, hp: f.hp, maxHp: f.hp,
+      batch: 'static', slot: -1, alive: true,
+    });
   }
 
   // ------------------------------------------------------------------
   // Rail yard
   // ------------------------------------------------------------------
-  {
-    const site = findFlatSite(hf, rng, mid.x + rng.range(-8000, 8000), mid.z + rng.range(-8000, 8000),
-      11000, 30, 420, 0.07);
-    if (site) {
-      // 218 m of rail cannot follow a hillside: grade the whole yard.
-      const y = hf.flattenSite(site.x, site.z, 118, 42, site.yaw);
-      const yardB = new MeshBuilder();
-      buildRailYard(yardB, slabB, site.x, y, site.z, site.yaw);
-      staticParts.push({ name: 'railyard', b: yardB });
-      // Rolling stock as instanced wagons on the sidings.
-      const c = Math.cos(site.yaw), s = Math.sin(site.yaw);
-      for (let track = -1; track <= 1; track++) {
-        for (let k = 0; k < 7; k++) {
-          const a = -70 + k * 21 + track * 6;
-          const bcoord = track * 9;
-          const x = site.x + a * s + bcoord * c;
-          const z = site.z + a * c - bcoord * s;
-          place(wagonBatch, 'wagons', 'railyard', 2, x, y, z, site.yaw, 6, 140);
-        }
-      }
-      targets.push({
-        id: nextId++, kind: 'railyard', team: 2,
-        x: site.x, y, z: site.z, radius: 110, hp: 1500, maxHp: 1500,
-        batch: 'static', slot: -1, alive: true,
-      });
-    }
+  if (siting.railyard) {
+    const r = siting.railyard;
+    const yardB = new MeshBuilder();
+    buildRailYard(yardB, slabB, r.x, r.y, r.z, r.yaw);
+    staticParts.push({ name: 'railyard', b: yardB });
+    // Rolling stock as instanced wagons on the sidings.
+    for (const w of siting.wagons) placeUnit(w);
+    targets.push({
+      id: nextId++, kind: 'railyard', team: 2,
+      x: r.x, y: r.y, z: r.z, radius: r.radius, hp: r.hp, maxHp: r.hp,
+      batch: 'static', slot: -1, alive: true,
+    });
   }
 
   // ------------------------------------------------------------------
   // Bridge — spans the trunk river where it is widest and lowest
   // ------------------------------------------------------------------
-  {
-    const span = findRiverCrossing(hf, rng);
-    if (span) {
-      const bridgeB = new MeshBuilder();
-      buildBridge(bridgeB, span);
-      staticParts.push({ name: 'bridge', b: bridgeB });
-      targets.push({
-        id: nextId++, kind: 'bridge', team: 2,
-        x: span.cx, y: span.deck, z: span.cz, radius: span.half + 12,
-        hp: 1800, maxHp: 1800, batch: 'static', slot: -1, alive: true,
-      });
-    }
+  if (siting.bridge) {
+    const b = siting.bridge;
+    const bridgeB = new MeshBuilder();
+    buildBridge(bridgeB, b.span);
+    staticParts.push({ name: 'bridge', b: bridgeB });
+    targets.push({
+      id: nextId++, kind: 'bridge', team: 2,
+      x: b.x, y: b.y, z: b.z, radius: b.radius, hp: b.hp, maxHp: b.hp,
+      batch: 'static', slot: -1, alive: true,
+    });
   }
 
   const staticMeshes: THREE.Mesh[] = [];
@@ -389,91 +306,6 @@ export function buildGroundTargets(
       mat.dispose();
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// Siting helpers
-// ---------------------------------------------------------------------------
-
-function findFlatSite(
-  hf: Heightfield, rng: Rng, cx: number, cz: number, searchR: number,
-  minH: number, maxH: number, maxSlope: number,
-): { x: number; y: number; z: number; yaw: number } | null {
-  for (let i = 0; i < 400; i++) {
-    const a = rng.range(0, Math.PI * 2);
-    const r = Math.sqrt(rng.next()) * searchR;
-    const x = cx + Math.cos(a) * r;
-    const z = cz + Math.sin(a) * r;
-    const y = hf.heightAt(x, z);
-    if (y < minH || y > maxH) continue;
-    let ok = true;
-    for (let k = 0; k < 8 && ok; k++) {
-      const ka = (k / 8) * Math.PI * 2;
-      const px = x + Math.cos(ka) * 90, pz = z + Math.sin(ka) * 90;
-      if (Math.abs(hf.heightAt(px, pz) - y) > 9 || hf.slopeAt(px, pz) > maxSlope) ok = false;
-    }
-    if (ok) return { x, y, z, yaw: rng.range(0, Math.PI * 2) };
-  }
-  return null;
-}
-
-interface RiverSpan {
-  cx: number; cz: number;
-  /** Direction across the river (unit). */
-  dx: number; dz: number;
-  half: number;
-  deck: number;
-}
-
-/**
- * Finds a place to put the bridge: walks the drainage map for a strong reach,
- * then measures the width of the low ground perpendicular to the flow.
- */
-function findRiverCrossing(hf: Heightfield, _rng: Rng): RiverSpan | null {
-  let best: RiverSpan | null = null;
-  let bestScore = -Infinity;
-
-  // Scan the drainage grid directly rather than sampling at random: the
-  // flooded reach is one or two 128 m cells wide out of a 65 km map, and a
-  // Monte-Carlo search finds it about once in three attempts.
-  for (let j = 2; j < COARSE_N - 2; j++) {
-    for (let i = 2; i < COARSE_N - 2; i++) {
-      const fl = hf.flow[j * COARSE_N + i];
-      if (fl < 0.44) continue;
-      const x = -MAP_HALF + i * COARSE_STEP;
-      const z = -MAP_HALF + j * COARSE_STEP;
-      // The channel must be flooded here, else the bridge spans a dry gully.
-      if (hf.heightAt(x, z) > SEA_LEVEL - 1.0) continue;
-
-      // Channel direction from the flow gradient; cross it perpendicular.
-      const e = 128;
-      const gx = hf.sampleFlow(x + e, z) - hf.sampleFlow(x - e, z);
-      const gz = hf.sampleFlow(x, z + e) - hf.sampleFlow(x, z - e);
-      let dx = gx, dz = gz;
-      const l = Math.hypot(dx, dz);
-      if (l < 1e-6) continue;
-      dx /= l; dz /= l;
-
-      // Walk out to dry land on both banks.
-      let half = 0, ok = false;
-      for (let sdist = 12; sdist <= 260; sdist += 12) {
-        const h1 = hf.heightAt(x + dx * sdist, z + dz * sdist);
-        const h2 = hf.heightAt(x - dx * sdist, z - dz * sdist);
-        half = sdist;
-        if (h1 > SEA_LEVEL + 2.5 && h2 > SEA_LEVEL + 2.5) { ok = true; break; }
-      }
-      if (!ok || half < 30) continue;
-
-      // Favour a strong river at a narrow point — that is where engineers put
-      // bridges, and it is where a bomb run has to be precise.
-      const score = fl * 3 - half / 90;
-      if (score > bestScore) {
-        bestScore = score;
-        best = { cx: x, cz: z, dx, dz, half: half + 22, deck: SEA_LEVEL + 10.5 };
-      }
-    }
-  }
-  return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -585,7 +417,9 @@ function buildWagon(): THREE.BufferGeometry {
 }
 
 function buildFactory(
-  b: MeshBuilder, slab: MeshBuilder, x: number, y: number, z: number, yaw: number, rng: Rng,
+  b: MeshBuilder, slab: MeshBuilder, x: number, y: number, z: number, yaw: number,
+  /** Pre-rolled chimney height jitter — see 'groundSites.ts' on RNG order. */
+  extra: number[],
 ): void {
   const c = Math.cos(yaw), s = Math.sin(yaw);
   const P = (a: number, bb: number): [number, number] => [x + a * s + bb * c, z + a * c - bb * s];
@@ -614,7 +448,7 @@ function buildFactory(
   for (let i = 0; i < 2; i++) {
     const [px, pz] = P(62, -6 + i * 26);
     b.color(0x7d5f4c);
-    b.cylinder(px, y, pz, 3.4, 2.2, 34 + rng.range(0, 9), 10, false);
+    b.cylinder(px, y, pz, 3.4, 2.2, 34 + (extra[i] ?? 4.5), 10, false);
     b.color(0x4c3a2d);
     b.cylinder(px, y + 33, pz, 2.5, 2.4, 2.2, 10, true);
   }

@@ -8,6 +8,8 @@
  * Coordinate system: right-handed, Y = up, metres, radians, seconds.
  */
 
+import type { WeatherId } from './environment';
+
 export const PROTOCOL_VERSION = 1;
 
 /** Server simulation rate. Clients predict at render rate and reconcile. */
@@ -336,14 +338,53 @@ export interface WelcomeMsg {
   serverTime: number;
   tickHz: number;
   players: PlayerInfo[];
+  /**
+   * Per-match sky. The server owns it because the client predicts against the
+   * wind it implies (see 'shared/environment.ts'), so the two halves cannot be
+   * allowed to disagree about which one is in force.
+   */
+  weather: WeatherId;
+  /** Local solar-clock hours, [0,24). */
+  timeOfDay: number;
 }
 export interface PlayerInfo { id: number; name: string; team: number; kills: number; deaths: number; score: number; alive: boolean }
-export interface SpawnRequestMsg { t: 'spawn'; aircraft: string }
-export interface SpawnAcceptedMsg { t: 'spawned'; entityId: number; aircraft: string }
+export interface SpawnRequestMsg {
+  t: 'spawn';
+  aircraft: string;
+  /**
+   * Hangar loadout id, or omitted/'clean' for guns only.
+   *
+   * Without this the server had no way to know what the player had hung on the
+   * aeroplane, so an online pilot always flew clean however carefully they
+   * armed themselves in the hangar — and, because the mass and drag penalty is
+   * part of the flight model the client predicts with, the two halves also
+   * disagreed about how fast the aeroplane was. The server validates it against
+   * the airframe's own loadout table and falls back to clean.
+   */
+  loadout?: string;
+}
+export interface SpawnAcceptedMsg {
+  t: 'spawned'; entityId: number; aircraft: string;
+  /** The loadout actually granted, which may not be the one asked for. */
+  loadout: string;
+}
+/**
+ * Stores remaining on the addressed player's aeroplane. Sent on spawn and on
+ * every release, because the server owns the racks: the client's readout is a
+ * display of this, not a count of its own.
+ */
+export interface StoresMsg {
+  t: 'stores'; entityId: number; loadout: string; bombs: number; rockets: number;
+}
 export interface ChatMsg { t: 'chat'; from: string; text: string; team: number }
 export interface KillfeedMsg { t: 'kill'; killer: string; victim: string; weapon: string; killerTeam: number; victimTeam: number }
-export interface MatchStateMsg { t: 'match'; scoreA: number; scoreB: number; timeLeft: number; players: PlayerInfo[] }
+export interface MatchStateMsg {
+  t: 'match'; scoreA: number; scoreB: number; timeLeft: number; players: PlayerInfo[];
+  /** Repeated on every match tick so a mid-match weather change replicates. */
+  weather: WeatherId;
+  timeOfDay: number;
+}
 
 export type ControlMsg =
-  | HelloMsg | WelcomeMsg | SpawnRequestMsg | SpawnAcceptedMsg
+  | HelloMsg | WelcomeMsg | SpawnRequestMsg | SpawnAcceptedMsg | StoresMsg
   | ChatMsg | KillfeedMsg | MatchStateMsg;

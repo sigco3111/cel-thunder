@@ -51,6 +51,33 @@ export function drawFullScreen(
   renderer.render(_quadScene, _quadCamera);
 }
 
+/**
+ * Compiles a pass's program now, rather than the first time it is drawn.
+ *
+ * three links a program lazily, on the first render that uses the material —
+ * and a full-screen post-process shader is a big one, so that first use costs a
+ * visible stall. It matters most for the *variants*: every quality tier flips
+ * '#define's on the ink, AO, DOF and motion-blur passes, so each tier the
+ * adaptive governor moves to used to pay a fresh compile the moment it got
+ * there. Warming every variant during boot turns a governor step from a stutter
+ * into a free lookup in three's program cache, which is what makes it safe for
+ * the governor to prefer tier changes over resolution changes.
+ */
+export function prewarmPass(
+  renderer: THREE.WebGLRenderer,
+  material: THREE.Material,
+): void {
+  const prev = _quadMesh.material;
+  _quadMesh.material = material;
+  try {
+    renderer.compile(_quadScene, _quadCamera);
+  } catch {
+    // A variant that will not compile here would not compile later either;
+    // let the real draw produce the error where it can be attributed.
+  }
+  _quadMesh.material = prev;
+}
+
 /** Vertex shader every full-screen pass uses. Bypasses all matrices. */
 export const FULLSCREEN_VERT = /* glsl */`
   varying vec2 vUv;

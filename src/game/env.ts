@@ -1,6 +1,7 @@
 import type { V3 } from '../shared/math';
 import {
-  airDensity, speedOfSound, windAt as sharedWindAt, windField, type WindField,
+  airDensity, speedOfSound, windAt as sharedWindAt, windField,
+  type WeatherId, type WindField,
 } from '../shared/environment';
 import { externals, type FlightEnv } from './externals';
 
@@ -18,12 +19,31 @@ export { airDensity, speedOfSound };
 
 export class ClientEnv implements FlightEnv {
   readonly seed: number;
+  /** The match weather this air was built for. See 'setWeather'. */
+  weather: WeatherId;
   private wind: WindField;
 
-  constructor(seed: number) {
+  constructor(seed: number, weather: WeatherId = 'scattered') {
     this.seed = seed;
-    // Same seed the server uses, so both derive the same wind field.
-    this.wind = windField(seed);
+    this.weather = weather;
+    // Same seed *and the same weather* the server uses, so both derive the same
+    // wind field. Weather is not cosmetic here: it scales the gradient wind and
+    // sets the turbulence amplitude the flight model integrates against.
+    this.wind = windField(seed, weather);
+  }
+
+  /**
+   * Rebuilds the air for a new match weather.
+   *
+   * Mutating in place rather than handing out a new instance is deliberate:
+   * prediction, the offline sandbox and the presentation layer all hold the
+   * same object, and swapping it under half of them is exactly how the two
+   * halves end up integrating against different air.
+   */
+  setWeather(weather: WeatherId): void {
+    if (weather === this.weather) return;
+    this.weather = weather;
+    this.wind = windField(this.seed, weather);
   }
 
   airDensity(y: number): number { return airDensity(y); }
@@ -67,7 +87,8 @@ export class ClientEnv implements FlightEnv {
  * subsystems take it from here rather than each building their own.
  */
 let shared: ClientEnv | null = null;
-export function getClientEnv(seed: number): ClientEnv {
-  if (!shared || shared.seed !== seed) shared = new ClientEnv(seed);
+export function getClientEnv(seed: number, weather?: WeatherId): ClientEnv {
+  if (!shared || shared.seed !== seed) shared = new ClientEnv(seed, weather ?? 'scattered');
+  else if (weather) shared.setWeather(weather);
   return shared;
 }

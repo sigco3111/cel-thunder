@@ -69,6 +69,7 @@ export type { PenetrationQuery, PenetrationResult } from './penetration';
 // --- explosions ------------------------------------------------------------
 export {
   applyExplosion, gurneyVelocity, shellCasing, warheadCasing, visualBlastRadius,
+  groundBlastDamage, groundBlastRadius,
 } from './explosion';
 export type { ExplosionParams } from './explosion';
 

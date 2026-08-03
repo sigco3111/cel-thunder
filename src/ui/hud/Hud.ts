@@ -12,6 +12,7 @@ import { DamagePanel } from './DamagePanel';
 import { Markers, type TargetInfo } from './Markers';
 import { Minimap } from './Minimap';
 import { Killfeed, Notices, Popups, ConnPill, MatchStrip, ChatBox } from './Feed';
+import { OrdnancePanel, BombSight, type OrdnanceView } from './Ordnance';
 
 const SPEED_METRIC: TapeConfig = { min: 0, max: 1000, tick: 10, labelEvery: 5, spacing: 13, unit: 'km/h', digits: 3, quantum: 1 };
 const SPEED_IMPERIAL: TapeConfig = { min: 0, max: 640, tick: 10, labelEvery: 5, spacing: 16, unit: 'mph', digits: 3, quantum: 1 };
@@ -19,6 +20,9 @@ const ALT_METRIC: TapeConfig = { min: 0, max: 12000, tick: 100, labelEvery: 5, s
 const ALT_IMPERIAL: TapeConfig = { min: 0, max: 40000, tick: 500, labelEvery: 4, spacing: 26, unit: 'ft', digits: 5, quantum: 1 };
 
 const _pos = new THREE.Vector3();
+const _sight = new THREE.Vector3();
+const _fpm = new THREE.Vector3();
+const _lp = new THREE.Vector3();
 const _vel = new THREE.Vector3();
 
 /**
@@ -54,6 +58,10 @@ export class Hud {
   private gFuel: Gauge;
   private flags: FlagRow;
   private ammo: AmmoPanel;
+  private stores: OrdnancePanel;
+  private bombsight: BombSight;
+  /** Latest ordnance state pushed in by the flight side; null when clean. */
+  private ordnance: OrdnanceView | null = null;
   private damage: DamagePanel;
   private gmeter: GMeter;
   private fireWarn: HTMLElement;
@@ -109,11 +117,20 @@ export class Hud {
     this.damage = new DamagePanel(frame);
     this.ammo = new AmmoPanel(frame);
 
+    // Stores go under the airframe panel, in the same column as the ammunition
+    // counters: they are the same class of information — what is left to shoot
+    // with — and a pilot scans them together.
+    this.stores = new OrdnancePanel(sys);
+
     this.gmeter = new GMeter(this.root);
 
     this.fireWarn = el('div', '', this.root, 'ENGINE FIRE');
     this.fireWarn.id = 'ct-firewarn';
     setStyle(this.fireWarn, 'display', 'none');
+
+    // Under the markers so a contact label is never printed over the pipper,
+    // and over the centre stack so the fall line reads across the reticle.
+    this.bombsight = new BombSight(this.root);
 
     this.minimap = new Minimap(this.root);
     this.markers = new Markers(this.root);
@@ -167,6 +184,7 @@ export class Hud {
     this.altTape.resize(u);
     this.compass.resize(u, 540 * u);
     this.markers.resize(w, h, u);
+    this.bombsight.resize(w, h, u);
     this.minimap.resize(244 * u, Math.min(devicePixelRatio || 1, 2));
     this.protectAcc = 99;
   }
@@ -291,6 +309,8 @@ export class Hud {
       this.ammo.build(t.ammo, specId);
     }
     this.damage.update(t.damage, t.health);
+    this.stores.update(this.ordnance);
+    this.updateBombSight(ctx, t);
     this.ammo.update(t.ammo);
     this.gmeter.update(t.gLoad, t.gPeak, t.gMin, spec?.aero.gLimit ?? 9);
 
@@ -312,6 +332,59 @@ export class Hud {
     this.popups.update(dt);
     this.chat.update(dt);
     setStyle(this.minimap.root, 'display', prefs.showMinimap ? 'block' : 'none');
+  }
+
+  /**
+   * Latest stores state from the flight side.
+   *
+   * Pushed rather than pulled: the impact solution is expensive enough that the
+   * flight system runs it on its own schedule, and the HUD has no business
+   * asking for a fresh one every frame.
+   */
+  setOrdnance(v: OrdnanceView | null): void {
+    this.ordnance = v;
+  }
+
+  /**
+   * Projects the impact solution and the flight-path marker into screen space.
+   *
+   * Both come from the same camera the frame is rendered with, so the pipper
+   * is conformal: it sits on the piece of ground the bombs will actually hit,
+   * at any field of view and in any attitude.
+   */
+  private updateBombSight(ctx: GameContext, t: HudTelemetry): void {
+    const o = this.ordnance;
+    const local = ctx.entities.get(ctx.localEntityId);
+    if (!o || !o.hasSolution || o.bombs <= 0 || !local || !t.alive) {
+      this.bombsight.hide();
+      return;
+    }
+
+    _sight.set(o.ix, o.iy, o.iz).project(ctx.camera);
+    const behind = _sight.z > 1;
+    const px = (_sight.x * 0.5 + 0.5) * this.w;
+    const py = (-_sight.y * 0.5 + 0.5) * this.h;
+    // A little slack past the frame edge so the pipper does not blink out the
+    // instant it touches the border during a hard pull.
+    const margin = 40 * this.u;
+    const onScreen = !behind
+      && px > -margin && px < this.w + margin && py > -margin && py < this.h + margin;
+
+    // The fall line springs from the flight-path marker — where the aeroplane
+    // is going — because that is the point the bomb inherits its velocity from.
+    const speed = Math.hypot(local.vx, local.vy, local.vz);
+    let fx = this.w * 0.5, fy = this.h * 0.5;
+    if (speed > 12) {
+      _fpm.set(local.vx, local.vy, local.vz).multiplyScalar(600 / speed)
+        .add(_lp.set(local.px, local.py, local.pz))
+        .project(ctx.camera);
+      if (_fpm.z <= 1) {
+        fx = (_fpm.x * 0.5 + 0.5) * this.w;
+        fy = (-_fpm.y * 0.5 + 0.5) * this.h;
+      }
+    }
+
+    this.bombsight.update(true, onScreen, px, py, fx, fy, o.range, o.fallTime, o.tooLow);
   }
 
   /** Bearing of the current primary target, cached for the compass caret. */

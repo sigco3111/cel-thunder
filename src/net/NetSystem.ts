@@ -6,6 +6,9 @@ import {
   type EntityState, type InputFrame, type PlayerInfo,
 } from '../shared/protocol';
 import { lerp, qslerp, q, type Q } from '../shared/math';
+import {
+  clampTimeOfDay, isWeatherId, matchEnvironment, type WeatherId,
+} from '../shared/environment';
 
 /**
  * Client half of the netcode.
@@ -58,6 +61,23 @@ export class NetSystem implements Subsystem {
   timeLeft = 0;
   rttMs = 0;
 
+  /**
+   * The match's sky, as the server chose it.
+   *
+   * This is not decoration: 'shared/environment.ts' derives the wind field and
+   * the turbulence the flight model integrates against from
+   * (mapSeed, weather), so a client flying a different weather to the server
+   * would predict a different trajectory and rubber-band. Everything else that
+   * consumes it — the sky dome, the rain, the fog — is downstream of that.
+   *
+   * Seeded so it is already sane before 'welcome' lands and for the offline
+   * sandbox, which has no server to ask.
+   */
+  weather: WeatherId = 'scattered';
+  /** Local solar-clock hours for this match, [0,24). */
+  matchTimeOfDay = 9.5;
+  private envApplied = false;
+
   private ws: WebSocket | null = null;
   private ctx!: GameContext;
   private snapshots: Snapshot[] = [];
@@ -80,6 +100,28 @@ export class NetSystem implements Subsystem {
 
   async init(ctx: GameContext): Promise<void> {
     this.ctx = ctx;
+
+    // Debug poses. Offline the sandbox owns the actors and handles this itself;
+    // online the server does, and only when it has been started with
+    // 'CT_DEBUG_PLACE' set — otherwise it ignores the message. Forwarding it
+    // here rather than from the flight subsystem keeps the two paths symmetric:
+    // the same 'debug:place' event sets up the same situation either way, which
+    // is what lets the playability harness fly the same bombing run online as
+    // it does offline.
+    ctx.bus.on('debug:place', (p: {
+      x: number; y: number; z: number;
+      heading: number; pitch: number; bank: number; speed: number;
+    }) => {
+      if (!this.connected || this.ws?.readyState !== WebSocket.OPEN) return;
+      try {
+        this.ws.send(JSON.stringify({
+          t: 'debugPlace',
+          x: p.x, y: p.y, z: p.z,
+          heading: p.heading, pitch: p.pitch, bank: p.bank, speed: p.speed,
+        }));
+      } catch { /* dropped */ }
+    });
+
     const url = this.resolveUrl();
 
     // Never block boot on the network: if the server is not there we fall back
@@ -88,9 +130,59 @@ export class NetSystem implements Subsystem {
     if (!ok) {
       this.offline = true;
       ctx.mapSeed = this.mapSeed;
+      // No server to ask, so derive the sky from the map seed. Deterministic on
+      // purpose: the screenshot and playability harnesses both run this path and
+      // a sandbox that rolled fresh weather every load would make every capture
+      // and every threshold non-reproducible.
+      this.applyMatchEnvironment(matchEnvironment(this.mapSeed), 'sandbox');
       console.warn('[net] no server — running offline sandbox');
       ctx.bus.emit('net:offline');
     }
+  }
+
+  /**
+   * Latches the match sky and republishes it.
+   *
+   * 'sky:*' consumers can simply listen for 'net:environment'; the flight model
+   * cannot, because it must be holding the right wind field before the very
+   * first prediction step, so it reads these fields directly at init instead.
+   */
+  private applyMatchEnvironment(
+    env: { weather: WeatherId; timeOfDay: number }, source: string,
+  ): void {
+    const params = new URLSearchParams(location.search);
+    // Query overrides exist so a stormy match can be reproduced on demand
+    // without restarting the server and hoping. Client-side only, which is
+    // safe for the clock (presentation) but *not* for the weather in a real
+    // match — see the guard below.
+    const forced = params.get('weather');
+    let weather = env.weather;
+    if (isWeatherId(forced)) {
+      if (this.offline) weather = forced;
+      else console.warn(`[net] ignoring ?weather=${forced}: the server owns match weather`);
+    }
+    const timeOfDay = params.has('tod')
+      ? clampTimeOfDay(Number(params.get('tod')))
+      : clampTimeOfDay(env.timeOfDay);
+
+    const changed = !this.envApplied
+      || weather !== this.weather
+      || Math.abs(timeOfDay - this.matchTimeOfDay) > 1e-4;
+    this.envApplied = true;
+    this.weather = weather;
+    this.matchTimeOfDay = timeOfDay;
+    // Only on an actual change. 'match' repeats the environment every two
+    // seconds, and writing ctx.timeOfDay unconditionally would stamp on the
+    // debug clock slider and on any camera framing that set its own hour.
+    if (!changed) return;
+    this.ctx.timeOfDay = timeOfDay;
+    const hh = Math.floor(timeOfDay);
+    const mm = Math.round((timeOfDay - hh) * 60);
+    console.info(
+      `[net] match sky: ${weather} at ${String(hh).padStart(2, '0')}:`
+      + `${String(mm).padStart(2, '0')} (${source})`,
+    );
+    this.ctx.bus.emit('net:environment', { weather, timeOfDay, source });
   }
 
   private resolveUrl(): string {
@@ -154,6 +246,16 @@ export class NetSystem implements Subsystem {
         this.ctx.localPlayerId = msg.playerId;
         this.ctx.localTeam = msg.team;
         this.ctx.mapSeed = msg.mapSeed;
+        // Before 'net:welcome': every consumer of that event is entitled to see
+        // the match sky already in force, and the sky/flight subsystems have not
+        // even been initialised yet at this point in the boot.
+        this.applyMatchEnvironment(
+          {
+            weather: isWeatherId(msg.weather) ? msg.weather : 'scattered',
+            timeOfDay: typeof msg.timeOfDay === 'number' ? msg.timeOfDay : 9.5,
+          },
+          'server',
+        );
         this.ctx.bus.emit('net:welcome', msg);
         break;
       case 'spawned':
@@ -164,7 +266,15 @@ export class NetSystem implements Subsystem {
       case 'match':
         this.scoreA = msg.scoreA; this.scoreB = msg.scoreB;
         this.timeLeft = msg.timeLeft; this.players = msg.players ?? [];
+        if (isWeatherId(msg.weather) && typeof msg.timeOfDay === 'number') {
+          this.applyMatchEnvironment({ weather: msg.weather, timeOfDay: msg.timeOfDay }, 'server');
+        }
         this.ctx.bus.emit('net:match', msg);
+        break;
+      case 'stores':
+        // The racks are the server's. This is the only thing that moves the
+        // client's stores readout online.
+        this.ctx.bus.emit('net:stores', msg);
         break;
       case 'kill':
         this.ctx.bus.emit('net:kill', msg);
@@ -303,14 +413,16 @@ export class NetSystem implements Subsystem {
    * That is the difference between "the renderer works" and "the game is
    * playable", so the id must always come from whoever actually owns actors.
    */
-  requestSpawn(aircraft: string): void {
+  requestSpawn(aircraft: string, loadout = 'clean'): void {
     if (this.connected) {
-      this.ws?.send(JSON.stringify({ t: 'spawn', aircraft }));
+      // The loadout goes with the request: the server arms the aeroplane, flies
+      // it against the loaded variant spec and owns the racks from there.
+      this.ws?.send(JSON.stringify({ t: 'spawn', aircraft, loadout }));
       return;
     }
     // The offline sandbox listens for this and replies with 'net:spawned'
     // carrying the real entity id once the actor exists.
-    this.ctx.bus.emit('game:spawnRequest', { aircraft });
+    this.ctx.bus.emit('game:spawnRequest', { aircraft, loadout });
   }
 
   sendChat(text: string): void {

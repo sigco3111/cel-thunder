@@ -13,6 +13,7 @@ import {
   type FlightModule, type FlightState, type FlightTransform,
 } from './externals';
 import { AiPilot } from './ai/AiPilot';
+import { flightSpecFor } from './loadout';
 
 /**
  * A complete single-player match, run entirely on the client.
@@ -37,7 +38,12 @@ const ROSTER: Array<{ id: string; ai: boolean }> = [
   { id: 'a6m5', ai: true },
 ];
 
-const RESPAWN_DELAY = 7;
+/**
+ * Seconds on the respawn screen. Kept in step with 'UiSystem.respawnSeconds',
+ * which draws the countdown ring — they were 7 and 8, so the ring finished a
+ * second before the aeroplane did.
+ */
+const RESPAWN_DELAY = 5;
 /** Trimmed cruise for a spawn, m/s TAS — about 460 km/h. */
 const CRUISE = 128;
 const PROJECTILE_LIFE = 4.0;
@@ -49,6 +55,12 @@ interface Actor {
   typeId: number;
   team: number;
   flight: FlightState;
+  /**
+   * The spec the flight model integrates this actor against. Identical to
+   * 'spec' unless the aeroplane is carrying stores, in which case it is the
+   * higher-cd0 variant from 'loadout.ts'.
+   */
+  flightSpec: AircraftSpec;
   state: EntityState;
   ai: AiPilot | null;
   /** Per-gun cooldown, seconds. */
@@ -142,6 +154,32 @@ export class OfflineSandbox {
       const id = (m as { aircraft?: string } | undefined)?.aircraft;
       this.respawnPlayer(id);
     });
+
+    // Blast damage arbitration. 'OrdnanceRuntime' owns the explosion physics —
+    // it runs the shared blast model and reports what each aircraft absorbed —
+    // but this class owns the health pool, the damage bits and the killfeed, so
+    // the two meet here rather than either reaching into the other.
+    this.ctx.bus.on('game:ordnanceHit', (m: unknown) => {
+      const h = m as { targetId: number; damage: number; x: number; y: number; z: number; shooter: number };
+      if (!h || !h.targetId) return;
+      const a = this.actors.find((x) => x.entityId === h.targetId);
+      if (a) this.applyBlast(a, h.damage, h.x, h.y, h.z, h.shooter);
+    });
+  }
+
+  /**
+   * The player's stores, pushed in by 'FlightSystem' every frame.
+   *
+   * Mass goes on the state ('extraMass' is a field the shared model already
+   * honours); drag goes on the spec, because the model rebuilds its own
+   * 'extraDrag' from the damage bits on every step and there is nowhere else to
+   * put it. See 'loadout.ts'.
+   */
+  setPlayerStores(mass: number, cdArea: number): void {
+    const a = this.playerActor;
+    if (!a) return;
+    (a.flight as Record<string, unknown>).extraMass = mass;
+    a.flightSpec = flightSpecFor(a.spec, cdArea);
   }
 
   /**
@@ -179,6 +217,8 @@ export class OfflineSandbox {
       actor.bailed = false;
       actor.respawnAt = 0;
       actor.ammo = actor.spec.guns.map((g) => g.ammo * g.count);
+      actor.flightSpec = actor.spec;
+      (actor.flight as Record<string, unknown>).extraMass = 0;
     }
 
     this.ctx.localEntityId = actor.entityId;
@@ -208,7 +248,7 @@ export class OfflineSandbox {
     state.qx = rot.x; state.qy = rot.y; state.qz = rot.z; state.qw = rot.w;
 
     const actor: Actor = {
-      entityId: id, spec, typeId: state.typeId, team, flight, state,
+      entityId: id, spec, typeId: state.typeId, team, flight, flightSpec: spec, state,
       ai: ai ? new AiPilot(id, spec) : null,
       gunCd: spec.guns.map(() => 0),
       ammo: spec.guns.map((g) => g.ammo * g.count),
@@ -287,7 +327,7 @@ export class OfflineSandbox {
     // --- flight -------------------------------------------------------------
     for (const a of this.actors) {
       (a.flight as Record<string, unknown>).damage = a.state.damage;
-      this.flightMod.stepFlight(a.flight, a.spec, a.input, this.env, dt);
+      this.flightMod.stepFlight(a.flight, a.flightSpec, a.input, this.env, dt);
       this.syncActor(a, dt);
       this.checkTerrain(a);
     }
@@ -543,6 +583,42 @@ export class OfflineSandbox {
     if (s.health <= 0) this.kill(target, p.shooter, `${p.calibre}mm`);
   }
 
+  /**
+   * A share of an explosion landing on an aeroplane.
+   *
+   * The shared blast model has already worked out how much energy reached this
+   * airframe through its own geometry; all that is left is to spend it. Blast
+   * is indiscriminate in a way gunfire is not — it arrives everywhere at once —
+   * so the component rolls are flatter and much more likely to take a wing off
+   * than a burst of the same nominal damage would be.
+   */
+  private applyBlast(
+    target: Actor, damage: number, hx: number, hy: number, hz: number, shooter: number,
+  ): void {
+    if (!target.alive || (target.state.damage & DamageBits.Destroyed)) return;
+    const s = target.state;
+    s.health = clamp(s.health - damage / target.spec.damage.hull, 0, 1);
+
+    this.event(EventKind.HitSpark, hx, hy, hz, 0, 1, 0, 2.2, target.entityId, shooter);
+
+    const sev = clamp(damage / (target.spec.damage.hull * 0.30), 0, 1);
+    if (Math.random() < sev * 0.55) {
+      s.damage |= Math.random() < 0.5 ? DamageBits.LeftWing : DamageBits.RightWing;
+    }
+    if (Math.random() < sev * 0.35) s.damage |= DamageBits.Engine;
+    if (Math.random() < sev * 0.30) s.damage |= DamageBits.Tail;
+    if (Math.random() < sev * 0.25) s.damage |= DamageBits.Elevator;
+    if ((s.damage & DamageBits.Engine) && Math.random() < sev * 0.30) {
+      s.damage |= DamageBits.EngineFire;
+    }
+    if ((s.damage & (DamageBits.LeftWing | DamageBits.RightWing)) && s.health < 0.5
+      && Math.random() < sev * 0.6) {
+      s.damage |= DamageBits.WingRipped;
+      this.event(EventKind.StructureFail, hx, hy, hz, 0, 1, 0, 2.4, target.entityId, 0);
+    }
+    if (s.health <= 0) this.kill(target, shooter, 'ordnance');
+  }
+
   private kill(target: Actor, killerId: number, weapon: string): void {
     if (target.state.damage & DamageBits.Destroyed) return;
     target.state.damage |= DamageBits.Destroyed;
@@ -571,6 +647,14 @@ export class OfflineSandbox {
       killerTeam: killer ? killer.team : -1,
       victimTeam: target.team,
     });
+
+    // Deliberately after 'net:kill'. Nothing in the repo emitted this event, so
+    // every consumer of it was dead code — the death screen and the kill-cam
+    // are both written, wired and correct, they were simply never told a kill
+    // had happened. It goes last because the death screen is first-writer-wins
+    // and this event carries no names, so announcing it before the killfeed
+    // line would put up a "killed by (nobody)" screen.
+    this.event(EventKind.Kill, s.px, s.py, s.pz, 0, 1, 0, 1, target.entityId, killerId);
   }
 
   private stepRespawns(): void {
@@ -583,10 +667,18 @@ export class OfflineSandbox {
       this.ctx.entities.delete(a.entityId);
       const wasPlayer = a === this.playerActor;
 
+      // Respawn separation has to be read as a *time*, not a distance. At the
+      // old ±5200-6800 m the two sides came back 10-14 km apart, and with a
+      // 256 m/s closure that is forty to fifty seconds of completely empty sky
+      // after every death — on top of the respawn wait itself. The match opens
+      // at ±1500 m for exactly the opposite reason, so a respawn was strictly
+      // worse pacing than the start of the match. This puts the merge about
+      // fifteen seconds out, which is long enough to pick a line and short
+      // enough that dying costs you a fight rather than a coffee break.
       const side = a.team === 0 ? -1 : 1;
-      const px = side * (5200 + Math.random() * 1600);
-      const pz = (Math.random() - 0.5) * 4200;
-      const py = 2300 + Math.random() * 900;
+      const px = side * (1900 + Math.random() * 800);
+      const pz = (Math.random() - 0.5) * 2200;
+      const py = 2300 + Math.random() * 700;
       const heading = a.team === 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
 
       const fresh = this.spawnActor(a.spec, a.team, a.ai !== null, px, py, pz, heading, CRUISE + 12);
