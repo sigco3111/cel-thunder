@@ -1,0 +1,8 @@
+node_modules/
+dist/
+# Screenshot rounds are build artefacts, not source. tools/shoot.mjs regenerates
+# them on demand; keeping ~2 MB x 10 shots x N rounds in git is not useful.
+shots/
+!shots/.gitkeep
+tools/_scratch/
+*.log
