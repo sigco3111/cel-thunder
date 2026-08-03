@@ -27,6 +27,8 @@ const OUT = arg('out', 'shots');
 const W = parseInt(arg('w', '1920'), 10);
 const H = parseInt(arg('h', '1080'), 10);
 const URL_BASE = arg('url', 'http://localhost:5233');
+/** A socket nothing listens on, so NetSystem falls back to the offline sandbox. */
+const OFFLINE_SOCKET = 'ws://127.0.0.1:8799/ws';
 const ONLY = arg('shots', '').split(',').filter(Boolean);
 const WARMUP = parseInt(arg('warmup', '3500'), 10);
 const SETTLE = parseInt(arg('settle', '1600'), 10);
@@ -224,8 +226,21 @@ async function main() {
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('pageerror', (e) => errors.push(String(e.stack || e)));
 
-  console.log(`[shoot] loading ${URL_BASE}`);
-  await page.goto(URL_BASE, { waitUntil: 'domcontentloaded' });
+  // Force the offline sandbox by pointing the client at a dead socket.
+  //
+  // This is not a convenience — it is a correctness requirement. The framings
+  // pose their subject by emitting `debug:place`, which FlightSystem no-ops
+  // whenever a server is answering, because online the server owns every actor
+  // and a client-side teleport would be a desync. So if ANY game server happens
+  // to be listening on :8791 — and `playtest.mjs` leaves one running — every
+  // capture silently comes out with no aircraft in it, while the harness still
+  // prints "0 errors" and 120 fps. A whole round of screenshots was reviewed
+  // and scored before anyone noticed the frames were empty.
+  const captureUrl = URL_BASE.includes('?')
+    ? `${URL_BASE}&server=${OFFLINE_SOCKET}`
+    : `${URL_BASE}/?server=${OFFLINE_SOCKET}`;
+  console.log(`[shoot] loading ${captureUrl}`);
+  await page.goto(captureUrl, { waitUntil: 'domcontentloaded' });
 
   try {
     await page.waitForFunction('window.__ready === true', { timeout: 90000 });
@@ -344,11 +359,38 @@ async function main() {
 
     await page.evaluate(STRIP_CONNECTION_CHROME).catch(() => {});
 
+    // Assert the frame actually contains what the framing promised, BEFORE it
+    // is written. A capture with no aircraft in it is not a screenshot of the
+    // game, and one round of ten such frames was reviewed and scored in full
+    // before anyone noticed. Silence is not success: say so on the shot.
+    const content = await page.evaluate(() => {
+      const g = window.__game;
+      if (!g) return { aircraft: 0, local: 0, entities: 0 };
+      let aircraft = 0;
+      for (const e of g.entities.values()) if (e.kind === 1) aircraft++;
+      return {
+        aircraft,
+        local: g.localEntityId,
+        entities: g.entities.size,
+        hasLocal: g.entities.has(g.localEntityId),
+      };
+    }).catch(() => null);
+
+    const empty = !content || content.aircraft === 0 || !content.hasLocal;
+    if (empty) {
+      errors.push(
+        `"${shot}" captured with no subject `
+        + `(aircraft=${content?.aircraft ?? '?'}, localEntityId=${content?.local ?? '?'}, `
+        + `entities=${content?.entities ?? '?'}) — is a game server answering on :8791? `
+        + 'debug:place is a no-op online.',
+      );
+    }
+
     const path = `${OUT}/${shot}.png`;
     await page.screenshot({ path });
 
     const shotErrors = errors.slice(before);
-    rows.push({ shot, applied, stats, errors: shotErrors.length });
+    rows.push({ shot, applied, stats, errors: shotErrors.length, empty });
     const perf = stats
       ? `${fmt(stats.fps, 1)} fps · ${stats.quality} · ${fmt(stats.drawCalls)} calls · ${fmt(stats.triangles)} tris`
       : 'no stats';
@@ -359,14 +401,24 @@ async function main() {
   }
 
   // --- summary -------------------------------------------------------------
-  console.log('\n[shoot] framing        fps   quality  draw calls  triangles  errors');
+  console.log('\n[shoot] framing        fps   quality  draw calls  triangles  errors  subject');
   for (const r of rows) {
     const s = r.stats;
     console.log(
       `        ${r.shot.padEnd(14)}${(s ? fmt(s.fps, 1) : '?').padStart(5)}  ${(s?.quality ?? '?').padEnd(8)}`
       + `${(s ? fmt(s.drawCalls) : '?').padStart(10)}  ${(s ? fmt(s.triangles) : '?').padStart(9)}`
-      + `${String(r.errors).padStart(8)}`,
+      + `${String(r.errors).padStart(8)}  ${r.empty ? 'MISSING' : 'ok'}`,
     );
+  }
+
+  const emptyShots = rows.filter((r) => r.empty);
+  if (emptyShots.length) {
+    console.log(
+      `\n[shoot] \x1b[31m${emptyShots.length}/${rows.length} CAPTURES HAVE NO AIRCRAFT IN THEM\x1b[0m`
+      + ` — ${emptyShots.map((r) => r.shot).join(', ')}`,
+    );
+    console.log('        These frames are worthless. Do not review or score them.');
+    console.log('        Most likely a game server is answering on :8791; debug:place no-ops online.');
   }
 
   if (errors.length) {

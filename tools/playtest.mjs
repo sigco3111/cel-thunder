@@ -573,6 +573,12 @@ async function runSuite(browser, mode, url) {
       p ? `${p.hard} hard of ${p.corrections} corrections, max ${p.maxErr.toFixed(1)} m` : '');
   }
 
+  // --- 10. ground attack -----------------------------------------------------
+  // Offline only: the ground installations are built by the world subsystem
+  // from the map seed and live in the client's world, so a bombing run is only
+  // resolvable on the path that owns them.
+  if (mode === 'offline') await groundAttack(page, tag, check);
+
   const stats = await page.evaluate(() => window.__game?.stats ?? null);
   check('frame rate holds up', (stats?.fps ?? 0) >= 45,
     `${stats?.fps ?? 0} fps, ${stats?.drawCalls ?? 0} draw calls`);
@@ -588,6 +594,217 @@ async function runSuite(browser, mode, url) {
 
   await page.screenshot({ path: `${tag}-07-final.png` });
   await page.close();
+}
+
+/**
+ * A complete air-to-ground sortie: rearm in the hangar, fly a dive-bombing
+ * pass on a real ground installation, release, and watch the bomb fall.
+ *
+ * The parts that matter and that nothing else covers:
+ *
+ *  - the loadout is chosen through the hangar, not injected;
+ *  - carrying it actually changes the aeroplane (mass and drag), and dropping
+ *    it gives most of that back;
+ *  - the release is the real 'DropBomb' input bit from a real key press;
+ *  - the store is a real entity that falls *ballistically* — accelerating
+ *    downward while keeping the forward throw it inherited — rather than being
+ *    teleported at the ground;
+ *  - and something is destroyed at the end of it.
+ *
+ * The run-in is set up with the same debug placement the screenshot framings
+ * use. Flying four kilometres to a convoy in real time would add a minute to
+ * every run and would be testing the terrain, not the ordnance.
+ */
+async function groundAttack(page, tag, check) {
+  console.log('\n10. Ground attack');
+
+  // --- rearm --------------------------------------------------------------
+  await page.keyboard.press('Escape');
+  await sleep(700);
+  const toHangar = await clickButton(page, 'button.ct-navitem', 'change aircraft');
+  const inHangar = toHangar && await waitForScreen(page, 'hangar', 6000);
+  check('the hangar is reachable from the cockpit', inHangar,
+    inHangar ? '' : `screen is "${await page.evaluate(SCREEN)}"`);
+  if (!inHangar) return;
+
+  const picked = await clickButton(page, '#ct-hangar button.ct-btn.is-ghost.is-sm', '250 lb');
+  check('a bomb loadout can be selected in the hangar', picked);
+  await sleep(500);
+  await page.screenshot({ path: `${tag}-08-loadout.png` });
+
+  await clickButton(page, 'button.ct-btn.is-primary', 'deploy');
+  const flying = await waitForScreen(page, 'flight', 8000);
+  if (!flying) { check('deploying with stores puts the player back in the air', false); return; }
+  await page.mouse.move(800, 450, { steps: 6 });
+  await sleep(3500);
+
+  const ORD = () => window.__game?.get?.('flight')?.ordnanceState ?? null;
+  const armed = await page.evaluate(ORD);
+  check('the aircraft deploys carrying the chosen stores',
+    !!armed && armed.loadout !== 'clean' && armed.bombs === 2,
+    armed ? `loadout "${armed.loadout}", ${armed.bombs} bombs` : 'no ordnance state');
+  check('stores are felt by the flight model as mass and drag',
+    !!armed && armed.extraMass > 200 && armed.extraDrag > 0.05,
+    armed ? `+${armed.extraMass.toFixed(0)} kg, +${armed.extraDrag.toFixed(3)} m² CdA` : '');
+
+  const hudText = await page.evaluate(() => document.body.innerText || '');
+  check('the HUD shows an ordnance readout', /STORES/i.test(hudText) && /2\/2/.test(hudText),
+    /STORES/i.test(hudText) ? 'STORES panel present' : 'no STORES panel');
+
+  // --- set up the run -----------------------------------------------------
+  // A short, steep attack from 900 m out and 330 m up: a 20° dive, four
+  // seconds of run-in and a release at about 250 m. That is a real
+  // fighter-bomber pass and it is deliberately *short*, because a three-
+  // kilometre approach spends fifteen seconds accumulating drift that has
+  // nothing to do with the ordnance and everything to do with how well an
+  // untended Spitfire holds a heading.
+  const setup = await page.evaluate(() => {
+    const g = window.__game;
+    const ord = g.get('flight').ordnanceState;
+    // A soft-skinned lorry rather than a dug-in gun: it is the target class a
+    // 250 lb bomb is meant for.
+    const t = ord.targets.find((x) => x.alive && x.kind === 'truck')
+      ?? ord.targets.find((x) => x.alive && x.kind === 'aa');
+    if (!t) return null;
+    const D = 900, H = 330;
+    const heading = Math.PI * 0.25;
+    const place = (x, y, z) => g.bus.emit('debug:place', {
+      // 'debug:place' takes the flight model's Euler convention, in which a
+      // POSITIVE pitch puts the nose down (see qFromEuler in shared/math).
+      x, y, z, heading, pitch: Math.atan2(H, D), bank: 0, speed: 150, opponent: null,
+    });
+    const x0 = t.x - Math.sin(heading) * D;
+    const z0 = t.z - Math.cos(heading) * D;
+    place(x0, t.y + H, z0);
+    return {
+      id: t.id, kind: t.kind, x: t.x, y: t.y, z: t.z, hp: t.hp,
+      heading, x0, z0, y0: t.y + H,
+    };
+  });
+  check('there is a ground target to attack', !!setup,
+    setup ? `${setup.kind} #${setup.id}, ${setup.hp} hp` : 'no live ground targets');
+  if (!setup) return;
+  await sleep(900);
+
+  // One lateral correction, taken from the game's own impact solution: shift
+  // the whole run-in sideways so the ground track passes over the target. This
+  // is the harness standing in for the fifteen seconds of gentle S-turning a
+  // pilot does on the way in, and it is the only part of the pass that is not
+  // flown — the approach, the release and everything after it are real.
+  const aim = await page.evaluate((tgt) => {
+    const g = window.__game;
+    const o = g.get('flight').ordnanceState;
+    if (!o.solution) return null;
+    // Across-track unit vector, horizontal and perpendicular to the run-in.
+    const ax = Math.cos(tgt.heading), az = -Math.sin(tgt.heading);
+    const across = (tgt.x - o.solution.x) * ax + (tgt.z - o.solution.z) * az;
+    g.bus.emit('debug:place', {
+      x: tgt.x0 + ax * across, y: tgt.y0, z: tgt.z0 + az * across,
+      heading: tgt.heading, pitch: Math.atan2(330, 900), bank: 0, speed: 150,
+      opponent: null,
+    });
+    return { across };
+  }, setup);
+  check('the bombsight produces a usable solution on the run-in', !!aim,
+    aim ? `across-track correction ${aim.across.toFixed(0)} m` : 'no solution');
+  await sleep(500);
+
+  // --- fly the pass and pickle ---------------------------------------------
+  // The pipper sits a fixed distance ahead of the aeroplane and the target
+  // walks back through it. Release on the crossing.
+  let best = 1e9;
+  let released = false;
+  let sightSeen = false;
+  let shotTaken = false;
+  let prevAlong = Infinity;
+  for (let i = 0; i < 160 && !released; i++) {
+    const s = await page.evaluate((tgt) => {
+      const g = window.__game;
+      const o = g?.get?.('flight')?.ordnanceState;
+      const node = document.getElementById('ct-bombsight');
+      const shown = !!node && getComputedStyle(node).display !== 'none';
+      if (!o || !o.solution) return { shown, d: null };
+      const ex = tgt.x - o.solution.x, ez = tgt.z - o.solution.z;
+      return {
+        shown,
+        d: Math.hypot(ex, ez),
+        // Positive while the target is still beyond the pipper.
+        along: ex * Math.sin(tgt.heading) + ez * Math.cos(tgt.heading),
+      };
+    }, setup);
+    sightSeen = sightSeen || s.shown;
+    if (s.d !== null) {
+      if (s.d < 220 && !shotTaken) {
+        shotTaken = true;
+        await page.screenshot({ path: `${tag}-09-bombrun.png` });
+      }
+      best = Math.min(best, s.d);
+      if (prevAlong > 0 && s.along <= 0) {
+        await page.keyboard.press('KeyV');
+        released = true;
+      }
+      prevAlong = s.along;
+    }
+    await sleep(40);
+  }
+  check('the bombsight is flown onto the target', best < 20,
+    `closest predicted impact ${best.toFixed(0)} m from the target`);
+  check('the impact indicator is drawn on the way in', sightSeen,
+    sightSeen ? 'pipper visible during the run' : 'pipper never shown');
+  // Pull off the target rather than following the bomb into the ground.
+  await page.mouse.move(800, 360, { steps: 4 });
+
+  // One frame for the release to be consumed by the flight step.
+  await sleep(300);
+  const after = await page.evaluate(ORD);
+  check('pressing the release drops a store',
+    !!after && after.bombs === 1 && after.inFlight >= 1,
+    after ? `${after.bombs} left, ${after.inFlight} in flight` : '');
+  check('releasing gives the performance back',
+    !!after && !!armed && after.extraMass < armed.extraMass - 100
+    && after.extraDrag < armed.extraDrag,
+    after ? `${after.extraMass.toFixed(0)} kg / ${after.extraDrag.toFixed(3)} m² CdA` : '');
+
+  // --- the fall -----------------------------------------------------------
+  // Sample the bomb entity over the first second of its fall: a store that is
+  // integrated properly gains downward speed and keeps its forward throw.
+  const track = [];
+  for (let i = 0; i < 20; i++) {
+    const b = await page.evaluate(() => {
+      for (const e of window.__game.entities.values()) {
+        if (e.kind === 3) return { x: e.px, y: e.py, z: e.pz, vy: e.vy, sp: Math.hypot(e.vx, e.vy, e.vz) };
+      }
+      return null;
+    });
+    if (b) track.push(b);
+    await sleep(70);
+  }
+  const t0 = track[0], t1 = track[track.length - 1];
+  check('the store exists in the world as a falling entity', track.length >= 4,
+    `${track.length} samples`);
+  check('it falls ballistically — accelerating down, still going forward',
+    track.length >= 4 && t1.vy < t0.vy - 4 && t1.y < t0.y
+    && Math.hypot(t1.x - t0.x, t1.z - t0.z) > 60,
+    track.length >= 4
+      ? `VS ${t0.vy.toFixed(0)} -> ${t1.vy.toFixed(0)} m/s,`
+        + ` throw ${Math.hypot(t1.x - t0.x, t1.z - t0.z).toFixed(0)} m`
+      : 'no track');
+
+  // --- the crater ---------------------------------------------------------
+  let hit = null;
+  for (let i = 0; i < 160; i++) {
+    hit = await page.evaluate((tgt) => {
+      const o = window.__game?.get?.('flight')?.ordnanceState;
+      const t = o?.targets.find((x) => x.id === tgt.id);
+      return t ? { hp: t.hp, alive: t.alive, inFlight: o.inFlight } : null;
+    }, setup);
+    if (hit && (!hit.alive || hit.hp < setup.hp)) break;
+    await sleep(200);
+  }
+  check('the bomb detonates and destroys the target',
+    !!hit && (!hit.alive || hit.hp < setup.hp),
+    hit ? `${setup.kind} #${setup.id}: ${setup.hp} -> ${hit.hp.toFixed(0)} hp, alive=${hit.alive}` : '');
+  await page.screenshot({ path: `${tag}-10-impact.png` });
 }
 
 async function finish(browser) {
