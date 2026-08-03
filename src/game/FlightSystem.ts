@@ -1,0 +1,434 @@
+import type { GameContext, Subsystem } from '../engine/context';
+import {
+  EntityKind, newEntityState, type EntityState, type InputFrame,
+} from '../shared/protocol';
+import { aircraftByIndex, aircraftIndex, AIRCRAFT_BY_ID, type AircraftSpec } from '../shared/aircraft';
+import { clamp, q, qslerp, qconj, qmul, v3, type Q } from '../shared/math';
+import type { NetSystem } from '../net/NetSystem';
+import { getClientEnv, type ClientEnv } from './env';
+import {
+  loadExternals, externals, readFlightTransform, writeFlightTransform,
+  readFlightScalar, newFlightTransform,
+  type FlightModule, type FlightState, type FlightTransform,
+} from './externals';
+import { createFlightState as fbCreate, stepFlight as fbStep } from './fallback/fallbackFlight';
+import { InputBridge } from './inputBridge';
+import { OfflineSandbox, type DebugPlacement } from './OfflineSandbox';
+
+/**
+ * Client-side prediction, reconciliation and the offline sandbox.
+ *
+ * ## Why predict at all
+ *
+ * The server is authoritative and 20 Hz. Waiting for it would put 60–120 ms
+ * between the stick moving and the nose moving, which in an air-combat game is
+ * the difference between "responsive" and "unplayable". So the local aircraft
+ * is stepped immediately, every frame, through the *same deterministic model*
+ * the server runs, from the same input frame that was just sent.
+ *
+ * ## Reconciliation
+ *
+ * Each snapshot acks the last input the server consumed. We take the server's
+ * authoritative state for that instant, write it into the flight state, and
+ * replay every input the server has not yet seen. That produces a corrected
+ * "now" which is what the physics continues from.
+ *
+ * The corrected position almost never exactly matches what we had predicted —
+ * floating-point divergence, a dropped input, a hit we did not know about. If
+ * the discrepancy is small we do **not** move the aeroplane: we keep the
+ * difference as a *visual* offset and decay it to zero over ~150 ms, so the
+ * player sees a continuous trajectory while the simulation is already correct.
+ * If it is large (>8 m or >12°) there is nothing to hide — the correction is
+ * applied instantly, because smearing a big error over time looks far worse
+ * than a single honest snap.
+ *
+ * ## Offline
+ *
+ * With no server, 'OfflineSandbox' runs a real six-ship match locally and this
+ * subsystem simply forwards the player's input to it.
+ */
+
+/** Error thresholds above which we stop smoothing and snap. */
+const HARD_POS = 8.0;                       // metres
+const HARD_ROT = 12 * (Math.PI / 180);      // radians
+
+/** Time constant of the smoothing blend. Three of these ≈ 150 ms to invisible. */
+const BLEND_TAU = 0.05;
+
+const MAX_HISTORY = 240;
+
+interface PredSample {
+  seq: number;
+  t: FlightTransform;
+}
+
+export interface PredictionStats {
+  /** Snapshots reconciled since boot. */
+  corrections: number;
+  /** How many of those exceeded the smoothing thresholds and had to snap. */
+  hard: number;
+  /** Largest positional discrepancy seen, metres. */
+  maxErr: number;
+  /** Inputs replayed on the most recent reconcile. */
+  replayed: number;
+}
+
+const _pred: FlightTransform = newFlightTransform();
+const _auth: FlightTransform = newFlightTransform();
+const _before: FlightTransform = newFlightTransform();
+const _qa: Q = q();
+const _qb: Q = q();
+const _qc: Q = q();
+const _qIdent: Q = q();
+
+export class FlightSystem implements Subsystem {
+  readonly name = 'flight';
+
+  /** True once a real flight model has been resolved (shared or fallback). */
+  private model!: FlightModule;
+  private usingShared = false;
+
+  private ctx!: GameContext;
+  private env!: ClientEnv;
+  private net: NetSystem | undefined;
+  private bridge = new InputBridge();
+
+  private sandbox: OfflineSandbox | null = null;
+
+  // --- local prediction ------------------------------------------------------
+  private localFlight: FlightState | null = null;
+  private localSpec: AircraftSpec | null = null;
+  private localEntity: EntityState = newEntityState();
+  private boundEntityId = 0;
+
+  private history: PredSample[] = [];
+  private lastSnapshotTick = -1;
+
+  /** Smoothed-out prediction error, applied at render time only. */
+  private errX = 0; private errY = 0; private errZ = 0;
+  private errQ: Q = q();
+
+  // --- diagnostics -----------------------------------------------------------
+  private debug = false;
+  private stats: PredictionStats = { corrections: 0, hard: 0, maxErr: 0, replayed: 0 };
+
+  async init(ctx: GameContext): Promise<void> {
+    this.ctx = ctx;
+    this.env = getClientEnv(ctx.mapSeed);
+    this.debug = resolveDebugFlag();
+
+    const ext = await loadExternals(ctx.mapSeed);
+    if (ext.flight) {
+      this.model = ext.flight;
+      this.usingShared = true;
+    } else {
+      this.model = { createFlightState: fbCreate, stepFlight: fbStep };
+      this.usingShared = false;
+      console.warn('[flight] shared flight model unavailable — using the client fallback');
+    }
+
+    this.net = ctx.get<NetSystem>('net');
+    this.bridge.attach(ctx.get('input'));
+
+    ctx.bus.on('net:spawned', (m: { entityId: number; aircraft?: string }) => {
+      this.onSpawned(m.entityId, m.aircraft);
+    });
+    ctx.bus.on('net:offline', () => this.startSandbox());
+
+    // Screenshot framings ask for a posed situation (see CameraSystem.
+    // debugFraming). Only the sandbox can honour it — online the server owns
+    // every actor — so it is a no-op in a real match rather than a desync.
+    ctx.bus.on('debug:place', (p: DebugPlacement) => {
+      if (!this.sandbox) return;
+      this.sandbox.placeSubject(p);
+      // The teleport invalidates every predicted sample and the smoothed
+      // correction offset; keeping either would drag the aircraft back toward
+      // where it used to be for the next 150 ms, right through the capture.
+      this.history.length = 0;
+      this.errX = this.errY = this.errZ = 0;
+      this.errQ.x = this.errQ.y = this.errQ.z = 0; this.errQ.w = 1;
+    });
+
+    // NetSystem decides offline during its own init, which has already run by
+    // the time we get here, so check directly as well as via the event.
+    if (this.net?.offline) this.startSandbox();
+
+    if (this.debug) {
+      (window as unknown as Record<string, unknown>).__flight = this;
+      console.info('[flight] prediction debug enabled (?flightdebug=1)');
+    }
+  }
+
+  private startSandbox(): void {
+    if (this.sandbox) return;
+    this.sandbox = new OfflineSandbox(this.ctx, this.env, this.model);
+    this.sandbox.start();
+    console.info('[flight] offline sandbox running');
+  }
+
+  private onSpawned(entityId: number, aircraftId?: string): void {
+    if (this.sandbox) return;         // the sandbox owns its own actors
+    this.boundEntityId = entityId;
+    this.ctx.localEntityId = entityId;
+    this.localFlight = null;
+    this.history.length = 0;
+    this.errX = this.errY = this.errZ = 0;
+    this.errQ.x = this.errQ.y = this.errQ.z = 0; this.errQ.w = 1;
+    if (aircraftId && AIRCRAFT_BY_ID[aircraftId]) this.localSpec = AIRCRAFT_BY_ID[aircraftId];
+  }
+
+  // -------------------------------------------------------------------------
+
+  update(ctx: GameContext): void {
+    const dt = ctx.dt;
+    if (dt <= 0) return;
+
+    this.bridge.refresh();
+    const frame = this.bridge.sample(dt, ctx.settings);
+
+    // The netcode wants every frame regardless of mode: offline it costs one
+    // push into a bounded ring, and it keeps the sequence numbering continuous
+    // if a server appears mid-session.
+    const sent = this.net ? this.net.sendInput(frame) : { ...frame, seq: 0 };
+
+    if (this.sandbox) {
+      this.sandbox.step(dt, sent);
+      return;
+    }
+
+    this.ensureLocalState(ctx);
+    if (!this.localFlight || !this.localSpec) return;
+
+    this.reconcile();
+
+    // --- predict ------------------------------------------------------------
+    (this.localFlight as Record<string, unknown>).damage = this.localEntity.damage;
+    this.model.stepFlight(this.localFlight, this.localSpec, sent, this.env, dt);
+    this.pushHistory(sent.seq);
+
+    // --- decay the visual correction ---------------------------------------
+    const k = Math.exp(-dt / BLEND_TAU);
+    this.errX *= k; this.errY *= k; this.errZ *= k;
+    qslerp(this.errQ, _qIdent, 1 - k, _qc);
+    this.errQ.x = _qc.x; this.errQ.y = _qc.y; this.errQ.z = _qc.z; this.errQ.w = _qc.w;
+
+    this.publish(ctx, sent);
+  }
+
+  /** Creates the local flight state the first time the server tells us where we are. */
+  private ensureLocalState(ctx: GameContext): void {
+    const id = ctx.localEntityId;
+    if (!id) return;
+    if (this.localFlight && this.boundEntityId === id) return;
+
+    const auth = this.net?.authoritative(id);
+    if (!auth) return;
+
+    this.boundEntityId = id;
+    this.localSpec = aircraftByIndex(auth.typeId);
+    this.localFlight = this.model.createFlightState(
+      this.localSpec,
+      v3(auth.px, auth.py, auth.pz),
+      q(auth.qx, auth.qy, auth.qz, auth.qw),
+    );
+    _auth.px = auth.px; _auth.py = auth.py; _auth.pz = auth.pz;
+    _auth.vx = auth.vx; _auth.vy = auth.vy; _auth.vz = auth.vz;
+    _auth.qx = auth.qx; _auth.qy = auth.qy; _auth.qz = auth.qz; _auth.qw = auth.qw;
+    _auth.wx = 0; _auth.wy = 0; _auth.wz = 0;
+    writeFlightTransform(this.localFlight, _auth);
+    this.history.length = 0;
+    this.errX = this.errY = this.errZ = 0;
+    this.errQ.x = this.errQ.y = this.errQ.z = 0; this.errQ.w = 1;
+    copyEntity(auth, this.localEntity);
+  }
+
+  /**
+   * Applies the newest authoritative state and replays everything the server
+   * has not acknowledged yet.
+   */
+  private reconcile(): void {
+    const net = this.net;
+    if (!net || !this.localFlight || !this.localSpec) return;
+    const snap = net.latestSnapshot;
+    if (!snap || snap.tick === this.lastSnapshotTick) return;
+    this.lastSnapshotTick = snap.tick;
+
+    const auth = snap.states.get(this.boundEntityId);
+    if (!auth) return;
+
+    // What we were about to show, before the correction.
+    readFlightTransform(this.localFlight, _before);
+
+    // Authoritative state at the acked input.
+    _auth.px = auth.px; _auth.py = auth.py; _auth.pz = auth.pz;
+    _auth.vx = auth.vx; _auth.vy = auth.vy; _auth.vz = auth.vz;
+    _auth.qx = auth.qx; _auth.qy = auth.qy; _auth.qz = auth.qz; _auth.qw = auth.qw;
+    _auth.wx = _before.wx; _auth.wy = _before.wy; _auth.wz = _before.wz;
+    writeFlightTransform(this.localFlight, _auth);
+    this.applyAuthoritativeScalars(auth);
+
+    // Replay every input the server has not consumed. This is the whole point:
+    // the correction is applied at the *acked* instant, not at "now", so the
+    // player's most recent stick movements are not thrown away.
+    const pending = net.pendingInputs;
+    for (let i = 0; i < pending.length; i++) {
+      const f = pending[i];
+      const fdt = clamp(f.dt, 0.002, 0.05);
+      this.model.stepFlight(this.localFlight, this.localSpec, f, this.env, fdt);
+    }
+    this.stats.replayed = pending.length;
+
+    readFlightTransform(this.localFlight, _pred);
+
+    // Residual error = (what we showed) − (what is actually true now).
+    const dx = _before.px - _pred.px;
+    const dy = _before.py - _pred.py;
+    const dz = _before.pz - _pred.pz;
+    const dist = Math.hypot(dx, dy, dz);
+
+    _qa.x = _before.qx; _qa.y = _before.qy; _qa.z = _before.qz; _qa.w = _before.qw;
+    _qb.x = _pred.qx; _qb.y = _pred.qy; _qb.z = _pred.qz; _qb.w = _pred.qw;
+    qmul(_qa, qconj(_qb, _qc), _qc);
+    if (_qc.w < 0) { _qc.x = -_qc.x; _qc.y = -_qc.y; _qc.z = -_qc.z; _qc.w = -_qc.w; }
+    const angle = 2 * Math.acos(clamp(_qc.w, -1, 1));
+
+    this.stats.corrections++;
+    this.stats.maxErr = Math.max(this.stats.maxErr, dist);
+
+    if (dist > HARD_POS || angle > HARD_ROT) {
+      // Too big to hide. Snap, and say so.
+      this.stats.hard++;
+      this.errX = this.errY = this.errZ = 0;
+      this.errQ.x = this.errQ.y = this.errQ.z = 0; this.errQ.w = 1;
+      if (this.debug) {
+        console.warn(
+          `[flight] hard correction: ${dist.toFixed(2)} m / ${(angle * 180 / Math.PI).toFixed(1)}° `
+          + `(replayed ${pending.length} inputs, tick ${snap.tick})`,
+        );
+      }
+    } else {
+      // Small: carry it as a visual offset that melts away.
+      this.errX = dx; this.errY = dy; this.errZ = dz;
+      this.errQ.x = _qc.x; this.errQ.y = _qc.y; this.errQ.z = _qc.z; this.errQ.w = _qc.w;
+      if (this.debug && dist > 0.35) {
+        console.debug(`[flight] soft correction ${dist.toFixed(2)} m, blending out`);
+      }
+    }
+
+    // History before the ack is now worthless.
+    const ack = snap.ackSeq;
+    while (this.history.length && seqLE(this.history[0].seq, ack)) this.history.shift();
+  }
+
+  /**
+   * Copies the authoritative non-transform state (throttle, gear, damage) into
+   * the flight state where the model exposes it. Damage in particular must come
+   * from the server or the replay diverges the moment we take a hit.
+   */
+  private applyAuthoritativeScalars(auth: EntityState): void {
+    const f = this.localFlight as Record<string, unknown> | null;
+    if (!f) return;
+    if (typeof f.throttle === 'number') f.throttle = auth.throttle;
+    if (typeof f.gear === 'number') f.gear = auth.gear;
+    if (typeof f.flaps === 'number') f.flaps = auth.flaps;
+    f.damage = auth.damage;
+    copyEntity(auth, this.localEntity);
+  }
+
+  private pushHistory(seq: number): void {
+    if (!this.localFlight) return;
+    const sample = this.history.length >= MAX_HISTORY
+      ? this.history.shift()!
+      : { seq: 0, t: newFlightTransform() };
+    sample.seq = seq;
+    readFlightTransform(this.localFlight, sample.t);
+    this.history.push(sample);
+  }
+
+  /** Writes the predicted (plus smoothed) state into the shared entity table. */
+  private publish(ctx: GameContext, input: InputFrame): void {
+    if (!this.localFlight || !this.localSpec) return;
+    readFlightTransform(this.localFlight, _pred);
+
+    const s = this.localEntity;
+    s.id = this.boundEntityId;
+    s.kind = EntityKind.Aircraft;
+    s.typeId = Math.max(0, aircraftIndex(this.localSpec.id));
+    s.team = ctx.localTeam;
+    s.ownerId = ctx.localPlayerId;
+
+    s.px = _pred.px + this.errX;
+    s.py = _pred.py + this.errY;
+    s.pz = _pred.pz + this.errZ;
+    s.vx = _pred.vx; s.vy = _pred.vy; s.vz = _pred.vz;
+
+    _qb.x = _pred.qx; _qb.y = _pred.qy; _qb.z = _pred.qz; _qb.w = _pred.qw;
+    qmul(this.errQ, _qb, _qa);
+    s.qx = _qa.x; s.qy = _qa.y; s.qz = _qa.z; s.qw = _qa.w;
+
+    s.throttle = clamp(readFlightScalar(this.localFlight, ['throttle'], input.throttle), 0, 1);
+    const rawRpm = readFlightScalar(this.localFlight, ['rpm', 'propRpm'], 0.18 + s.throttle * 0.82);
+    s.rpm = clamp(rawRpm > 2 ? rawRpm / this.localSpec.engine.maxRpm : rawRpm, 0, 1);
+    s.gear = clamp(readFlightScalar(this.localFlight, ['gear', 'gearPos'], s.gear), 0, 1);
+    s.flaps = clamp(readFlightScalar(this.localFlight, ['flaps', 'flapPos'], s.flaps), 0, 1);
+    s.ctlPitch = clamp(readFlightScalar(this.localFlight, ['ctlPitch'], input.pitch), -1, 1);
+    s.ctlRoll = clamp(readFlightScalar(this.localFlight, ['ctlRoll'], input.roll), -1, 1);
+    s.ctlYaw = clamp(readFlightScalar(this.localFlight, ['ctlYaw'], input.yaw), -1, 1);
+
+    ctx.entities.set(s.id, s);
+  }
+
+  // -------------------------------------------------------------------------
+  // Introspection for the HUD and debug overlay
+  // -------------------------------------------------------------------------
+
+  /** Air data for the HUD; undefined when the model does not publish it. */
+  get airData(): { ias: number; tas: number; alpha: number; gLoad: number; mach: number; stall: number } | undefined {
+    const f = this.localFlight ?? this.sandbox?.playerFlight;
+    if (!f) return undefined;
+    return {
+      ias: readFlightScalar(f, ['ias'], 0),
+      tas: readFlightScalar(f, ['tas', 'speed'], 0),
+      alpha: readFlightScalar(f, ['alpha'], 0),
+      gLoad: readFlightScalar(f, ['gLoad', 'g'], 1),
+      mach: readFlightScalar(f, ['mach'], 0),
+      stall: readFlightScalar(f, ['stall'], 0),
+    };
+  }
+
+  get predictionStats(): Readonly<PredictionStats> { return this.stats; }
+  get offline(): boolean { return this.sandbox !== null; }
+  get usingSharedModel(): boolean { return this.usingShared; }
+  get sandboxRoster() { return this.sandbox?.roster ?? []; }
+  get sandboxShots(): number { return this.sandbox?.shotsFired ?? 0; }
+
+  dispose(): void {
+    this.localFlight = null;
+    this.history.length = 0;
+    this.sandbox = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+function resolveDebugFlag(): boolean {
+  try {
+    if (new URLSearchParams(location.search).has('flightdebug')) return true;
+    return localStorage.getItem('celthunder.debug.flight') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function copyEntity(a: EntityState, b: EntityState): void {
+  b.damage = a.damage;
+  b.health = a.health;
+  b.team = a.team;
+  b.ownerId = a.ownerId;
+  b.typeId = a.typeId;
+}
+
+/** Wrapped u16 sequence comparison, matching 'NetSystem'. */
+function seqLE(a: number, b: number): boolean {
+  return ((b - a) & 0xffff) < 30000;
+}

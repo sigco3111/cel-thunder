@@ -1,0 +1,35 @@
+{
+  "name": "cel-thunder",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "dev": "concurrently -n web,srv -c cyan,magenta \"vite\" \"tsx watch server/index.ts\"",
+    "web": "vite",
+    "server": "tsx server/index.ts",
+    "build": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit",
+    "shoot": "node tools/shoot.mjs",
+    "selftest": "tsx src/shared/flight/selftest.ts && tsx src/shared/combat/selftest.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "three": "^0.185.1",
+    "ws": "^8.21.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.3",
+    "@types/ws": "^8.18.1",
+    "concurrently": "^10.0.4",
+    "playwright": "^1.62.1",
+    "tsx": "^4.23.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.0"
+  },
+  "type": "module"
+}
