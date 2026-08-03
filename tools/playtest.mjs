@@ -596,6 +596,9 @@ async function runSuite(browser, mode, url) {
   // resolvable — and scored — online as well as in the sandbox.
   await groundAttack(page, tag, check, mode);
 
+  // --- 12. controls, onboarding and the pointer ------------------------------
+  await controlsAndOnboarding(page, tag, check);
+
   const stats = await page.evaluate(() => window.__game?.stats ?? null);
   check('frame rate holds up', (stats?.fps ?? 0) >= 45,
     `${stats?.fps ?? 0} fps, ${stats?.drawCalls ?? 0} draw calls`);
@@ -771,6 +774,214 @@ async function onlineGunnery(page, tag, check) {
   check('online damage is modular, not a single destroyed flag',
     nBits >= 2 && (bits & ~DESTROYED) !== 0,
     `${nBits} distinct bits set (0x${bits.toString(16)})`);
+}
+
+/**
+ * Everything a player needs in order to find out how to play, plus the two
+ * pointer bugs that made the game unflyable.
+ *
+ * Every check here exists because the thing it tests was broken in a shipped
+ * build, and three of them were invisible to every other test in this file —
+ * the aeroplane flew perfectly in the harness precisely *because* the harness
+ * drove it through the broken path.
+ */
+async function controlsAndOnboarding(page, tag, check) {
+  console.log('\n12. Controls and onboarding');
+
+  // -- the controls screen must not be able to lie ---------------------------
+  //
+  // There used to be two binding tables: the engine's, which dispatched the
+  // game, and a private copy inside the settings panel, which was displayed.
+  // They had drifted apart, so the controls screen confidently told players
+  // that WEP was on R (Space), the camera on V (C) and the cannons on the
+  // middle mouse button (the right one) — and rebinding on it changed nothing,
+  // because nothing read what it wrote. This compares what is on screen with
+  // what the input system will actually dispatch.
+  await page.evaluate(() => {
+    const ui = window.__game.get('ui');
+    ui?.setScreen?.('flight');
+    // Open the controls tab the way the pause menu does.
+    ui?.openSettings?.('controls');
+  });
+  await sleep(600);
+  const truth = await page.evaluate(() => {
+    const bindings = window.__game.get('input')?.bindings;
+    if (!bindings) return { ok: false, why: 'no binding table' };
+    const rows = [...document.querySelectorAll('.ct-bind')];
+    if (rows.length < 20) return { ok: false, why: `only ${rows.length} rows rendered` };
+    // Spot-check the three that were wrong, by label text.
+    const find = (rx) => rows.map((r) => r.textContent.replace(/\s+/g, ' ').trim()).find((t) => rx.test(t)) ?? '';
+    const lbl = (a) => {
+      const c = bindings.codesFor(a)[0] ?? '';
+      if (c.startsWith('Mouse')) return ['LMB', 'MMB', 'RMB', 'M4', 'M5'][+c.slice(5)] ?? c;
+      if (c.startsWith('Key')) return c.slice(3);
+      return c;
+    };
+    const cases = [
+      ['War emergency power', /emergency/i, 'wep'],
+      ['Cycle camera', /cycle camera/i, 'cameraCycle'],
+      ['Cannons', /cannons/i, 'fire2'],
+      ['Landing gear', /landing gear/i, 'gear'],
+    ];
+    const bad = [];
+    for (const [name, rx, action] of cases) {
+      const shown = find(rx);
+      const want = lbl(action);
+      if (!shown || !shown.includes(want)) bad.push(`${name}: screen "${shown}" vs live "${want}"`);
+    }
+    return { ok: bad.length === 0, why: bad.join('; '), rows: rows.length };
+  });
+  check('the controls screen shows the bindings the game actually dispatches',
+    !!truth && truth.ok, truth ? (truth.why || `${truth.rows} bindings listed`) : 'settings unavailable');
+
+  await page.screenshot({ path: `${tag}-09-controls.png` });
+  await page.evaluate(() => window.__game.get('ui')?.closeSettings?.());
+  await sleep(400);
+
+  // -- the in-flight legend --------------------------------------------------
+  await page.keyboard.press('F1');
+  await sleep(600);
+  const legend = await page.evaluate(() => {
+    const n = document.querySelector('.ct-legend');
+    return {
+      open: !!n && !n.classList.contains('ct-hidden'),
+      rows: document.querySelectorAll('.ct-legend-row').length,
+      // A legend that grabbed the pointer would eat the click that takes it.
+      pe: n ? getComputedStyle(n).pointerEvents : 'x',
+    };
+  });
+  check('F1 shows a control legend in flight', legend.open && legend.rows >= 20,
+    `${legend.rows} bindings, pointer-events ${legend.pe}`);
+  check('the legend does not capture the pointer', legend.pe === 'none');
+  await page.keyboard.press('F1');
+  await sleep(400);
+  check('F1 closes the legend again',
+    await page.evaluate(() => document.querySelector('.ct-legend')?.classList.contains('ct-hidden') === true));
+
+  // -- pointer lock is requested by Deploy -----------------------------------
+  //
+  // The harness cannot hold pointer lock (Chromium refuses it unless the OS
+  // window has focus, which it does not under automation), so this cannot
+  // assert that the mouse *is* captured. It asserts the thing that is testable
+  // and that actually regressed: that the game ASKED, from inside the Deploy
+  // gesture. 'lockDenied' is only ever set by a refused request, so its being
+  // true is proof that a request was made.
+  const lock = await page.evaluate(() => {
+    const m = window.__game.get('input')?.mouse;
+    return m ? { denied: m.lockDenied, locked: m.locked, has: m.hasLocked } : null;
+  });
+  check('the game requests pointer lock without a second, undocumented click',
+    !!lock && (lock.denied || lock.locked),
+    lock ? `denied=${lock.denied} locked=${lock.locked}` : 'no mouse device');
+
+  // -- an uncaptured pointer must not fly the aeroplane ----------------------
+  //
+  // THE bug the player reported as "the plane is jittery and moving around".
+  // With the pointer uncaptured the reticle used to be pinned to the absolute
+  // cursor position — so a cursor parked anywhere but dead centre held the
+  // reticle at the edge of the aim cone and commanded a permanent max-rate
+  // turn. Measured before the fix: cursor in the bottom-right corner gave
+  // conePull 1.00 and a 126 m/s descent, indefinitely.
+  //
+  // The fallback is legitimate when pointer lock is genuinely unavailable, so
+  // the flag is cleared for the duration of the check to exercise the path a
+  // real browser takes, then restored.
+  //
+  // The cursor goes somewhere unhelpful first: parked dead centre it would pass
+  // even with the bug fully present, because the reticle would be on the nose
+  // for the wrong reason.
+  await page.mouse.move(1480, 830, { steps: 8 });
+  await sleep(300);
+  const held = await page.evaluate(async () => {
+    const input = window.__game.get('input');
+    const m = input?.mouse;
+    if (!m) return null;
+    const was = m.lockDenied;
+    m.lockDenied = false;                 // pretend lock is available but not held
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    await wait(2500);
+    const theta = input.aim.theta;
+    const cone = input.aim.out.conePull;
+    const air0 = window.__game.get('flight').airData;
+    await wait(2500);
+    const air1 = window.__game.get('flight').airData;
+    m.lockDenied = was;
+    return {
+      theta, cone,
+      bank0: Math.abs(air0.rollAngle * 57.2958),
+      bank1: Math.abs(air1.rollAngle * 57.2958),
+      dPitch: Math.abs((air1.pitchAngle - air0.pitchAngle) * 57.2958),
+      vs: air1.vertSpeed,
+      nx: m.nx, ny: m.ny, moved: m.movedUnlocked,
+    };
+  });
+  // Put the cursor somewhere unhelpful first so the check has something to
+  // catch: dead centre would pass even with the bug present.
+  // The reticle sitting on the nose is the assertion; the attitude is only
+  // corroboration, and it is deliberately expressed as "not diverging" rather
+  // than "level". This check runs at the end of a suite that has just flown a
+  // bombing run, so the aeroplane can legitimately still be rolling out of the
+  // pull-off when it starts — and a fixed bank threshold would then fail on
+  // leftover attitude while the thing being tested was working perfectly.
+  const holding = !!held && held.theta < 0.05 && held.cone < 0.15
+    && held.dPitch < 20 && held.bank1 < Math.max(45, held.bank0 + 6);
+  check('an uncaptured mouse holds attitude instead of flying at the cursor', holding,
+    held
+      ? `theta ${held.theta.toFixed(3)} rad, conePull ${held.cone.toFixed(2)},`
+      + ` bank ${held.bank0.toFixed(0)}° -> ${held.bank1.toFixed(0)}°,`
+      + ` VS ${held.vs.toFixed(0)} m/s (cursor at ${held.nx.toFixed(2)}, ${held.ny.toFixed(2)})`
+      : 'no mouse device');
+  // Leave the aeroplane pointing somewhere sensible for the final screenshot.
+  await page.mouse.move(800, 450, { steps: 8 });
+  await sleep(1500);
+
+  // -- beginner assists ------------------------------------------------------
+  //
+  // Arcade is the default and must stay the default: the g limiter, the stall
+  // guard, the auto-rudder and the wing leveller are what make "let go of the
+  // controls" a valid recovery for someone who has never flown a simulator.
+  const assists = await page.evaluate(() => {
+    const cfg = window.__game.get('input')?.aim?.cfg;
+    const prefs = window.__game.get('ui')?.prefs;
+    return cfg ? {
+      instructor: cfg.instructor, coordination: cfg.coordination,
+      level: cfg.levelAssist, gLimit: cfg.gLimitFactor, stall: cfg.stallMargin,
+      pref: prefs?.assists ?? '?',
+    } : null;
+  });
+  check('beginner assists are on by default',
+    !!assists && assists.instructor === true && assists.coordination > 0
+    && assists.level > 0 && assists.gLimit <= 1 && assists.stall < 1 && assists.pref === 'arcade',
+    assists
+      ? `${assists.pref}: instructor=${assists.instructor}, rudder=${assists.coordination},`
+      + ` level=${assists.level}, g×${assists.gLimit}, stall@${assists.stall}`
+      : 'no aim controller');
+
+  // -- flight school ---------------------------------------------------------
+  //
+  // It must exist, teach from the live bindings, be skippable, and — the part
+  // that makes it acceptable rather than annoying — never block the game or
+  // play twice.
+  const school = await page.evaluate(() => {
+    const ui = window.__game.get('ui');
+    const n = document.querySelector('.ct-tut');
+    if (!n || !ui) return null;
+    return {
+      exists: true,
+      // By now the harness has flown the whole suite, so it is long finished.
+      hiddenNow: n.classList.contains('ct-hidden'),
+      seen: (() => { try { return localStorage.getItem('celthunder.tutorial.v1') === '1'; } catch { return false; } })(),
+      pe: getComputedStyle(n).pointerEvents,
+      skip: !!n.querySelector('.ct-tut-skip'),
+      steps: n.querySelectorAll('.ct-tut-pip').length,
+    };
+  });
+  check('flight school exists, with a Skip button and a step for each control',
+    !!school && school.exists && school.skip && school.steps >= 5,
+    school ? `${school.steps} steps` : 'not built');
+  check('flight school never blocks the game or plays twice',
+    !!school && school.pe === 'none' && school.hiddenNow && school.seen,
+    school ? `pointer-events ${school.pe}, hidden ${school.hiddenNow}, seen ${school.seen}` : '');
 }
 
 async function groundAttack(page, tag, check, mode) {

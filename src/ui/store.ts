@@ -12,6 +12,17 @@ import type { GameContext, QualityTier } from '../engine/context';
 
 export type ControlMode = 'mouse-aim' | 'instructor' | 'realistic' | 'simulator';
 export type Units = 'metric' | 'imperial';
+/**
+ * How much the flight instructor is allowed to help.
+ *
+ * 'arcade' is the default and stays the default. Someone who has never flown a
+ * simulator cannot be expected to know that pulling harder in a stall makes it
+ * worse, and an aeroplane that departs, spins and hits the ground the first
+ * time they yank the mouse teaches them only that the game is broken. Arcade
+ * keeps the g limiter, the stall protection, the automatic rudder and the wing
+ * leveller in the loop, so releasing the controls always recovers.
+ */
+export type AssistLevel = 'arcade' | 'realistic';
 
 export interface UiPrefs {
   // --- graphics ---
@@ -29,6 +40,7 @@ export interface UiPrefs {
 
   // --- controls ---
   controlMode: ControlMode;
+  assists: AssistLevel;
   mouseSensitivity: number;
   invertY: boolean;
   aimAssist: number;
@@ -147,6 +159,7 @@ export const DEFAULT_PREFS: UiPrefs = {
   outlineWidth: 1,
 
   controlMode: 'mouse-aim',
+  assists: 'arcade',
   mouseSensitivity: 1,
   invertY: false,
   aimAssist: 0.5,
@@ -257,6 +270,7 @@ export function applyPrefs(p: UiPrefs, ctx: GameContext): void {
   });
   ctx.bus.emit('controls:changed', {
     mode: p.controlMode,
+    assists: p.assists,
     sensitivity: p.mouseSensitivity,
     invertY: p.invertY,
     aimAssist: p.aimAssist,

@@ -27,7 +27,7 @@ export type Action =
   | 'cameraCycle' | 'freeLook' | 'lookBack' | 'zoom'
   // Meta
   | 'map' | 'chat' | 'bail' | 'targetCycle' | 'targetClear'
-  | 'controlModeCycle' | 'toggleHud';
+  | 'controlModeCycle' | 'toggleHud' | 'toggleControls';
 
 export type Bindings = Record<Action, string[]>;
 
@@ -86,31 +86,170 @@ export const DEFAULT_BINDINGS: Bindings = {
   targetCycle: ['Tab'],
   targetClear: ['Escape'],
   controlModeCycle: ['KeyO'],
-  toggleHud: ['F1'],
+  // F1 is the near-universal "what are the controls?" key, so it opens the
+  // legend; hiding the HUD moves to F2 (and 'U' still does it from the UI
+  // layer). A player who presses F1 expecting help must not instead have their
+  // instruments vanish with no explanation.
+  toggleHud: ['F2'],
+  toggleControls: ['F1'],
 };
 
 /** Actions that must not have the browser's default behaviour applied. */
 const SWALLOW = new Set<string>([
   'Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
-  'Backspace', 'F1', 'Slash', 'Quote',
+  'Backspace', 'F1', 'F2', 'Slash', 'Quote',
 ]);
 
 export const shouldSwallow = (code: string): boolean => SWALLOW.has(code);
 
+const NAMED: Record<string, string> = {
+  Space: 'Space', Escape: 'Esc', Enter: 'Enter', Tab: 'Tab', Backspace: 'Backspace',
+  Minus: '−', Equal: '+', BracketLeft: '[', BracketRight: ']',
+  Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Slash: '/', Backslash: '\\',
+  Backquote: '`', NumpadAdd: 'Num +', NumpadSubtract: 'Num −',
+  CapsLock: 'Caps', PageUp: 'PgUp', PageDown: 'PgDn', Home: 'Home', End: 'End',
+};
+
 /** Human-readable label for a binding code, for the controls screen. */
 export function labelFor(code: string): string {
+  if (!code) return '—';
   if (code.startsWith('Mouse')) {
     const n = Number(code.slice(5));
     return ['LMB', 'MMB', 'RMB', 'M4', 'M5'][n] ?? `Mouse${n}`;
   }
+  if (NAMED[code]) return NAMED[code];
   if (code.startsWith('Pad')) return `Pad ${code.slice(3)}`;
   if (code.startsWith('Key')) return code.slice(3);
   if (code.startsWith('Digit')) return code.slice(5);
   if (code.startsWith('Numpad')) return `Num ${code.slice(6)}`;
   if (code.startsWith('Arrow')) return code.slice(5);
-  return code
-    .replace(/^(Shift|Control|Alt|Meta)(Left|Right)$/, (_m, a, b) => `${a[0] === 'C' ? 'Ctrl' : a} ${b[0]}`)
-    .replace('ControlLeft', 'Ctrl L');
+  return code.replace(
+    /^(Shift|Control|Alt|Meta)(Left|Right)$/,
+    (_m, a: string, b: string) => `${a === 'Control' ? 'Ctrl' : a} ${b[0]}`,
+  );
+}
+
+/**
+ * Display grouping for every action, in the order a player wants to read them.
+ *
+ * This lives next to the actions rather than in the UI layer on purpose. The
+ * controls screen used to carry its own private copy of the list — with its own
+ * private, *different* default keys — so it confidently told players that WEP
+ * was on R (it is Space), that the camera was on V (it is C) and that cannons
+ * were on the middle mouse button (they are the right one). Reading the same
+ * table the input system dispatches from is the only way a controls screen can
+ * be trusted, and it is why 'Legend' and 'SettingsPanel' both source from here.
+ */
+export const BINDING_GROUPS: { title: string; items: [Action, string][] }[] = [
+  {
+    title: 'Flight',
+    items: [
+      ['pitchUp', 'Pull up / nose up'],
+      ['pitchDown', 'Push / nose down'],
+      ['rollLeft', 'Roll left'],
+      ['rollRight', 'Roll right'],
+      ['yawLeft', 'Rudder left'],
+      ['yawRight', 'Rudder right'],
+    ],
+  },
+  {
+    title: 'Engine',
+    items: [
+      ['throttleUp', 'Throttle up'],
+      ['throttleDown', 'Throttle down'],
+      ['throttleMax', 'Throttle 100 %'],
+      ['throttleIdle', 'Throttle idle'],
+      ['wep', 'War emergency power'],
+      ['radiator', 'Radiator'],
+    ],
+  },
+  {
+    title: 'Weapons',
+    items: [
+      ['fire1', 'Machine guns'],
+      ['fire2', 'Cannons'],
+      ['bombs', 'Release bombs'],
+      ['rockets', 'Launch rockets'],
+      ['targetCycle', 'Cycle target'],
+      ['targetClear', 'Clear target'],
+    ],
+  },
+  {
+    title: 'Airframe',
+    items: [
+      ['gear', 'Landing gear'],
+      ['flaps', 'Flaps down a stage'],
+      ['flapsUp', 'Flaps up a stage'],
+      ['airbrake', 'Air brake'],
+      ['wheelBrake', 'Wheel brake'],
+      ['bail', 'Bail out (hold)'],
+    ],
+  },
+  {
+    title: 'View',
+    items: [
+      ['cameraCycle', 'Cycle camera'],
+      ['freeLook', 'Free look (hold)'],
+      ['lookBack', 'Look back'],
+      ['zoom', 'Gunsight zoom (hold)'],
+      ['toggleHud', 'Hide the HUD'],
+      ['toggleControls', 'This control list'],
+    ],
+  },
+  {
+    title: 'Trim',
+    items: [
+      ['trimNoseUp', 'Trim nose up'],
+      ['trimNoseDown', 'Trim nose down'],
+      ['trimLeft', 'Trim left'],
+      ['trimRight', 'Trim right'],
+      ['trimYawLeft', 'Trim rudder left'],
+      ['trimYawRight', 'Trim rudder right'],
+      ['trimReset', 'Reset trim'],
+    ],
+  },
+  {
+    title: 'Interface',
+    items: [
+      ['map', 'Map'],
+      ['chat', 'Chat'],
+      ['controlModeCycle', 'Mouse aim / simulator'],
+    ],
+  },
+];
+
+/**
+ * What a first-time pilot has to know, in the order they need it.
+ *
+ * 'actions' is a list because the useful unit here is an *axis*, not a key:
+ * "W / S — pitch" teaches the control, whereas two separate rows for "pitch
+ * down" and "pitch up" teach a keyboard layout. 'literal' covers the one entry
+ * that is not a binding at all — the mouse itself.
+ */
+export const ESSENTIALS: { actions: Action[]; literal?: string; note: string }[] = [
+  { actions: [], literal: 'Mouse', note: 'Aims — the aeroplane flies to the reticle' },
+  { actions: ['fire1', 'fire2'], note: 'Machine guns / cannons' },
+  { actions: ['pitchDown', 'pitchUp'], note: 'Pitch, if you would rather not use the mouse' },
+  { actions: ['rollLeft', 'rollRight'], note: 'Roll' },
+  { actions: ['throttleUp', 'throttleDown'], note: 'Throttle' },
+  { actions: ['wep'], note: 'War emergency power' },
+  { actions: ['gear', 'flaps'], note: 'Landing gear / flaps' },
+  { actions: ['cameraCycle'], note: 'Change camera' },
+  { actions: ['toggleControls'], note: 'Show every control' },
+];
+
+/**
+ * The label a player should see for an action: its first binding, which is the
+ * primary one by convention (later entries are the arrow-key and gamepad
+ * mirrors, and printing all of them turns a legend into a wall of text).
+ */
+export function primaryLabel(set: BindingSet, a: Action): string {
+  return labelFor(set.codesFor(a)[0] ?? '');
+}
+
+/** 'W / S' — the primary binding of each action, joined. */
+export function axisLabel(set: BindingSet, actions: readonly Action[]): string {
+  return actions.map((a) => primaryLabel(set, a)).filter((s) => s !== '—').join(' / ');
 }
 
 const STORAGE_KEY = 'celthunder.bindings.v1';

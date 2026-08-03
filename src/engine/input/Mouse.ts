@@ -41,6 +41,32 @@ export class Mouse {
   locked = false;
   /** True once the player has locked at least once — suppresses the prompt nag. */
   hasLocked = false;
+  /**
+   * True when this browser has been *asked* for pointer lock and refused, and
+   * has never granted it.
+   *
+   * This is the switch that decides whether the absolute-cursor fallback is
+   * allowed to fly the aeroplane at all (see 'InputSystem.updateAiming'). It has
+   * to be earned by a real refusal rather than assumed from "not locked right
+   * now", because those two states want opposite behaviour:
+   *
+   *   not locked, but lock works here — the player has not taken the controls
+   *     yet, or has just pressed Escape. The cursor is wherever they last left
+   *     it (on the Deploy button, in the corner, over another window) and it
+   *     means nothing. Flying to it is what made the aeroplane "jittery and
+   *     moving around": parked off-centre, the reticle pins to the cone edge and
+   *     the director holds a max-rate turn forever. Measured, cursor at the
+   *     bottom-right corner gave conePull = 1.00 indefinitely.
+   *
+   *   lock genuinely refused — an embedded frame, an unusual browser, the test
+   *     harness. Now the cursor is the only pointing device there is, and
+   *     following it is the only way the game is playable at all.
+   *
+   * Once a lock has succeeded we know the capability exists, so a later failure
+   * (Chrome rate-limits re-locking for ~1.25 s after an Escape) is transient and
+   * must not switch the fallback on.
+   */
+  lockDenied = false;
 
   private el: HTMLElement | null = null;
   private prompt: HTMLElement | null = null;
@@ -124,6 +150,7 @@ export class Mouse {
     this.locked = document.pointerLockElement === this.el;
     if (this.locked) {
       this.hasLocked = true;
+      this.lockDenied = false;
       this.dx = 0; this.dy = 0;
       // Coming back out of lock, the OS restores the cursor to wherever it was
       // when we captured it; that stale position must not snap the reticle.
@@ -134,8 +161,14 @@ export class Mouse {
 
   private onLockError = (): void => {
     this.locked = false;
+    this.noteDenied();
     this.syncPrompt();
   };
+
+  /** Records a refused lock. See 'lockDenied' for why 'hasLocked' gates it. */
+  private noteDenied(): void {
+    if (!this.hasLocked) this.lockDenied = true;
+  }
 
   /**
    * Makes the unlocked absolute-cursor path inert again until the player
@@ -169,31 +202,82 @@ export class Mouse {
   }
   private promptSuppressed = false;
 
+  /**
+   * Second, independent suppression, owned by the tutorial.
+   *
+   * Flight school's first instruction is "click anywhere to take the controls",
+   * in a larger panel, in the same corner of the screen — two overlapping boxes
+   * saying the same sentence. This mutes the smaller one for the duration.
+   *
+   * Kept separate from 'promptSuppressed' rather than sharing it because that
+   * flag belongs to the screenshot harness, and a tutorial that ended by
+   * clearing it would put the prompt back across every beauty shot.
+   */
+  setPromptMuted(v: boolean): void {
+    if (this.promptMuted === v) return;
+    this.promptMuted = v;
+    this.syncPrompt();
+  }
+  private promptMuted = false;
+
+  /**
+   * Whether 'unadjustedMovement' has been proven to work here.
+   * undefined = untried, true/false = decided. Sticky for the session.
+   */
+  private static rawMovementSupported: boolean | undefined;
+
   requestLock(): void {
     const now = performance.now();
-    // Chrome throws a SecurityError if you re-request within ~1.25 s of an
-    // Escape-triggered exit; do not spam it.
-    if (now - this.lastLockAttempt < 400) return;
+    // Chrome throws a SecurityError if a request lands within ~1.25 s of an
+    // Escape-triggered exit, so requests are rate-limited — but the limit must
+    // NOT swallow the second half of a double-click, which is exactly how most
+    // players try to capture the mouse. 120 ms is long enough to stop a held
+    // button spamming the API and short enough that a double-click's second
+    // press still gets a real attempt if the first was denied.
+    if (now - this.lastLockAttempt < 120) return;
     this.lastLockAttempt = now;
+
+    const el = this.el;
+    const req = (el as unknown as { requestPointerLock?: (o?: unknown) => unknown })?.requestPointerLock;
+    if (!el || !req) return;
+
+    // 'unadjustedMovement' asks for raw, un-accelerated deltas — much better for
+    // aiming, and Chromium-only.
+    //
+    // The subtlety that made this fail outright: pointer lock must be requested
+    // from inside a user gesture. The previous version requested it WITH the
+    // option and, if the returned promise rejected, retried without it inside
+    // the '.catch()' — which runs on a later microtask, by which point the
+    // gesture has expired and the retry is rejected too. The result was a game
+    // that never captured the mouse on any browser that dislikes the option,
+    // and, because mouse-aim then falls back to absolute cursor position, a
+    // flight director that spent every frame chasing an off-centre reticle.
+    //
+    // So: only pass the option once we know it works, and when we do not know,
+    // make the plain request — synchronously, inside the gesture — and probe
+    // for support separately.
+    const useRaw = Mouse.rawMovementSupported === true;
     try {
-      // 'unadjustedMovement' asks the browser for raw, un-accelerated deltas.
-      // It is only supported on Chromium; elsewhere the call either ignores the
-      // argument or rejects, and we fall back to the plain request.
-      const el = this.el;
-      const req = (el as unknown as { requestPointerLock?: (o?: unknown) => unknown })?.requestPointerLock;
-      if (!el || !req) return;
-      const p = req.call(el, { unadjustedMovement: true });
+      const p = useRaw ? req.call(el, { unadjustedMovement: true }) : req.call(el);
       if (p && typeof (p as Promise<void>).catch === 'function') {
         (p as Promise<void>).catch(() => {
-          // The retry returns a promise of its own in Chromium, and leaving it
-          // unhandled surfaces as an "unhandled rejection" in the console —
-          // which is indistinguishable from a real fault in any harness that
-          // treats console errors as failures. Swallow it here: a denied lock
-          // is an expected outcome, not an error.
-          try { swallow(req.call(el)); } catch { /* denied */ }
+          // A denied lock is an expected outcome (no gesture, too soon after an
+          // Escape, an unsupported embedding), not a fault. Do NOT retry here —
+          // see above. The prompt stays up and the next click tries again.
+          if (useRaw) Mouse.rawMovementSupported = false;
+          this.noteDenied();
         });
       }
-    } catch { /* denied — the prompt stays up and the next click retries */ }
+      // First successful plain lock: find out whether raw movement is available
+      // for next time, without risking this attempt.
+      if (Mouse.rawMovementSupported === undefined) {
+        Mouse.rawMovementSupported = typeof (navigator as { userAgentData?: unknown }).userAgentData !== 'undefined';
+      }
+    } catch {
+      if (useRaw) Mouse.rawMovementSupported = false;
+      this.noteDenied();
+      // Denied — the prompt stays up and the next click retries.
+    }
   }
 
   /** Returns the movement accumulated since the last call and resets it. */
@@ -206,47 +290,131 @@ export class Mouse {
   // Prompt overlay
   // -------------------------------------------------------------------------
 
+  /**
+   * The "click to fly" call to action.
+   *
+   * This used to be a 12 px line of letter-spaced caps at the very bottom of
+   * the frame, which is where a game puts things it does not mind you missing.
+   * The player missed it, never captured the mouse, and spent the session
+   * fighting an aeroplane that was chasing their cursor — so the prompt is now
+   * sized and animated like the instruction it is: centred low, a mouse glyph,
+   * a breathing ring, and the canvas itself switches to a pointer cursor so the
+   * "this is clickable" signal exists even for someone reading nothing.
+   */
   private buildPrompt(): void {
+    if (!document.getElementById('ct-lock-prompt-css')) {
+      const css = document.createElement('style');
+      css.id = 'ct-lock-prompt-css';
+      css.textContent = `
+@keyframes ct-lockpulse {
+  0%,100% { transform: scale(1);    opacity: .55; }
+  50%     { transform: scale(1.14); opacity: .12; }
+}
+/* Transform only — deliberately.
+   A CSS animation wins over an inline style, and this one runs with
+   'fill: both', so a keyframe that touched opacity would pin the prompt's
+   opacity at its final value forever: the panel then stayed lit through the
+   pause menu, over the settings modal and after the mouse had been captured,
+   because 'style.opacity = "0"' was being silently outranked. Visibility is the
+   inline transition's job; this only supplies the rise. */
+@keyframes ct-lockrise {
+  from { transform: translate(-50%, 10px); }
+  to   { transform: translate(-50%, 0); }
+}
+#ct-lock-prompt { animation: ct-lockrise .34s cubic-bezier(.2,.8,.3,1) both; }
+#ct-lock-prompt .ct-lp-ring {
+  position: absolute; inset: -6px; border-radius: 10px;
+  border: 2px solid rgba(255,207,107,.85);
+  animation: ct-lockpulse 1.9s ease-in-out infinite;
+  pointer-events: none;
+}
+#ct-lock-prompt .ct-lp-mouse {
+  width: 15px; height: 23px; border-radius: 8px;
+  border: 2px solid rgba(255,207,107,.95);
+  position: relative; flex: 0 0 auto;
+}
+#ct-lock-prompt .ct-lp-mouse::after {
+  content: ''; position: absolute; left: 50%; top: 3px;
+  width: 2px; height: 6px; margin-left: -1px; border-radius: 1px;
+  background: rgba(255,207,107,.95);
+}`;
+      document.head.appendChild(css);
+    }
+
     const el = document.createElement('div');
     el.id = 'ct-lock-prompt';
     el.setAttribute('role', 'status');
-    // Inline styles: there is no stylesheet to depend on and this must render
-    // correctly on the very first frame, before any UI system has initialised.
+    // Inline styles for the box itself: there is no stylesheet to depend on and
+    // this must render correctly on the very first frame, before any UI system
+    // has initialised.
     el.style.cssText = [
-      'position:fixed', 'left:50%', 'bottom:9%', 'transform:translateX(-50%)',
+      'position:fixed', 'left:50%', 'bottom:17%', 'transform:translateX(-50%)',
       'z-index:60', 'pointer-events:none', 'opacity:0',
       'transition:opacity .28s ease',
-      'font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-      'letter-spacing:.22em', 'text-transform:uppercase',
-      'color:#dfe8f2',
-      'padding:11px 20px 10px',
-      'background:linear-gradient(180deg,rgba(9,14,22,.82),rgba(9,14,22,.62))',
-      'border:1px solid rgba(190,215,240,.28)',
-      'border-radius:2px',
-      'box-shadow:0 2px 18px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.06)',
+      'display:flex', 'align-items:center', 'gap:13px',
+      'font:600 15px/1.25 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif',
+      'color:#eef4fb',
+      'padding:14px 22px',
+      'background:linear-gradient(180deg,rgba(9,14,22,.92),rgba(9,14,22,.78))',
+      'border:1px solid rgba(190,215,240,.34)',
+      'border-radius:4px',
+      'box-shadow:0 6px 34px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.07)',
       'text-shadow:0 1px 2px rgba(0,0,0,.8)',
-      'backdrop-filter:blur(3px)',
+      'backdrop-filter:blur(4px)',
       'white-space:nowrap',
     ].join(';');
-    el.innerHTML =
-      '<span style="color:#ffcf6b">Click</span> to take the controls' +
-      '<span style="opacity:.45;margin:0 10px">/</span>' +
-      '<span style="opacity:.7">Esc releases the mouse</span>';
+    el.innerHTML = PROMPT_INVITE;
     document.body.appendChild(el);
     this.prompt = el;
     this.syncPrompt();
   }
 
+  private promptMode: '' | 'invite' | 'denied' = '';
+
   private syncPrompt(): void {
     if (!this.prompt) return;
-    const show = this.wantLock && !this.locked && !this.promptSuppressed;
-    if (show === this.promptVisible) return;
-    this.promptVisible = show;
-    this.prompt.style.opacity = show ? '1' : '0';
+    const show = this.wantLock && !this.locked && !this.promptSuppressed && !this.promptMuted;
+    // Two different things to say, and telling a player the wrong one is worse
+    // than silence. "Click to take the controls" is an instruction; if this
+    // browser has already refused pointer lock, clicking will refuse it again
+    // and the instruction becomes a lie the player will keep obeying. In that
+    // state the cursor genuinely *is* the aim, so say that instead.
+    const mode = !show ? '' : this.lockDenied ? 'denied' : 'invite';
+    if (this.el) this.el.style.cursor = mode === 'invite' ? 'pointer' : '';
+    if (mode !== this.promptMode) {
+      this.promptMode = mode;
+      if (mode) this.prompt.innerHTML = mode === 'denied' ? PROMPT_DENIED : PROMPT_INVITE;
+    }
+    const useful = mode !== '';
+    if (useful === this.promptVisible) return;
+    this.promptVisible = useful;
+    this.prompt.style.opacity = useful ? '1' : '0';
+    // Re-run the entrance animation each time it comes back, so a player who
+    // pressed Escape and forgot gets a fresh, moving cue rather than a static
+    // panel they have already learned to ignore.
+    if (useful) {
+      this.prompt.style.animation = 'none';
+      void this.prompt.offsetWidth;
+      this.prompt.style.animation = '';
+    }
   }
 }
 
-/** Ignores a rejected pointer-lock promise without leaving it unhandled. */
-function swallow(p: unknown): void {
-  if (p && typeof (p as Promise<void>).catch === 'function') (p as Promise<void>).catch(() => {});
-}
+const PROMPT_SUB = 'style="opacity:.62;font-weight:500;font-size:12.5px;letter-spacing:.02em"';
+
+/** The normal case: capture is available and the player has not taken it. */
+const PROMPT_INVITE =
+  '<i class="ct-lp-ring"></i>'
+  + '<i class="ct-lp-mouse"></i>'
+  + '<span><b style="color:#ffcf6b;font-weight:700">Click anywhere to take the controls</b>'
+  + `<br><span ${PROMPT_SUB}>The mouse aims the aeroplane · Esc releases it</span></span>`;
+
+/**
+ * The browser has refused pointer lock. No ring — there is nothing to click,
+ * and an animated call to action that cannot be satisfied is just a nag.
+ */
+const PROMPT_DENIED =
+  '<i class="ct-lp-mouse"></i>'
+  + '<span><b style="color:#eef4fb;font-weight:700">This browser will not capture the mouse</b>'
+  + `<br><span ${PROMPT_SUB}>Aim with the cursor — the edge of the window is full deflection</span></span>`;
+

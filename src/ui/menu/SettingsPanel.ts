@@ -1,5 +1,11 @@
 import { el, setText, setClass, clamp } from '../dom';
-import { BINDING_GROUPS, DEFAULT_BINDINGS, DEFAULT_PREFS, keyLabel, type ControlMode, type UiPrefs, type Units } from '../store';
+import {
+  DEFAULT_BINDINGS, DEFAULT_PREFS,
+  type AssistLevel, type ControlMode, type UiPrefs, type Units,
+} from '../store';
+import {
+  BINDING_GROUPS, labelFor, type Action, type BindingSet,
+} from '../../engine/input/bindings';
 import { segmented, settingRow, slider, toggle, textField, groupTitle } from './controls';
 import type { QualityTier } from '../../engine/context';
 import { isWeatherId, type WeatherId } from '../../shared/environment';
@@ -54,9 +60,20 @@ export class SettingsPanel {
   private panels = new Map<Tab, HTMLElement>();
   private tab: Tab = 'graphics';
   private prefs: UiPrefs;
-  private listening: { key: string; node: HTMLElement } | null = null;
-  private keyNodes = new Map<string, HTMLElement>();
+  private listening: { action: Action; node: HTMLElement } | null = null;
   private rebuild: (() => void)[] = [];
+  /**
+   * The engine's live binding table.
+   *
+   * This panel used to rebind a private 'prefs.bindings' map that no subsystem
+   * read and whose defaults had drifted away from the real ones — so it both
+   * displayed the wrong keys and silently discarded every rebind the player
+   * made. It now edits the table the input system dispatches from, which is the
+   * only arrangement in which a controls screen can be correct.
+   */
+  private bindings: BindingSet | null = null;
+  private bindHost: HTMLElement | null = null;
+  private controlsRebuilt: (() => void) | null = null;
   /** Session-only sky overrides — see 'buildWeatherOverride'. */
   private weatherChoice: WeatherChoice = 'match';
   private todOverride: number | null = null;
@@ -240,7 +257,15 @@ export class SettingsPanel {
 
   private buildControls(p: HTMLElement): void {
     groupTitle(p, 'Flight model assistance');
-    let r = settingRow(p, 'Control mode', {
+    let r = settingRow(p, 'Assists', {
+      desc: 'Arcade keeps the g limiter, stall guard, auto-rudder and wing leveller '
+        + 'in the loop — letting go of the controls always recovers.',
+    });
+    const asst = segmented<AssistLevel>(r, [['arcade', 'Arcade'], ['realistic', 'Realistic']],
+      this.prefs.assists, (v) => { this.prefs.assists = v; this.commit(); });
+    this.rebuild.push(() => asst.set(this.prefs.assists));
+
+    r = settingRow(p, 'Control mode', {
       desc: 'Mouse aim flies for you; simulator gives raw surface control.',
     });
     const cm = segmented<ControlMode>(r, [
@@ -248,6 +273,7 @@ export class SettingsPanel {
       ['realistic', 'Realistic'], ['simulator', 'Sim'],
     ], this.prefs.controlMode, (v) => { this.prefs.controlMode = v; this.commit(); });
     this.rebuild.push(() => cm.set(this.prefs.controlMode));
+    this.controlsRebuilt = () => cm.set(this.prefs.controlMode);
 
     r = settingRow(p, 'Mouse sensitivity');
     const ms = slider(r, 0.2, 3, 0.05, this.prefs.mouseSensitivity, (v) => v.toFixed(2),
@@ -263,14 +289,42 @@ export class SettingsPanel {
       (v) => { this.prefs.aimAssist = v; this.commit(); });
     this.rebuild.push(() => aa.set(this.prefs.aimAssist));
 
+    this.bindHost = el('div', '', p);
+    this.paintBindings();
+  }
+
+  /** Hands the panel the engine's binding table. Repaints the key list. */
+  setBindings(b: BindingSet | null): void {
+    this.bindings = b;
+    this.paintBindings();
+  }
+
+  /** Re-reads preferences into the controls tab (the scheme may change in game). */
+  refreshControls(): void { this.controlsRebuilt?.(); }
+
+  private paintBindings(): void {
+    const host = this.bindHost;
+    if (!host) return;
+    this.cancelListen();
+    host.textContent = '';
+    const b = this.bindings;
+    if (!b) {
+      groupTitle(host, 'Key bindings');
+      el('div', 'ct-row-desc', host, 'Unavailable — the input subsystem is not running.');
+      return;
+    }
     for (const grp of BINDING_GROUPS) {
-      groupTitle(p, grp.title);
-      for (const [key, label] of grp.items) {
-        const row = el('div', 'ct-bind', p);
+      groupTitle(host, grp.title);
+      for (const [action, label] of grp.items) {
+        const row = el('div', 'ct-bind', host);
         el('span', 'k', row, label);
-        const btn = el('button', 'ct-key', row, keyLabel(this.prefs.bindings[key] ?? ''));
-        btn.onclick = () => this.beginListen(key, btn);
-        this.keyNodes.set(key, btn);
+        const codes = b.codesFor(action).filter((c) => !c.startsWith('Pad'));
+        // The alternates are shown but not editable: the second and third
+        // entries are the arrow-key and gamepad mirrors, and letting a rebind
+        // silently drop them is how a player loses the arrow keys forever.
+        if (codes.length > 1) el('span', 'alt', row, codes.slice(1).map(labelFor).join(' · '));
+        const btn = el('button', 'ct-key', row, labelFor(codes[0] ?? ''));
+        btn.onclick = () => this.beginListen(action, btn);
       }
     }
   }
@@ -319,9 +373,9 @@ export class SettingsPanel {
 
   // -------------------------------------------------------------------------
 
-  private beginListen(key: string, node: HTMLElement): void {
-    if (this.listening) setClass(this.listening.node, 'is-listen', false);
-    this.listening = { key, node };
+  private beginListen(action: Action, node: HTMLElement): void {
+    this.cancelListen();
+    this.listening = { action, node };
     setClass(node, 'is-listen', true);
     setText(node, 'PRESS…');
   }
@@ -344,27 +398,29 @@ export class SettingsPanel {
   };
 
   private assign(code: string): void {
-    if (!this.listening) return;
-    const { key, node } = this.listening;
-    // A binding is exclusive: steal it from whatever held it.
-    for (const [k, v] of Object.entries(this.prefs.bindings)) {
-      if (v === code && k !== key) {
-        this.prefs.bindings[k] = '';
-        const other = this.keyNodes.get(k);
-        if (other) setText(other, '—');
-      }
+    const b = this.bindings;
+    if (!this.listening || !b) return;
+    const { action } = this.listening;
+    // Keep the alternates: only the primary binding is being replaced.
+    const kept = b.codesFor(action).slice(1);
+    // A binding is exclusive, so take the code off whatever else held it.
+    for (const other of b.actionsFor(code)) {
+      if (other === action) continue;
+      b.set(other, b.codesFor(other).filter((c) => c !== code));
     }
-    this.prefs.bindings[key] = code;
-    setText(node, keyLabel(code));
-    setClass(node, 'is-listen', false);
+    b.set(action, [code, ...kept.filter((c) => c !== code)]);
     this.listening = null;
+    // Repaint wholesale: a steal changes a row somewhere else on the page.
+    this.paintBindings();
     this.commit();
   }
 
   private cancelListen(): void {
     if (!this.listening) return;
-    setText(this.listening.node, keyLabel(this.prefs.bindings[this.listening.key] ?? ''));
-    setClass(this.listening.node, 'is-listen', false);
+    const { action, node } = this.listening;
+    const code = this.bindings?.codesFor(action)[0] ?? '';
+    setText(node, labelFor(code));
+    setClass(node, 'is-listen', false);
     this.listening = null;
   }
 
@@ -373,7 +429,8 @@ export class SettingsPanel {
     const last = this.prefs.lastAircraft;
     Object.assign(this.prefs, DEFAULT_PREFS, { bindings: { ...DEFAULT_BINDINGS }, playerName: name, lastAircraft: last });
     for (const f of this.rebuild) f();
-    for (const [k, node] of this.keyNodes) setText(node, keyLabel(this.prefs.bindings[k] ?? ''));
+    this.bindings?.reset();
+    this.paintBindings();
     this.commit();
   }
 

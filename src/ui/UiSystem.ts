@@ -20,6 +20,9 @@ import { Hangar } from './menu/Hangar';
 import { SettingsPanel } from './menu/SettingsPanel';
 import { Scoreboard } from './menu/Scoreboard';
 import { DeathScreen, MatchEnd } from './menu/DeathScreen';
+import { ControlLegend, FirstFlight } from './menu/Legend';
+import { Tutorial, type TutorialProbe } from './menu/Tutorial';
+import type { BindingSet } from '../engine/input/bindings';
 import type { AircraftBuilder } from './menu/HangarViewer';
 
 export type UiScreen = 'menu' | 'hangar' | 'flight';
@@ -69,6 +72,11 @@ export class UiSystem implements Subsystem {
   private scoreboard!: Scoreboard;
   private death!: DeathScreen;
   private matchEnd!: MatchEnd;
+  private legend!: ControlLegend;
+  private firstFlight!: FirstFlight;
+  private tutorial!: Tutorial;
+  /** Set once a cinematic framing has been applied — see 'ui:debugFraming'. */
+  private cinematic = false;
 
   private screen: UiScreen = 'menu';
   private settingsOpen = false;
@@ -119,6 +127,7 @@ export class UiSystem implements Subsystem {
 
     this.menu = new MainMenu(this.root, [
       { id: 'play', label: 'Play', hint: 'ENTER' },
+      { id: 'tutorial', label: 'Flight school', hint: '' },
       { id: 'hangar', label: 'Hangar', hint: 'H' },
       { id: 'settings', label: 'Settings', hint: 'O' },
       { id: 'controls', label: 'Controls', hint: 'K' },
@@ -126,11 +135,30 @@ export class UiSystem implements Subsystem {
     this.hangar = new Hangar(this.root);
     this.pause = new PauseMenu(this.root, [
       { id: 'resume', label: 'Resume', hint: 'ESC' },
+      { id: 'controls', label: 'Controls', hint: 'F1' },
       { id: 'hangar', label: 'Change aircraft', hint: '' },
       { id: 'settings', label: 'Settings', hint: '' },
       { id: 'menu', label: 'Leave battle', hint: '' },
     ]);
     this.settings = new SettingsPanel(this.root, this.prefs);
+    this.legend = new ControlLegend(this.root);
+    this.firstFlight = new FirstFlight(this.root);
+    this.tutorial = new Tutorial(this.root);
+    // The engine's binding table is the only true one — see menu/Legend.ts.
+    this.legend.setBindings(this.liveBindings());
+    this.settings.setBindings(this.liveBindings());
+    this.tutorial.setBindings(this.liveBindings());
+    // A player who skips flight school still gets the one-card summary; one who
+    // sat through it has just been taught the same six things, at length.
+    this.tutorial.onEnd = (completed) => {
+      this.mutePrompt(false);
+      // Only in the air. Leaving the aeroplane also ends flight school, and
+      // without this guard the "basics" card would follow the player into the
+      // hangar and sit over the aircraft they were choosing.
+      if (!completed && this.screen === 'flight') {
+        this.firstFlight.show(this.liveBindings(), 14, true);
+      }
+    };
 
     this.wire();
     this.applyPrefs();
@@ -214,7 +242,13 @@ export class UiSystem implements Subsystem {
     // --- menus ------------------------------------------------------------
     this.menu.onSelect = (id) => {
       if (id === 'play') this.setScreen('hangar');
-      else if (id === 'hangar') this.setScreen('hangar');
+      else if (id === 'tutorial') {
+        // Arm it and send them to the hangar; it starts on the next Deploy,
+        // which is where the aeroplane it teaches actually appears.
+        Tutorial.replay();
+        this.replayTutorial = true;
+        this.setScreen('hangar');
+      } else if (id === 'hangar') this.setScreen('hangar');
       else if (id === 'settings') this.openSettings('graphics');
       else if (id === 'controls') this.openSettings('controls');
     };
@@ -229,6 +263,7 @@ export class UiSystem implements Subsystem {
 
     this.pause.onSelect = (id) => {
       if (id === 'resume') { sfx('ui:back'); this.closePause(); }
+      else if (id === 'controls') { this.openSettings('controls'); }
       else if (id === 'hangar') { this.closePause(); this.setScreen('hangar'); }
       else if (id === 'settings') { this.openSettings('graphics'); }
       else if (id === 'menu') { sfx('ui:back'); this.closePause(); this.setScreen('menu'); }
@@ -314,6 +349,54 @@ export class UiSystem implements Subsystem {
     on('hud:input', (p) => { this.inputBits = p?.bits ?? 0; });
     on('ui:notice', (p) => this.hud.notices.show(p.key ?? 'x', p.text ?? '', p.kind ?? '', p.life ?? 4));
     on('world:markers', (p) => this.setWorldMarkers(p));
+
+    // --- controls ---------------------------------------------------------
+    on('input:toggleControls', () => this.toggleLegend());
+    // The screenshot harness poses the camera directly rather than playing the
+    // game, so every teaching overlay stands down for good once it does.
+    on('ui:debugFraming', () => {
+      this.cinematic = true;
+      this.tutorial.finish(false);
+      this.firstFlight.hide();
+      this.legend.setVisible(false);
+    });
+    // The 'O' key cycles the scheme inside the input subsystem; mirror it back
+    // into the preference so the settings panel never contradicts the game.
+    on('input:scheme', (s) => {
+      const mode = s === 'realistic' ? 'realistic' : 'mouse-aim';
+      if (this.prefs.controlMode === mode) return;
+      this.prefs.controlMode = mode;
+      savePrefs(this.prefs);
+      this.settings.refreshControls();
+    });
+  }
+
+  /**
+   * The engine's live binding table, or null in a build without an input
+   * subsystem. Looked up structurally for the same reason the audio sink is:
+   * the interface must stay usable when a subsystem is missing.
+   */
+  private liveBindings(): BindingSet | null {
+    const input = this.ctx.get('input') as unknown as { bindings?: BindingSet } | undefined;
+    return input?.bindings ?? null;
+  }
+
+  /** Mutes the engine's own "click to take the controls" prompt. */
+  private mutePrompt(v: boolean): void {
+    const input = this.ctx.get('input') as unknown as {
+      mouse?: { setPromptMuted?: (v: boolean) => void };
+    } | undefined;
+    input?.mouse?.setPromptMuted?.(v);
+  }
+
+  private toggleLegend(): void {
+    if (this.screen !== 'flight') return;
+    this.legend.setBindings(this.liveBindings());
+    sfx(this.legend.toggle() ? 'ui:click' : 'ui:back');
+    // Deliberately NOT a modal: the legend does not suspend input and does not
+    // release the pointer. A player checking which key drops the gear is still
+    // flying the aeroplane, and yanking the mouse out of the game to show them
+    // a list would be its own small betrayal.
   }
 
   /**
@@ -525,7 +608,16 @@ export class UiSystem implements Subsystem {
     this.menu.setVisible(s === 'menu');
     this.hangar.setVisible(s === 'hangar');
     this.hud.setVisible(s === 'flight' && this.prefs.showHud);
-    if (s !== 'flight') this.closePause();
+    if (s !== 'flight') {
+      this.closePause();
+      // Leaving the aeroplane ends the lesson; it re-arms on the next Deploy
+      // only if the player asked for it from the menu. Finished first, so its
+      // 'onEnd' cannot put a card up that the two lines below were meant to
+      // have cleared.
+      this.tutorial.finish(false);
+      this.legend.setVisible(false);
+      this.firstFlight.hide();
+    }
   }
 
   private deploy(spec: AircraftSpec, livery: number, loadout = 'clean'): void {
@@ -543,7 +635,35 @@ export class UiSystem implements Subsystem {
     });
     this.net?.requestSpawn(spec.id, loadout);
     this.hud.notices.show('deploy', `${spec.name} — cleared for take-off`, '', 3);
+
+    // Take the pointer here, synchronously, while the browser still counts this
+    // as the Deploy click.
+    //
+    // Pointer lock may only be requested from inside a user gesture, and this is
+    // the last gesture before the player is in the air. Asking for it here is
+    // the difference between spawning with the mouse already flying the
+    // aeroplane and spawning uncaptured — which is the state the player was
+    // actually in, chasing a cursor they did not know was the stick. It must
+    // stay in the same task: an await, a timeout or a promise callback here and
+    // the gesture has expired and the request is refused.
+    this.ctx.bus.emit('input:captureMouse');
+
+    // ...and, on the very first sortie, teach them to fly it.
+    //
+    // Not while a cinematic framing is driving the camera: the screenshot
+    // harness poses the world itself and a tutorial card across every beauty
+    // shot would be a regression in ten framings at once.
+    if (!this.cinematic) {
+      const started = this.tutorial.start(this.replayTutorial);
+      this.replayTutorial = false;
+      // Flight school says "click to take the controls" itself, larger and in
+      // the same place; two panels with the same sentence is worse than one.
+      if (started) this.mutePrompt(true);
+      // No tutorial (already seen) but still a first flight — show the card.
+      if (!started) this.firstFlight.show(this.liveBindings());
+    }
   }
+  private replayTutorial = false;
 
   private onSpawned(m: { entityId?: number; aircraft?: string }): void {
     if (m?.aircraft && AIRCRAFT_BY_ID[m.aircraft]) {
@@ -570,6 +690,44 @@ export class UiSystem implements Subsystem {
     this.ctx.bus.emit('ui:modal', this.isModal());
     this.wasAlive = true;
     this.lastDamage = 0;
+    // Say where the fight is, once the world has had a moment to replicate.
+    this.briefIn = 4;
+  }
+
+  /** Seconds until the post-spawn "where is everyone" brief. 0 = done. */
+  private briefIn = 0;
+
+  /**
+   * Tells the player what to do next.
+   *
+   * A new pilot spawns into an empty sky with a compass, a minimap and no idea
+   * which way anything is. The markers were always there; what was missing was
+   * the sentence that makes them mean something. This posts once per life,
+   * after the entity table has had a few seconds to fill.
+   */
+  private briefObjective(): void {
+    const me = this.ctx.entities.get(this.ctx.localEntityId);
+    if (!me) return;
+    let best: EntityState | null = null;
+    let bestD = Infinity;
+    for (const e of this.ctx.entities.values()) {
+      if (e.kind !== EntityKind.Aircraft || e.id === me.id) continue;
+      if (e.team === this.ctx.localTeam || e.health <= 0) continue;
+      const d = Math.hypot(e.px - me.px, e.py - me.py, e.pz - me.pz);
+      if (d < bestD) { bestD = d; best = e; }
+    }
+    if (!best) {
+      this.notice('No contacts — steer for the marked airfields', '', 6, 'brief');
+      return;
+    }
+    // Compass bearing to the contact: +Z is north in this world, and 'atan2(x, z)'
+    // is what the HUD's own compass uses, so the number the player is told
+    // matches the number on the tape.
+    const brg = ((Math.atan2(best.px - me.px, best.pz - me.pz) * 180) / Math.PI + 360) % 360;
+    this.notice(
+      `Hostiles bearing ${Math.round(brg).toString().padStart(3, '0')}° · ${(bestD / 1000).toFixed(1)} km — marked in red`,
+      '', 7, 'brief',
+    );
   }
 
   private onDeath(killer: string, weapon: string): void {
@@ -602,6 +760,7 @@ export class UiSystem implements Subsystem {
 
   private openPause(): void {
     this.pauseOpen = true;
+    this.legend.setVisible(false);
     this.pause.setVisible(true);
     this.ctx.bus.emit('ui:modal', true);
   }
@@ -634,7 +793,16 @@ export class UiSystem implements Subsystem {
 
     const bind = this.prefs.bindings;
 
+    // The first-flight card is an interruption, so any key clears it — but it
+    // does not *consume* the key, or the first thing a new player learns is
+    // that their first input did nothing.
+    this.firstFlight.hide();
+
     if (e.code === 'Escape') {
+      // Escape unwinds one layer at a time, innermost first. Closing the legend
+      // must not also open the pause menu.
+      if (this.tutorial.handleEscape()) return;
+      if (this.legend.isOpen) { sfx('ui:back'); this.legend.setVisible(false); return; }
       sfx('ui:back');
       if (this.settingsOpen) { this.closeSettings(); return; }
       if (this.screen === 'hangar') { this.hangar.onBack(); return; }
@@ -811,6 +979,12 @@ export class UiSystem implements Subsystem {
     // overlay would otherwise have to remember to undo it.
     this.hud.setDim(this.screen !== 'flight' || this.death.isOpen || this.scoreOpen || this.pauseOpen);
 
+    this.firstFlight.update(dt);
+    if (this.tutorial.isActive) this.tutorial.update(dt, this.probeForTutorial());
+    if (this.briefIn > 0 && this.screen === 'flight' && !this.cinematic) {
+      this.briefIn -= dt;
+      if (this.briefIn <= 0) this.briefObjective();
+    }
     this.directHitT = Math.max(0, this.directHitT - dt);
     this.leadExternalT -= dt;
     if (this.leadExternalT <= 0) this.leadExternal = false;
@@ -874,6 +1048,35 @@ export class UiSystem implements Subsystem {
     }
 
     this.minimapAcc += dt;
+  }
+
+  /**
+   * One frame's worth of "what has the player actually done", for the tutorial.
+   *
+   * Read off the live subsystems rather than pushed, because every value here
+   * already has an owner and duplicating them into an event would be one more
+   * thing to keep in step. Structurally typed for the usual reason: a build
+   * without an input subsystem must still reach the menu.
+   */
+  private probeForTutorial(): TutorialProbe {
+    const input = this.ctx.get('input') as unknown as {
+      mouse?: { locked?: boolean; lockDenied?: boolean };
+      throttle?: number;
+      down?: (a: string) => boolean;
+    } | undefined;
+    const down = (a: string): boolean => input?.down?.(a) === true;
+    const t = this.telemetry.data;
+    return {
+      locked: input?.mouse?.locked === true,
+      lockUnavailable: input?.mouse?.lockDenied === true,
+      throttleKey: down('throttleUp') || down('throttleDown'),
+      throttle: input?.throttle ?? 0,
+      firing: down('fire1') || down('fire2'),
+      cameraMode: this.cameraSys?.mode ?? '',
+      pitchDeg: t.pitch,
+      bankDeg: t.roll,
+      flying: this.screen === 'flight' && !this.synthActive && !this.death.isOpen && t.health > 0,
+    };
   }
 
   private announceDamage(added: number): void {

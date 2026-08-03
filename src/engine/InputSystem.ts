@@ -197,6 +197,14 @@ export class InputSystem implements Subsystem {
       ctx.bus.on('input:setScheme', (s: unknown) => {
         if (s === 'mouse' || s === 'realistic') this.setScheme(s);
       }),
+      // Emitted from inside the click handler that deploys the player. Pointer
+      // lock may only be requested during a user gesture, and "Deploy" is the
+      // last gesture before the player is in the air — so taking the capture
+      // there means the mouse is already the aircraft's the instant it exists,
+      // instead of the player spawning uncaptured and having to discover a
+      // second, separate click they were never told about.
+      ctx.bus.on('input:captureMouse', () => this.mouse.requestLock()),
+      ctx.bus.on('controls:changed', (p: unknown) => this.applyControlPrefs(p)),
     );
   }
 
@@ -232,6 +240,58 @@ export class InputSystem implements Subsystem {
    * error and haul the aeroplane round to "correct" it.
    */
   resetAim(): void { this.pendingAimReset = true; }
+
+  /**
+   * Applies the settings panel's control preferences to the live controller.
+   *
+   * Before this existed, 'controls:changed' had no subscriber anywhere in the
+   * codebase: the Control mode selector and the Invert vertical axis toggle
+   * were both inert, and 'invertY' was read exactly once, at 'init', from a
+   * 'ctx.settings' the UI had not necessarily populated yet.
+   *
+   * The first event is recorded rather than applied. It arrives during boot,
+   * carrying whatever mode is stored in the UI's own preferences, and applying
+   * it would overwrite the scheme the player last chose with the 'O' key —
+   * which is persisted separately, under 'celthunder.scheme'.
+   */
+  private lastControlMode: string | null = null;
+  private applyControlPrefs(raw: unknown): void {
+    const p = raw as { mode?: string; assists?: string; invertY?: boolean } | null;
+    if (!p) return;
+    if (typeof p.invertY === 'boolean') this.aim.cfg.invertY = p.invertY;
+    if (typeof p.assists === 'string') this.applyAssists(p.assists);
+
+    const mode = p.mode;
+    if (typeof mode !== 'string') return;
+    const first = this.lastControlMode === null;
+    const changed = this.lastControlMode !== mode;
+    this.lastControlMode = mode;
+    if (first || !changed) return;
+    this.setScheme(mode === 'mouse-aim' || mode === 'instructor' ? 'mouse' : 'realistic');
+  }
+
+  /**
+   * The beginner protections, as one switch.
+   *
+   * Arcade is the shipped default and every one of these is why: the g limiter
+   * stops a novice pulling the wings off, the stall guard withholds the last of
+   * the elevator before the buffet instead of letting them ride it into a spin,
+   * the auto-rudder keeps the ball centred (uncoordinated flight is the main
+   * reason a beginner's shots miss), and the wing leveller means that letting
+   * go of the controls is always a valid recovery — which is the single most
+   * important property a first flight can have.
+   *
+   * Realistic hands all four back. It is a deliberate choice, never a default.
+   */
+  private applyAssists(level: string): void {
+    const arcade = level !== 'realistic';
+    const cfg = this.aim.cfg;
+    cfg.instructor = arcade;
+    cfg.coordination = arcade ? DEFAULT_MOUSE_AIM.coordination : 0;
+    cfg.levelAssist = arcade ? DEFAULT_MOUSE_AIM.levelAssist : 0;
+    cfg.gLimitFactor = arcade ? DEFAULT_MOUSE_AIM.gLimitFactor : 1.05;
+    cfg.stallMargin = arcade ? DEFAULT_MOUSE_AIM.stallMargin : 1.0;
+  }
 
   setScheme(s: ControlScheme): void {
     if (this.scheme === s) return;
@@ -394,6 +454,7 @@ export class InputSystem implements Subsystem {
       ctx.settings.showHud = !ctx.settings.showHud;
       ctx.bus.emit('ui:showHud', ctx.settings.showHud);
     }
+    if (this.pressed('toggleControls')) ctx.bus.emit('input:toggleControls');
     if (this.pressed('controlModeCycle')) this.setScheme(this.scheme === 'mouse' ? 'realistic' : 'mouse');
 
     // -- targeting --------------------------------------------------------
@@ -554,18 +615,25 @@ export class InputSystem implements Subsystem {
     ctx.camera.matrixWorld.extractBasis(_camRight, _camUp, _v);
 
     const mouseFree = !this.lookActive && !this.suspended && !this.cameraOwnsMouse;
-    if (this.scheme === 'mouse' && this.device !== 'gamepad' && mouseFree && !this.mouse.locked && this.mouse.movedUnlocked) {
-      // Unlocked fallback. Without pointer lock there are no unbounded deltas to
-      // integrate — 'movementX/Y' is only meaningful while captured — so
-      // 'drain()' returns zero and mouse aim contributes nothing at all. That is
-      // the state the game is in before the player's first click, in every
-      // browser that denies the lock, and in the headless screenshot harness.
-      // The absolute cursor is mapped straight through the aim cone instead: the
-      // canvas edge is the cone edge, which is the only mapping that stays
-      // consistent when the player clicks and the relative path takes over.
-      this.aim.fromWireAim(view, this.mouse.nx, this.mouse.ny, _camRight, _camUp);
-    } else if (this.scheme === 'mouse' && this.device !== 'gamepad' && mouseFree) {
+    const mouseAim = this.scheme === 'mouse' && this.device !== 'gamepad' && mouseFree;
+    if (mouseAim && this.mouse.locked) {
       this.aim.steer(this.mouseDx, this.mouseDy, _camRight, _camUp, ctx.settings.mouseSensitivity);
+    } else if (mouseAim && this.mouse.lockDenied && this.mouse.movedUnlocked) {
+      // Fallback for a browser that has refused pointer lock outright. There
+      // are no unbounded deltas to integrate without a capture, so the absolute
+      // cursor is mapped through the aim cone instead: the canvas edge is the
+      // cone edge, which is the only mapping that stays consistent if a later
+      // click does succeed and the relative path takes over. It is a worse way
+      // to fly than a captured mouse, and it is only reached when there is no
+      // captured mouse to be had — see 'Mouse.lockDenied'.
+      this.aim.fromWireAim(view, this.mouse.nx, this.mouse.ny, _camRight, _camUp);
+    } else if (mouseAim) {
+      // Capture is available but not held: between the spawn and the player's
+      // first click, or any time they have pressed Escape. The cursor's position
+      // is not a command — it is wherever the OS happened to leave the arrow —
+      // so the director parks the reticle on the nose and the aeroplane holds
+      // its attitude instead of flying at the corner of the screen.
+      this.aim.holdBoresight(view);
     } else if (this.scheme === 'mouse' && this.device === 'gamepad' && !this.lookActive) {
       // On a pad the right stick is the rudder, so the reticle is driven by the
       // left stick as a *rate*: hold it over and the reticle sweeps.

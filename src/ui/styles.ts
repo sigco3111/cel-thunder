@@ -1432,6 +1432,143 @@ export const UI_CSS = /* css */ `
 }
 .ct-key:hover { background: rgba(255,178,58,.16); color: #fff; }
 .ct-key.is-listen { background: var(--accent); color: var(--ink); animation: ct-pulse .7s steps(2) infinite; }
+.ct-bind .alt { font-family: var(--font-mono); font-size: var(--f-nano); color: var(--hud-faint); margin-right: var(--s2); }
+
+/* ===================================================================== *
+ * 16b. Control legend and the first-flight card
+ *
+ * Both are pointer-events: none all the way down. They sit over the live
+ * canvas while the player is flying, and anything that swallowed a click here
+ * would swallow the click that takes pointer lock.
+ * ===================================================================== */
+kbd.ct-kbd {
+  display: inline-block; min-width: calc(var(--px) * 26);
+  padding: calc(var(--px) * 3) calc(var(--px) * 7) calc(var(--px) * 4);
+  font-family: var(--font-mono); font-size: var(--f-nano); font-weight: 600;
+  line-height: 1; letter-spacing: .04em; text-align: center; white-space: nowrap;
+  color: var(--accent-hot); background: rgba(255, 178, 58, .10);
+  border-radius: calc(var(--px) * 3);
+  box-shadow: inset 0 0 0 1px rgba(255, 178, 58, .34), 0 calc(var(--px) * 2) 0 rgba(3, 6, 10, .55);
+}
+kbd.ct-kbd.is-none { color: var(--hud-faint); background: transparent; box-shadow: inset 0 0 0 1px var(--line); }
+
+.ct-legend {
+  position: absolute; inset: 0; z-index: 46;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, rgba(4, 7, 12, .58), rgba(4, 7, 12, .82));
+  animation: ct-screen-in .18s var(--ease) both;
+}
+.ct-legend-panel {
+  width: min(calc(var(--px) * 1220), 95vw); max-height: 92vh; overflow: hidden;
+  padding: var(--s4) var(--s5) var(--s5);
+}
+.ct-legend-head { display: flex; align-items: baseline; gap: var(--s4); padding-bottom: var(--s3); border-bottom: 1px solid var(--line); }
+.ct-legend-hint { font-family: var(--font-mono); font-size: var(--f-micro); color: var(--hud-dim); letter-spacing: .1em; text-transform: uppercase; }
+/* Multi-column rather than a grid, and deliberately.
+   A grid puts every group of a row on the same baseline, so the tallest group
+   (Trim, seven rows) set the height of its whole row and pushed the last one
+   off the bottom of a panel that is capped at 92vh — the legend silently lost
+   its last two bindings at 720p. Columns balance the groups by content. */
+.ct-legend-grid {
+  columns: 4 calc(var(--px) * 250); column-gap: var(--s5);
+  padding-top: var(--s4);
+}
+.ct-legend-col { break-inside: avoid; margin-bottom: var(--s4); }
+.ct-legend-title {
+  font-family: var(--font-cond); font-size: var(--f-nano); letter-spacing: .28em;
+  text-transform: uppercase; color: rgba(255, 178, 58, .78);
+  padding-bottom: calc(var(--px) * 5); margin-bottom: calc(var(--px) * 4);
+  border-bottom: 1px solid rgba(158, 199, 230, .12);
+}
+.ct-legend-row {
+  display: grid; grid-template-columns: calc(var(--px) * 104) 1fr;
+  align-items: center; gap: var(--s3); padding: calc(var(--px) * 3) 0;
+}
+.ct-legend-keys { display: flex; flex-wrap: wrap; gap: calc(var(--px) * 3); justify-content: flex-end; }
+.ct-legend-name { font-size: var(--f-tiny); color: rgba(230, 241, 251, .84); }
+.ct-legend-empty { font-size: var(--f-sm); color: var(--hud-dim); padding: var(--s4); }
+
+.ct-firstflight {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  z-index: 44; pointer-events: none;
+  animation: ct-ff-in .42s cubic-bezier(.2, .8, .3, 1) both;
+}
+@keyframes ct-ff-in {
+  from { transform: translate(-50%, calc(-50% + var(--s4))); opacity: 0; }
+  to   { transform: translate(-50%, -50%); opacity: 1; }
+}
+.ct-ff-panel { width: min(calc(var(--px) * 560), 90vw); padding: var(--s4) var(--s5) var(--s4); }
+.ct-ff-kicker {
+  font-family: var(--font-cond); font-size: var(--f-nano); letter-spacing: .3em;
+  text-transform: uppercase; color: rgba(255, 178, 58, .8);
+}
+.ct-ff-title { font-family: var(--font-cond); font-size: var(--f-lg); letter-spacing: .04em; color: var(--paper); margin-bottom: var(--s3); }
+.ct-ff-list { display: flex; flex-direction: column; gap: calc(var(--px) * 5); }
+.ct-ff-row { display: grid; grid-template-columns: calc(var(--px) * 118) 1fr; align-items: center; gap: var(--s3); }
+.ct-ff-keys { display: flex; flex-wrap: wrap; gap: calc(var(--px) * 3); justify-content: flex-end; }
+.ct-ff-note { font-size: var(--f-tiny); color: rgba(230, 241, 251, .86); }
+.ct-ff-foot {
+  margin-top: var(--s4); padding-top: var(--s3); border-top: 1px solid var(--line);
+  font-size: var(--f-micro); color: var(--hud-dim);
+}
+
+/* ===================================================================== *
+ * 16c. Flight school
+ *
+ * pointer-events: none on everything except the Skip button — the first thing
+ * this asks the player to do is click the canvas to take pointer lock, and an
+ * overlay that ate that click would deadlock its own first instruction.
+ * ===================================================================== */
+.ct-tut {
+  position: absolute; left: 50%; bottom: calc(var(--px) * 96);
+  transform: translateX(-50%);
+  z-index: 48; pointer-events: none;
+}
+.ct-tut-card {
+  width: min(calc(var(--px) * 520), 92vw);
+  padding: var(--s3) var(--s4) var(--s3);
+  animation: ct-tut-in .3s cubic-bezier(.2, .8, .3, 1) both;
+  transition: box-shadow .2s var(--ease);
+}
+@keyframes ct-tut-in {
+  from { opacity: 0; transform: translateY(calc(var(--px) * 14)); }
+  to   { opacity: 1; transform: none; }
+}
+.ct-tut-head { display: flex; align-items: center; gap: var(--s3); }
+.ct-tut-kicker {
+  flex: 1; font-family: var(--font-cond); font-size: var(--f-nano);
+  letter-spacing: .3em; text-transform: uppercase; color: rgba(255, 178, 58, .8);
+}
+.ct-tut-pips { display: flex; gap: calc(var(--px) * 4); }
+.ct-tut-pip {
+  width: calc(var(--px) * 18); height: calc(var(--px) * 3); border-radius: 2px;
+  background: rgba(158, 199, 230, .22); position: relative; overflow: hidden;
+}
+.ct-tut-pip.is-done { background: rgba(121, 230, 166, .75); }
+.ct-tut-pip.is-now { background: rgba(158, 199, 230, .28); }
+.ct-tut-pip.is-now::after {
+  content: ''; position: absolute; inset: 0; width: var(--p, 0%);
+  background: var(--accent);
+}
+.ct-tut-title {
+  font-family: var(--font-cond); font-size: var(--f-lg); letter-spacing: .03em;
+  color: var(--paper); margin-top: calc(var(--px) * 5);
+}
+.ct-tut-keys { display: flex; flex-wrap: wrap; gap: calc(var(--px) * 4); margin: var(--s2) 0 calc(var(--px) * 6); }
+.ct-tut-why { font-size: var(--f-tiny); color: rgba(230, 241, 251, .74); }
+.ct-tut-nudge { margin-top: var(--s2); font-size: var(--f-micro); color: var(--warn); }
+.ct-tut-tick {
+  display: none; margin-top: var(--s2);
+  font-family: var(--font-cond); font-size: var(--f-md); letter-spacing: .16em;
+  text-transform: uppercase; color: var(--ok);
+}
+.ct-tut-card.is-done { box-shadow: inset 0 0 0 1px rgba(121, 230, 166, .5); }
+.ct-tut-card.is-done .ct-tut-tick { display: block; }
+.ct-tut-card.is-done .ct-tut-why { opacity: .35; }
+.ct-tut-foot { display: flex; justify-content: flex-end; margin-top: var(--s3); }
+/* The one interactive element in the whole overlay. */
+.ct-tut-skip { pointer-events: auto; }
 
 /* ===================================================================== *
  * 17. Scoreboard

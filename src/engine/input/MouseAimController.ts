@@ -184,6 +184,26 @@ export class MouseAimController {
   }
 
   /**
+   * Parks the reticle on the nose, leaving every integrator alone.
+   *
+   * This is what the director does while the pointer is *not* captured but
+   * could be — the state between spawning and the player's first click, and
+   * every moment after they press Escape. With no pointing error the outer loop
+   * asks for nothing, the wing leveller rolls the aircraft upright and it holds
+   * a stable attitude, which is the only sane thing to do when the game has no
+   * idea where the player is looking.
+   *
+   * Distinct from 'reset', which also clears the PI state; doing that every
+   * frame would throw away the trim the integrators have earned and the
+   * aeroplane would sag each time the mouse was released.
+   */
+  holdBoresight(view: AircraftView): void {
+    if (!this.initialised || !view.valid) return;
+    this.aimRaw.copy(view.forward);
+    this.aimDir.copy(view.forward);
+  }
+
+  /**
    * Steers the reticle with a mouse delta expressed in the camera's screen
    * basis. 'right' and 'up' are the camera's world-space axes, so "mouse right"
    * always means "reticle right on screen" regardless of aircraft bank.

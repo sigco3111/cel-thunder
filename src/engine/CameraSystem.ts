@@ -1134,6 +1134,10 @@ export class CameraSystem implements Subsystem {
     // The harness never clicks, so the "click to take the controls" prompt would
     // otherwise be printed across every beauty shot.
     this.input?.mouse.setPromptSuppressed(true);
+    // ...and for the same reason, the teaching overlays stand down: a framing
+    // means "compose a picture", not "play the game", and flight school across
+    // the middle of a hero shot is a regression in every framing at once.
+    ctx.bus.emit('ui:debugFraming');
     const ui = ctx.get('ui') as unknown as Record<string, unknown> | undefined;
     const setScreen = ui?.['setScreen'];
     if (typeof setScreen === 'function') {
