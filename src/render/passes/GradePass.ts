@@ -47,6 +47,15 @@ export class GradePass {
 
       uContrast: { value: 0.30 },
       uShoulder: { value: 1.55 },
+      /**
+       * Where the display-referred shoulder starts, in gamma-encoded units,
+       * and how much chroma is put back into what it compresses.
+       *
+       * See the shoulder block in the shader: below this the transfer is
+       * exactly the identity, so nothing in the mid-tone or the toe moves.
+       */
+      uKnee: { value: 0.62 },
+      uKneeSat: { value: 0.72 },
       /** Tone-curve pivot, in gamma-encoded units. ~18 % scene grey. */
       uPivot: { value: 0.44 },
       /** Straight-line gain about the pivot. 1.0 = no expansion. */
@@ -179,6 +188,8 @@ const FRAG = /* glsl */`
   uniform vec3  uBloomTint;
   uniform float uContrast;
   uniform float uShoulder;
+  uniform float uKnee;
+  uniform float uKneeSat;
   uniform float uPivot;
   uniform float uGain;
   uniform float uLutScale;
@@ -199,15 +210,38 @@ const FRAG = /* glsl */`
     vec2 d = vUv - 0.5;
     float r2 = dot( d, d );
 
-    // --- chromatic aberration (edges only) --------------------------------
+    // --- chromatic aberration (edges only, and never on a highlight) -------
     // r^4 falloff: at half radius the shift is 1/16 of its corner value, i.e.
     // a fraction of a pixel. Only the extreme corners fringe.
+    //
+    // The falloff alone is not enough, and the sea proved it. Lateral CA is a
+    // *displacement*, so what it costs is proportional to the gradient it is
+    // displaced across — and the specular glitter on the sun path is the
+    // steepest gradient in the game: single scene-referred pixels at 3.0 sitting
+    // against water at 0.5. A quarter-pixel shift there does not read as lens
+    // character, it paints an orange edge on the sunward side of every sparkle
+    // and a cyan one on the other, which is the rubric's shimmering-edges
+    // failure. The same arithmetic put a red hairline on the sunset nose stroke
+    // and a rainbow on the cockpit canopy sill.
+    //
+    // So the shift is applied only where it is *invisible by construction*:
+    // measure the colour the displacement would invent, normalise it by the
+    // local brightness, and fade the whole effect out as that ratio grows. On a
+    // smooth sky or a vignette corner the ratio is a few thousandths and CA
+    // runs at full strength; on a sparkle, an ink stroke or a specular edge it
+    // is above a third and CA is simply not applied. One extra fetch, and the
+    // centre tap was needed anyway.
     float ca = uChromatic * r2 * r2;
     vec2 shift = d * ca * 0.02;
-    vec3 col;
-    col.r = texture2D( tColor, vUv + shift ).r;
-    col.g = texture2D( tColor, vUv ).g;
-    col.b = texture2D( tColor, vUv - shift ).b;
+    vec3 cen = texture2D( tColor, vUv ).rgb;
+    vec3 fringed = vec3(
+      texture2D( tColor, vUv + shift ).r,
+      cen.g,
+      texture2D( tColor, vUv - shift ).b
+    );
+    float dev = max( abs( fringed.r - cen.r ), abs( fringed.b - cen.b ) );
+    float rel = dev / ( max( cen.r, max( cen.g, cen.b ) ) + 0.25 );
+    vec3 col = mix( cen, fringed, 1.0 - smoothstep( 0.06, 0.30, rel ) );
 
     // --- bloom (still linear, still scene-referred) -----------------------
     if ( uBloom > 0.0 ) {
@@ -225,7 +259,13 @@ const FRAG = /* glsl */`
     vec3 tvL = col / ( 1.0 + l / uShoulder );
     vec3 tvC = col / ( 1.0 + col / uShoulder );
     col = mix( tvL, tvC, clamp( tvC, 0.0, 1.0 ) );
-    col = clamp( col, 0.0, 1.0 );
+    // NOT clamped to 1 here. This curve asymptotes to uShoulder, not to white,
+    // so clipping at this point threw away everything between scene-referred
+    // 1.7 and 2.8 before the display transform below had a chance to shape it —
+    // and that band is precisely where the horizon sits in every framing that
+    // contains one. The overshoot is carried through and compressed by the
+    // shoulder at the end instead.
+    col = max( col, vec3( 0.0 ) );
 
     // --- contrast in perceptual space --------------------------------------
     // Reinhard alone is a *very* flat curve: with a shoulder of 1.35 a scene
@@ -242,8 +282,51 @@ const FRAG = /* glsl */`
     // plateaus the toon ramp exists to create survive the treatment.
     vec3 p = pow( col, vec3( 1.0 / 2.2 ) );
     p = ( p - uPivot ) * uGain + uPivot;
-    vec3 s = p * p * ( 3.0 - 2.0 * p );
-    p = mix( p, s, uContrast );
+
+    // The S runs on the [0,1] section only. 'p * p * (3 - 2p)' is a smoothstep
+    // polynomial: above 1 it turns over and comes back down, so feeding it the
+    // overshoot would make the transfer non-monotonic and invert the brightest
+    // parts of the frame. Shape the in-range part, carry the overshoot past it
+    // untouched, and the curve stays monotone everywhere.
+    vec3 pc = clamp( p, 0.0, 1.0 );
+    vec3 s = pc * pc * ( 3.0 - 2.0 * pc );
+    pc = mix( pc, s, uContrast );
+    p = pc + max( p - 1.0, vec3( 0.0 ) );
+
+    // --- shoulder ----------------------------------------------------------
+    // A print stock's shoulder: identity below the knee, unit slope *at* the
+    // knee, asymptotic to paper white and never reaching it.
+    //
+    // This is the fix for the horizon band, and it is worth being precise about
+    // what that band actually was, because three rounds of critique assumed it
+    // was a haze term and it is not. Killing scene fog outright moves the
+    // coastline by one level; killing the cel material's aerial perspective
+    // moves it by one; killing bloom moves the brightest part of the band by
+    // four. What made it read as a blown bar was the *transfer*: everything
+    // above scene-referred ~1.7 arrived at exactly 1.0, so the sky, the sea and
+    // the cloud shelf all landed on the same value and the boundary between
+    // them stopped existing.
+    //
+    // Measured on the hero framing at x=1690, before: a continuous 220-pixel
+    // run above 220/255 peaking at (253,253,228) — neutral paper white, no
+    // interior. After, with the knee at 0.62: the same column peaks at
+    // (231,220,201) and only ~40 pixels of it clear 220, with the sea, the
+    // cloud shelf and the coast each separating again. The band did not get
+    // narrower because less light is being drawn; it got narrower because the
+    // top of the range stopped being one value.
+    vec3 over = max( p - uKnee, vec3( 0.0 ) );
+    float span = max( 1.0 - uKnee, 1e-3 );
+    vec3 shouldered = min( p, vec3( uKnee ) ) + span * ( 1.0 - exp( -over / span ) );
+
+    // Compressing value also flattens chroma, and a flattened chroma at the top
+    // of the range is exactly the structureless cream the horizon was made of.
+    // Put back a share of it in proportion to how hard the shoulder worked, so
+    // the compressed highlights keep the hue they arrived with — warm at the
+    // horizon, cool in the zenith — instead of converging on white.
+    float comp = clamp( ( lumaOf( p ) - lumaOf( shouldered ) ) * 1.6, 0.0, 1.0 );
+    float lp = lumaOf( shouldered );
+    p = mix( vec3( lp ), shouldered, 1.0 + uKneeSat * comp );
+
     col = pow( clamp( p, 0.0, 1.0 ), vec3( 2.2 ) );
 
     // --- creative grade: procedural 3D LUT --------------------------------

@@ -7,7 +7,11 @@ import {
   type EntityState, type InputFrame, type GameEvent, type PlayerInfo,
 } from '../src/shared/protocol';
 import { AIRCRAFT, AIRCRAFT_BY_ID, aircraftIndex, nationTeam, type AircraftSpec } from '../src/shared/aircraft';
-import { v3, q, qrot, vadd, vaddScaled, vlen, type V3 } from '../src/shared/math';
+import { v3, q, qrot, type V3 } from '../src/shared/math';
+import {
+  createFlightState, spawnInFlight, stepFlight, writeEntityState,
+  type FlightState,
+} from '../src/shared/flight';
 
 /**
  * One match. Owns the authoritative simulation, the entity list and the
@@ -22,11 +26,30 @@ import { v3, q, qrot, vadd, vaddScaled, vlen, type V3 } from '../src/shared/math
  *  - a ring buffer of past transforms supports lag-compensated hit testing.
  */
 
+/** A team's home field, as the terrain bake sited it. */
+export interface SpawnSite {
+  x: number;
+  z: number;
+  /** Runway elevation, m ASL. */
+  elevation: number;
+  /** Runway bearing, radians (0 = +Z). */
+  heading: number;
+  team: number;
+}
+
+/**
+ * Everything the simulation needs to know about the world. This is exactly the
+ * shared flight model's 'Environment' plus the spawn sites, so the same object
+ * can be handed straight to 'stepFlight'.
+ */
 export interface Env {
   airDensity(y: number): number;
   windAt(p: V3, out: V3): V3;
   terrainHeight(x: number, z: number): number;
   terrainNormal(x: number, z: number, out: V3): V3;
+  /** 0 = paved, 1 = soft ground, 2 = water. */
+  surfaceType?(x: number, z: number): number;
+  airfield(team: number): SpawnSite;
 }
 
 interface HistorySample {
@@ -72,8 +95,8 @@ export class Player {
 export interface ServerEntity {
   state: EntityState;
   spec?: AircraftSpec;
-  /** Opaque flight state owned by the shared flight model. */
-  flight?: any;
+  /** Flight state owned by the shared flight model. */
+  flight?: FlightState;
   /** Opaque damage state owned by the shared combat model. */
   dmg?: any;
   /** Ring buffer for lag compensation. */
@@ -86,6 +109,8 @@ export interface ServerEntity {
   he?: number;
   mass?: number;
   dead: boolean;
+  /** Latched once the death has been scored, so it is only scored once. */
+  killed?: boolean;
 }
 
 const HISTORY_LEN = Math.ceil(LAGCOMP_HISTORY * TICK_HZ);
@@ -171,8 +196,14 @@ export class Room {
   }
 
   /**
-   * Spawns a player aircraft on their team's airfield, offset so simultaneous
-   * spawns do not overlap.
+   * Spawns a player aircraft over their team's airfield, offset so
+   * simultaneous spawns do not overlap.
+   *
+   * The spawn is *airborne and trimmed*, not parked on the runway: a match
+   * that begins with a cold-start taxi is unplayable as a deathmatch, and a
+   * ground spawn is also where every collision bug hides. The aircraft still
+   * has a runway to come home to — the field below is real, and the
+   * undercarriage model lands on it.
    */
   spawnAircraft(p: Player, aircraftId: string): ServerEntity | null {
     const spec = AIRCRAFT_BY_ID[aircraftId] ?? AIRCRAFT[0];
@@ -195,28 +226,38 @@ export class Room {
     e.state.gear = 1;
 
     const base = this.airfield(p.team);
-    const slot = [...this.players.values()].filter((q) => q.team === p.team).indexOf(p);
-    const lateral = ((slot % 6) - 2.5) * 26;
-    const back = Math.floor(slot / 6) * 40;
+    const foe = this.env.airfield(p.team === 0 ? 1 : 0);
 
-    e.state.px = base.x + lateral;
-    e.state.py = this.env.terrainHeight(base.x + lateral, base.z - back) + 1.2;
-    e.state.pz = base.z - back;
-    // Runways are aligned to +Z for team 0 and -Z for team 1.
-    const yaw = p.team === 0 ? 0 : Math.PI;
-    e.state.qx = 0; e.state.qy = Math.sin(yaw / 2); e.state.qz = 0; e.state.qw = Math.cos(yaw / 2);
-    e.state.vx = 0; e.state.vy = 0; e.state.vz = 0;
-    e.state.throttle = 0;
-    e.state.rpm = 0.18;
+    // Line up abreast, pointed at the other side's field, so the merge happens
+    // without anyone having to navigate.
+    const heading = Math.atan2(foe.x - base.x, foe.z - base.z);
+    const slot = [...this.players.values()].filter((o) => o.team === p.team).indexOf(p);
+    const lateral = ((slot % 6) - 2.5) * 90;
+    const back = Math.floor(slot / 6) * 220;
+    // Offset across the flight path, i.e. 90° from the heading.
+    const px = base.x + Math.cos(heading) * lateral - Math.sin(heading) * back;
+    const pz = base.z - Math.sin(heading) * lateral - Math.cos(heading) * back;
+    const alt = base.elevation + SPAWN_AGL + (slot % 6) * 40;
+    const speed = cruiseSpeed(chosen);
+
+    const flight = createFlightState(chosen, v3(px, alt, pz), q());
+    // Full throttle: the input system hands the player a wide-open throttle on
+    // spawn, so priming the engine anywhere else just means the first two
+    // seconds of every sortie are a spool-up transient the client has to
+    // predict and the server has to correct.
+    spawnInFlight(flight, chosen, this.env, alt, speed, heading, 1);
+    flight.pos.x = px; flight.pos.z = pz;
+    e.flight = flight;
+    writeEntityState(flight, chosen, e.state);
 
     p.entityId = e.state.id;
     p.alive = true;
     return e;
   }
 
-  airfield(team: number): V3 {
-    // Deterministic from the map seed; the client derives the same positions.
-    return team === 0 ? v3(-14000, 0, -19000) : v3(14000, 0, 19000);
+  /** The team's home field, as sited by the terrain bake. */
+  airfield(team: number): SpawnSite {
+    return this.env.airfield(team);
   }
 
   // -------------------------------------------------------------------------
@@ -294,8 +335,12 @@ export class Room {
   }
 
   /**
-   * Steps one aircraft. Delegates to the shared flight model when it is
-   * available; the fallback keeps a match playable if the model is mid-swap.
+   * Steps one aircraft through the shared flight model — the same code, the
+   * same environment and the same timestep the client predicts with. There is
+   * deliberately no reduced-order fallback: one existed, nothing ever bound
+   * the model that was supposed to replace it, and so every online match was
+   * silently arbitrated by a toy integrator that the client's prediction
+   * disagreed with on every single tick.
    */
   private stepAircraft(e: ServerEntity, input: InputFrame | null): void {
     const s = e.state;
@@ -311,88 +356,26 @@ export class Room {
       return;
     }
 
-    if (e.flight && globalThis.__stepFlight) {
-      globalThis.__stepFlight(e.flight, e.spec, input ?? ZERO_INPUT, this.env, TICK_DT);
-      globalThis.__syncFlightToState?.(e.flight, s);
-    } else {
-      this.stepAircraftFallback(e, input);
+    if (!e.flight || !e.spec) return;
+
+    // Damage is arbitrated by the projectile pass, which writes the replicated
+    // record; the flight model reads it back so a shot-off wing actually
+    // changes how the aeroplane flies.
+    e.flight.damage = s.damage;
+    e.flight.health = s.health;
+
+    stepFlight(e.flight, e.spec, input ?? ZERO_INPUT, this.env, TICK_DT);
+    writeEntityState(e.flight, e.spec, s);
+
+    // Flying it into the ground counts: the model itself zeroes health on a
+    // structural failure or a hard arrival.
+    if (s.health <= 0) {
+      this.killEntity(e, 0, 'terrain');
+      return;
     }
 
     // Firing
-    if (input && e.spec) this.stepGuns(e, input);
-  }
-
-  /**
-   * Reduced-order flight integration used only when the full model has not
-   * been wired in. Enough to fly and be shot at; not enough to be authentic.
-   */
-  private stepAircraftFallback(e: ServerEntity, input: InputFrame | null): void {
-    const s = e.state;
-    const spec = e.spec!;
-    const dt = TICK_DT;
-    const i = input ?? ZERO_INPUT;
-
-    s.throttle += (i.throttle - s.throttle) * Math.min(1, dt / spec.engine.spool);
-    s.rpm = 0.18 + s.throttle * 0.82;
-
-    const rot = q(s.qx, s.qy, s.qz, s.qw);
-    const fwd = qrot(rot, FWD, _f);
-    const up = qrot(rot, UP, _u);
-    const right = qrot(rot, RIGHT, _r);
-
-    const vel = v3(s.vx, s.vy, s.vz);
-    const speed = vlen(vel);
-    const rho = this.env.airDensity(s.py);
-    const qbar = 0.5 * rho * speed * speed;
-
-    // Angular response, authority scaled by dynamic pressure.
-    const auth = Math.min(1, qbar / 2400);
-    const wx = i.pitch * spec.aero.pitchRate * auth;
-    const wy = i.yaw * spec.aero.yawRate * auth;
-    const wz = -i.roll * spec.aero.rollRate * auth;
-
-    const half = dt * 0.5;
-    const dx = s.qw * wx * half + s.qy * wz * half - s.qz * wy * half;
-    const dy = s.qw * wy * half + s.qz * wx * half - s.qx * wz * half;
-    const dz = s.qw * wz * half + s.qx * wy * half - s.qy * wx * half;
-    const dw = -s.qx * wx * half - s.qy * wy * half - s.qz * wz * half;
-    s.qx += dx; s.qy += dy; s.qz += dz; s.qw += dw;
-    const ql = Math.hypot(s.qx, s.qy, s.qz, s.qw) || 1;
-    s.qx /= ql; s.qy /= ql; s.qz /= ql; s.qw /= ql;
-
-    const thrust = spec.engine.powerKw * 1000 * s.throttle / Math.max(30, speed);
-    const alpha = speed > 5 ? Math.asin(Math.max(-1, Math.min(1, -(vel.x * up.x + vel.y * up.y + vel.z * up.z) / speed))) : 0;
-    const cl = Math.max(-spec.aero.clMax, Math.min(spec.aero.clMax, spec.aero.cl0 + spec.aero.clAlpha * alpha));
-    const lift = qbar * spec.aero.wingArea * cl;
-    const cd = spec.aero.cd0 + (cl * cl) / (Math.PI * spec.aero.oswald * (spec.aero.span ** 2 / spec.aero.wingArea));
-    const drag = qbar * spec.aero.wingArea * cd;
-
-    const m = spec.aero.mass;
-    let ax = (fwd.x * thrust + up.x * lift) / m;
-    let ay = (fwd.y * thrust + up.y * lift) / m - 9.81;
-    let az = (fwd.z * thrust + up.z * lift) / m;
-    if (speed > 0.1) {
-      ax -= (vel.x / speed) * drag / m;
-      ay -= (vel.y / speed) * drag / m;
-      az -= (vel.z / speed) * drag / m;
-    }
-
-    s.vx += ax * dt; s.vy += ay * dt; s.vz += az * dt;
-    s.px += s.vx * dt; s.py += s.vy * dt; s.pz += s.vz * dt;
-
-    const gh = this.env.terrainHeight(s.px, s.pz);
-    if (s.py < gh + 1.0) {
-      s.py = gh + 1.0;
-      if (s.vy < -12) {
-        this.killEntity(e, 0, 'terrain');
-      } else {
-        s.vy = Math.max(0, s.vy);
-        s.vx *= 0.985; s.vz *= 0.985;
-      }
-    }
-
-    s.ctlPitch = i.pitch; s.ctlRoll = i.roll; s.ctlYaw = i.yaw;
-    s.gear = s.py - gh < 60 ? 1 : Math.max(0, s.gear - dt * 0.25);
+    if (input) this.stepGuns(e, input);
   }
 
   private gunCooldown = new Map<number, number[]>();
@@ -491,7 +474,11 @@ export class Room {
   }
 
   private killEntity(target: ServerEntity, killerEntityId: number, weapon: string): void {
-    if (target.state.damage & DamageBits.Destroyed) return;
+    // Guarded by an explicit latch rather than by the Destroyed bit: the
+    // flight model sets that bit itself the moment health reaches zero, so
+    // testing it here would swallow the death that bit represents.
+    if (target.killed) return;
+    target.killed = true;
     target.state.damage |= DamageBits.Destroyed;
     target.state.health = 0;
 
@@ -636,16 +623,18 @@ export class Room {
 
 const ZERO_INPUT: InputFrame = { seq: 0, dt: TICK_DT, pitch: 0, roll: 0, yaw: 0, throttle: 0, bits: 0, aimX: 0, aimY: 0 };
 const FWD = v3(0, 0, 1);
-const UP = v3(0, 1, 0);
-const RIGHT = v3(1, 0, 0);
-const _f = v3(), _u = v3(), _r = v3(), _p = v3();
+const _f = v3(), _p = v3();
 
-declare global {
-  // Bound by server/index.ts once the shared flight model is available.
-  // eslint-disable-next-line no-var
-  var __stepFlight: undefined | ((flight: any, spec: any, input: InputFrame, env: Env, dt: number) => void);
-  // eslint-disable-next-line no-var
-  var __syncFlightToState: undefined | ((flight: any, state: EntityState) => void);
+/** Metres above the home field that a spawn is dropped in at. */
+const SPAWN_AGL = 1800;
+
+/**
+ * A trimmed cruise for this airframe, m/s TAS. Roughly 60 % of never-exceed,
+ * which for every archetype in the roster lands between 110 and 145 m/s — fast
+ * enough to manoeuvre immediately, slow enough not to overshoot the merge.
+ */
+function cruiseSpeed(spec: AircraftSpec): number {
+  return Math.max(95, Math.min(160, spec.aero.vne * 0.62));
 }
 
 /** Closest approach of segment AB to a sphere at C with radius r. */

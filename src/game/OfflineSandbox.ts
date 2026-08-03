@@ -38,6 +38,8 @@ const ROSTER: Array<{ id: string; ai: boolean }> = [
 ];
 
 const RESPAWN_DELAY = 7;
+/** Trimmed cruise for a spawn, m/s TAS — about 460 km/h. */
+const CRUISE = 128;
 const PROJECTILE_LIFE = 4.0;
 const HIT_RADIUS = 5.5;
 
@@ -122,10 +124,7 @@ export class OfflineSandbox {
       // Nose the two formations at each other along ±X.
       const heading = team === 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
 
-      const actor = this.spawnActor(spec, team, entry.ai, px, py, pz, heading);
-      // Trim into level cruise at a realistic speed instead of dropping out of
-      // the sky at zero airspeed.
-      this.setCruise(actor, 128 + i * 4);
+      const actor = this.spawnActor(spec, team, entry.ai, px, py, pz, heading, 128 + i * 4);
       this.actors.push(actor);
       if (!entry.ai) this.playerActor = actor;
     }
@@ -135,17 +134,67 @@ export class OfflineSandbox {
     this.ctx.bus.emit('net:spawned', {
       t: 'spawned', entityId: this.playerActor.entityId, aircraft: this.playerActor.spec.id,
     });
+
+    // Offline, NetSystem has no server to ask, so the hangar's Deploy button
+    // routes here. The sandbox owns the actor list and is therefore the only
+    // thing that can supply a real entity id — see NetSystem.requestSpawn.
+    this.ctx.bus.on('game:spawnRequest', (m: unknown) => {
+      const id = (m as { aircraft?: string } | undefined)?.aircraft;
+      this.respawnPlayer(id);
+    });
+  }
+
+  /**
+   * Re-spawns the player, optionally in a different airframe, and republishes
+   * the real entity id. Called when the player deploys from the hangar.
+   */
+  respawnPlayer(aircraftId?: string): void {
+    const spec = (aircraftId && AIRCRAFT_BY_ID[aircraftId]) || this.playerActor.spec;
+
+    // Reuse the existing actor when the type has not changed — rebuilding it
+    // would orphan the view the entity system has already pooled for it.
+    const sameType = spec.id === this.playerActor.spec.id;
+    const team = nationTeam(spec.nation);
+
+    // Enter the same way the initial roster does: airborne, trimmed, at
+    // altitude. Spawning on the deck is what put the aircraft underground.
+    const px = team === 0 ? -1500 : 1500;
+    const pz = team === 0 ? 900 : -900;
+    const py = 2300 + (team === 0 ? 0 : 260);
+    const heading = team === 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
+
+    let actor = this.playerActor;
+    if (!sameType || !actor.alive) {
+      const i = this.actors.indexOf(actor);
+      actor = this.spawnActor(spec, team, false, px, py, pz, heading, CRUISE);
+      if (i >= 0) this.actors[i] = actor; else this.actors.push(actor);
+      this.playerActor = actor;
+    } else {
+      const rot = q(0, Math.sin(heading / 2), 0, Math.cos(heading / 2));
+      actor.flight = this.flightMod.createFlightState(actor.spec, v3(px, py, pz), rot);
+      this.setCruise(actor, px, py, pz, heading, CRUISE);
+      actor.state.health = 1;
+      actor.state.damage = 0;
+      actor.alive = true;
+      actor.bailed = false;
+      actor.respawnAt = 0;
+      actor.ammo = actor.spec.guns.map((g) => g.ammo * g.count);
+    }
+
+    this.ctx.localEntityId = actor.entityId;
+    this.ctx.localTeam = actor.team;
+    this.ctx.bus.emit('net:spawned', {
+      t: 'spawned', entityId: actor.entityId, aircraft: actor.spec.id,
+    });
   }
 
   private spawnActor(
     spec: AircraftSpec, team: number, ai: boolean,
-    px: number, py: number, pz: number, heading: number,
+    px: number, py: number, pz: number, heading: number, speed: number,
   ): Actor {
     const id = this.nextEntityId++;
     const rot = q(0, Math.sin(heading / 2), 0, Math.cos(heading / 2));
     const flight = this.flightMod.createFlightState(spec, v3(px, py, pz), rot);
-    (flight as Record<string, unknown>).gear = 0;
-    (flight as Record<string, unknown>).gearTarget = 0;
 
     const state = newEntityState();
     state.id = id;
@@ -158,7 +207,7 @@ export class OfflineSandbox {
     state.px = px; state.py = py; state.pz = pz;
     state.qx = rot.x; state.qy = rot.y; state.qz = rot.z; state.qw = rot.w;
 
-    return {
+    const actor: Actor = {
       entityId: id, spec, typeId: state.typeId, team, flight, state,
       ai: ai ? new AiPilot(id, spec) : null,
       gunCd: spec.guns.map(() => 0),
@@ -166,24 +215,49 @@ export class OfflineSandbox {
       alive: true, respawnAt: 0, bailed: false,
       input: { seq: 0, dt: 1 / 60, pitch: 0, roll: 0, yaw: 0, throttle: 1, bits: 0, aimX: 0, aimY: 0 },
     };
+    this.setCruise(actor, px, py, pz, heading, speed);
+    return actor;
   }
 
-  /** Puts an actor into trimmed level flight at 'speed'. */
-  private setCruise(actor: Actor, speed: number): void {
+  /**
+   * Puts an actor into trimmed level flight at 'speed'.
+   *
+   * The model's own 'spawnInFlight' is the only thing that gets this right: a
+   * bare 'createFlightState' hands back a cold engine idling at 20 % rpm with
+   * the gear down, and writing a velocity into that produces an aeroplane that
+   * is doing 460 km/h with no thrust and immediately mushes. It also has to
+   * match what the server does on an online spawn, or prediction starts out
+   * disagreeing with the authority on the very first frame.
+   */
+  private setCruise(
+    actor: Actor, px: number, py: number, pz: number, heading: number, speed: number,
+  ): void {
     const f = actor.flight as Record<string, unknown>;
-    const rot = f.rot as Q | undefined;
-    const vel = f.vel as V3 | undefined;
-    if (rot && vel) {
-      qrot(rot, FWD, _fwd);
-      vel.x = _fwd.x * speed; vel.y = _fwd.y * speed; vel.z = _fwd.z * speed;
+    const prime = this.flightMod.spawnInFlight;
+    if (prime) {
+      // Full throttle to match what the input system commands on spawn.
+      prime(actor.flight, actor.spec, this.env, py, speed, heading, 1);
+      const pos = f.pos as V3 | undefined;
+      if (pos) { pos.x = px; pos.z = pz; }
+    } else {
+      const rot = f.rot as Q | undefined;
+      const vel = f.vel as V3 | undefined;
+      if (rot && vel) {
+        qrot(rot, FWD, _fwd);
+        vel.x = _fwd.x * speed; vel.y = _fwd.y * speed; vel.z = _fwd.z * speed;
+      }
+      if (typeof f.throttle === 'number') f.throttle = 1;
     }
-    if (typeof f.throttle === 'number') f.throttle = 0.85;
-    if (typeof f.rpm === 'number') f.rpm = 0.88;
-    actor.state.vx = _fwd.x * speed;
-    actor.state.vy = 0;
-    actor.state.vz = _fwd.z * speed;
-    actor.state.throttle = 0.85;
-    actor.state.rpm = 0.88;
+    f.gear = 0; f.gearTarget = 0;
+
+    readFlightTransform(actor.flight, _t);
+    const s = actor.state;
+    s.px = _t.px; s.py = _t.py; s.pz = _t.pz;
+    s.qx = _t.qx; s.qy = _t.qy; s.qz = _t.qz; s.qw = _t.qw;
+    s.vx = _t.vx; s.vy = _t.vy; s.vz = _t.vz;
+    s.gear = 0;
+    s.throttle = 1;
+    s.rpm = 0.95;
   }
 
   // -------------------------------------------------------------------------
@@ -515,8 +589,7 @@ export class OfflineSandbox {
       const py = 2300 + Math.random() * 900;
       const heading = a.team === 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
 
-      const fresh = this.spawnActor(a.spec, a.team, a.ai !== null, px, py, pz, heading);
-      this.setCruise(fresh, 140);
+      const fresh = this.spawnActor(a.spec, a.team, a.ai !== null, px, py, pz, heading, CRUISE + 12);
       this.actors[i] = fresh;
       if (wasPlayer) {
         this.playerActor = fresh;

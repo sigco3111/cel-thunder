@@ -36,6 +36,16 @@ export interface PropellerResult {
   radius: number;
   /** Half-width of the disc quad, in metres — the shader's radial unit. */
   discRadius: number;
+  /**
+   * How far the spinner reaches forward of 'hubZ'.
+   *
+   * The disc quad is placed part way along it rather than at its base: the
+   * blade roots emerge from the middle of a Rotol spinner, and a disc sitting
+   * behind the whole cone reads — from any quarter view — as a ring floating
+   * *behind* the nose with the spinner poking out of it, which is most of what
+   * "the disc does not encircle the spinner" was describing.
+   */
+  spinnerLen: number;
 }
 
 /** Chord as a fraction of the maximum, against radius fraction. */
@@ -162,6 +172,7 @@ export function buildPropeller(
     hubZ,
     radius: R,
     discRadius,
+    spinnerLen: spinLen,
   };
 }
 
@@ -170,31 +181,52 @@ export function buildPropeller(
 // ---------------------------------------------------------------------------
 
 /**
- * Why this is a shader and not a translucent texture.
+ * Why this is a shader and not a translucent texture — and why it is written
+ * the way it is now rather than the way it was.
  *
  * A propeller turning at 1 500 rpm sweeps its blades past a given azimuth
- * twenty-five times a second. What the eye integrates is *not* a uniformly
- * tinted circle: it is mostly the background, seen through air, with a thin
- * smear of blade laid over it. Three properties follow, and the previous flat
- * 34 %-opacity quad had none of them:
+ * twenty-five times a second. What the eye integrates is a *partly opaque
+ * annulus*: mostly background seen through air, with a smear of matt-black
+ * blade laid over it, thickening from the spinner out to the tip.
  *
- *  1. **Density follows blade area, not radius.** Chord peaks around 60 % of
- *     the radius and the inboard third is spinner and blade cuff, so the disc
- *     is essentially invisible at the hub. A constant alpha put a grey plate
- *     over the cowl.
+ * The previous version got one thing badly wrong and everything else followed
+ * from it. It asserted that the disc "must not darken a bright background", so
+ * its colour was authored *brighter than the sky* and its base alpha was a few
+ * per cent. Composited premultiplied, that makes the disc a no-op over sky: the
+ * only fragments that survived were the peaks of a high-frequency angular
+ * grain term and a narrow Gaussian tip ring. So the same shader produced a
+ * fan of white filaments in 'hero', a bare wireframe ellipse in 'clouds',
+ * concentric hairlines in 'hud' and a rimmed hoop in 'low' — four different
+ * descriptions of one defect, which is that only the *detail* terms were ever
+ * visible and never the disc they were meant to decorate.
  *
- *  2. **It must not darken a bright background.** Straight alpha blending
- *     lerps toward the disc colour, so a dark smear over a sunset punches a
- *     grey hole — which is exactly what it did. The composite here is
- *     *premultiplied*: 'dst·(1−a) + colour·a' with a bright, sun-tinted colour,
- *     so the disc attenuates the background by a couple of per cent and adds
- *     its own scattered light on top. Against a bright sky it is a faint sheen;
- *     against dark terrain it is a pale smear. Both are what a photograph does.
+ * A real propeller is matt black with painted tips. Its blurred image is
+ * therefore darker than a bright sky and lighter than dark terrain, and it
+ * reads against both. That is the whole design here:
  *
- *  3. **It has angular structure and it moves.** Blade-count arcs advance with
- *     the hub phase and finer filaments break the ring up, so it reads as
- *     motion rather than as a decal. The painted tips smear into a hot arc
- *     near the rim — the single most recognisable feature of a running prop.
+ *  1. **A hub-to-tip radial ramp, and nothing that spikes.** Alpha climbs out
+ *     of the spinner, rises with blade area, and holds all the way to a soft
+ *     outer falloff. No term anywhere is allowed to reach zero between lobes
+ *     or to peak at one radius: a narrow bright annulus *is* the wireframe
+ *     hoop, and a modulation that bottoms out at zero *is* the filament fan.
+ *     Both the blade arcs and the blur streaks are shallow modulations of a
+ *     solid disc (0.72…1.0 and ±13 %), never the disc itself.
+ *
+ *  2. **Blade-paint colour, not sky colour.** Mid-value, sun-graded across the
+ *     azimuth so one half of the annulus is lit and the other skylit, with a
+ *     strong forward-scatter lift when the sun is ahead of the aeroplane —
+ *     which is what saves the golden-hour frame, where the disc is genuinely
+ *     luminous.
+ *
+ *  3. **Painted tips as a tint, not as alpha.** The yellow tip band is a wide,
+ *     low-contrast colour shift over the outer third with only a 25 % alpha
+ *     lift where a blade currently is. The previous 0.20 *additive* tip spike
+ *     at a 0.055-wide Gaussian was the bright rim line the critique called out
+ *     in four separate frames.
+ *
+ * The composite stays premultiplied ('One / OneMinusSrcAlpha'): with a colour
+ * that can be either side of the background it both attenuates and adds, which
+ * is exactly what a partly transparent lit medium does.
  *
  * Everything is driven off two per-view uniforms ('uOpacity' from the rpm
  * cross-fade, 'uPhase' from the hub angle) plus the shared cel globals, so one
@@ -208,6 +240,7 @@ varying vec2 vP;
 varying vec2 vSun;
 varying float vSunZ;
 varying float vDepth;
+varying float vFace;
 
 void main() {
   vP = position.xy / uRadius;
@@ -225,6 +258,20 @@ void main() {
 
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   vDepth = -mv.z;
+
+  // How square-on the disc is to the lens.
+  //
+  // The blur is a *volume* of swept blade, not a decal, so the path length the
+  // eye looks through is 1/cos of the viewing angle. Seen edge-on the annulus
+  // covers a handful of pixels and every one of them is looking through the
+  // whole width of the sweep, which is why a propeller photographed from the
+  // beam is a dense dark sliver rather than an invisible line. Without this,
+  // the same alpha that reads face-on disappears entirely at the angles the
+  // 'clouds' and 'hero' framings use.
+  vec3 axis = normalize((modelViewMatrix * vec4(0.0, 0.0, 1.0, 0.0)).xyz);
+  vec3 toEye = normalize(-mv.xyz);
+  vFace = abs(dot(axis, toEye));
+
   gl_Position = projectionMatrix * mv;
 }
 `;
@@ -236,6 +283,7 @@ uniform vec3 uAerialColor;
 uniform vec3 uTip;
 uniform float uAerialFar;
 uniform float uAerialStrength;
+uniform float uKeyLevel;
 uniform float uOpacity;
 uniform float uPhase;
 uniform float uBlades;
@@ -243,6 +291,7 @@ varying vec2 vP;
 varying vec2 vSun;
 varying float vSunZ;
 varying float vDepth;
+varying float vFace;
 
 void main() {
   float r = length(vP);
@@ -250,42 +299,68 @@ void main() {
   vec2 dir = r > 1e-4 ? vP / r : vec2(1.0, 0.0);
   float ang = atan(dir.y, dir.x);
 
-  // Spinner and blade cuffs occupy the inboard third: nothing smears there.
-  float hub = smoothstep(0.17, 0.44, r);
-  // Soft outer falloff. Without it the disc reads as a cut ellipse against
-  // the sky, which is the defect the art director found in water.png.
-  float edge = 1.0 - smoothstep(0.945, 1.0, r);
-  // Paddle-blade chord distribution, peaking a little outboard of mid-span.
-  float chord = exp(-pow((r - 0.64) / 0.40, 2.0));
+  // --- density: one monotone ramp out of the hub ---------------------------
+  // The spinner fills the inboard fifth. The ramp out of it is smooth and
+  // short: too long and the disc is a ring with a hole punched in it rather
+  // than a smear centred on the nose.
+  float hub = smoothstep(0.06, 0.30, r);
+  // Soft outer falloff, wide enough that the rim can never draw a line.
+  float edge = 1.0 - smoothstep(0.82, 1.0, r);
+  // Blade area swept per unit annulus. Chord peaks a little outboard of
+  // mid-span, and because the pitch flattens toward the tip the projected
+  // smear stays thick all the way out — so this is a broad hump on a
+  // substantial floor, never a lobe that closes to nothing.
+  float chord = 0.54 + 0.46 * exp(-pow((r - 0.72) / 0.50, 2.0));
 
-  // Blade-count arcs, advanced by the hub phase. The power narrows each lobe
-  // into a streak rather than a broad scallop.
+  // Blade-count arcs, advanced by the hub phase. Shallow: this modulates a
+  // solid disc, it is not the disc.
   float sweep = 0.5 + 0.5 * cos(ang * uBlades - uPhase * uBlades);
-  float streak = pow(sweep, 2.0);
-  // Finer filaments: the shed vorticity that makes a real disc look grainy
-  // instead of airbrushed. Drifting slowly against the arcs breaks up any
-  // stationary pattern.
-  float grain = 0.66 + 0.34 * sin(ang * 23.0 + uPhase * 1.6 + r * 15.0);
+  float arc = 0.72 + 0.28 * sweep * sweep;
+  // Blade-blur streaks — the fine radial texture of a real disc. Bounded to
+  // +-13 % so it can decorate the smear but never become the only thing left
+  // of it, which is what the previous 0.66 + 0.34 grain term did over a bright
+  // sky: the troughs went to zero alpha and only the crests survived, as a fan
+  // of white hairs off the nose.
+  float streak = 1.0 + 0.13 * sin(ang * uBlades * 4.0 - uPhase * uBlades * 4.0 + r * 9.0);
 
-  // One half of the disc has the blade backs turned to the sun.
-  float lit = 0.55 + 0.45 * dot(dir, vSun);
-  // Sun ahead of the aeroplane means we are looking at a backlit disc, which
-  // scatters hard — this is what saves the sunset frame.
-  float glow = 0.85 + 0.75 * clamp(vSunZ, 0.0, 1.0);
+  // Optical thickness of the annulus, thickened by the slant path length (see
+  // vFace), then turned into coverage through Beer-Lambert. Going through the
+  // exponential rather than using the thickness directly is what keeps the
+  // grazing-angle case honest: the slant term can double the path without ever
+  // pushing the disc past the roughly two-thirds opacity a real one reaches,
+  // and it softens the outer falloff into a curve with no terminating edge.
+  float slant = mix(1.5, 1.0, smoothstep(0.0, 0.55, vFace));
+  // Thinned right up close. From the cockpit the disc is two and a half metres
+  // from the eye and fills most of the windscreen, and at the density that
+  // reads correctly from twenty metres it becomes a structureless warm wash
+  // over the gunsight. A pilot cannot focus on it either — at that distance it
+  // is a shimmer, not a surface.
+  float near = mix(0.45, 1.0, smoothstep(2.0, 7.0, vDepth));
+  float tau = 1.10 * near * slant * hub * edge * chord * arc * streak;
+  float a = 1.0 - exp(-tau);
 
-  float a = hub * edge * (0.045 + 0.110 * chord)
-          * (0.35 + 1.15 * streak) * grain * lit * glow;
+  // --- colour: blade paint, not sky ----------------------------------------
+  // Which half of the annulus has its blade faces turned to the sun. This is
+  // the gradient that makes the disc read as a rotating solid rather than as
+  // a decal, and it works at every view angle because it is computed in the
+  // propeller's own frame.
+  float lit = 0.5 + 0.5 * dot(dir, vSun);
+  // Sun ahead of the aeroplane: we are looking *through* a backlit blur, which
+  // forward-scatters hard. This is what makes the golden-hour disc luminous.
+  float glow = clamp(vSunZ, 0.0, 1.0);
 
-  // Painted tips, smeared into a hot ring and brightest where a blade is now.
-  // Wide and soft on purpose. A narrow, opaque ring reads as a wireframe hoop
-  // hanging in front of the nose rather than as paint being swept round at
-  // 250 m/s, and that is exactly what it looked like at half this width.
-  float tipRing = exp(-pow((r - 0.930) / 0.055, 2.0)) * edge;
-  float tipHot = tipRing * (0.28 + 0.72 * pow(sweep, 5.0));
-  a += tipHot * 0.20 * glow;
+  vec3 skylit = uSkyColor * 0.44;
+  vec3 sunlit = uSunColor * uKeyLevel * 0.115;
+  vec3 col = mix(skylit, sunlit, clamp(lit * 0.85 + 0.10, 0.0, 1.0));
+  col += sunlit * (0.95 * glow * (0.35 + 0.65 * lit));
 
-  vec3 col = mix(uSkyColor * 1.30, uSunColor, 0.60) * (0.70 + 0.60 * lit) * glow;
-  col = mix(col, uSunColor * 1.7 + uTip * 0.5, clamp(tipHot * 1.3, 0.0, 1.0));
+  // Painted tips: a wide, low-contrast warm band over the outer third, with
+  // only a small alpha lift where a blade currently is. As a tint it reads as
+  // paint being swept round at 250 m/s; as an alpha spike — which is what it
+  // used to be — it reads as a wire hoop hung in front of the nose.
+  float tipBand = smoothstep(0.58, 0.94, r) * edge;
+  col = mix(col, uTip * (0.30 + 0.55 * lit) + sunlit * 0.45, tipBand * 0.30);
+  a *= 1.0 + 0.22 * tipBand * sweep;
 
   // Same aerial-perspective ramp the hull uses, so a distant disc sits in the
   // same haze as the aeroplane carrying it.
@@ -300,6 +375,7 @@ void main() {
 /** Uniform names that must stay shared with 'celGlobals' across a clone. */
 export const PROP_DISC_SHARED_UNIFORMS = [
   'uSunDir', 'uSunColor', 'uSkyColor', 'uAerialColor', 'uAerialFar', 'uAerialStrength',
+  'uKeyLevel',
 ];
 
 export function createPropDiscMaterial(spec: AircraftSpec, discRadius: number): THREE.ShaderMaterial {
@@ -312,6 +388,7 @@ export function createPropDiscMaterial(spec: AircraftSpec, discRadius: number): 
       uAerialColor: celGlobals.uAerialColor,
       uAerialFar: celGlobals.uAerialFar,
       uAerialStrength: celGlobals.uAerialStrength,
+      uKeyLevel: celGlobals.uKeyLevel,
       uTip: { value: new THREE.Color(spec.livery.accent) },
       uRadius: { value: discRadius },
       uBlades: { value: Math.max(2, spec.engine.blades) },

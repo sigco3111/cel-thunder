@@ -52,7 +52,7 @@ import type { SurfaceCut } from './wing';
 import { foilsFor, naca } from './naca';
 import { MeshBuilder, boxGeom, makeHinge, mergeGeoms, quadGeom, triCount, trs } from './geom';
 import { buildCanopy, canopyOpening, makeGlassStreakTexture } from './canopy';
-import { buildCockpit, buildCockpitAtlas } from './cockpit';
+import { attachCockpitLighting, buildCockpit, buildCockpitAtlas, cockpitLightRig } from './cockpit';
 import { buildPropeller, createPropDiscMaterial } from './propeller';
 import { buildGear } from './gear';
 import { buildDetails } from './details';
@@ -176,6 +176,12 @@ const IMPOSTER_DIST = 6000;
 
 /** Where the outer wing panel starts — outboard of every flap, inboard of none. */
 const WING_SPLIT = 0.52;
+
+/**
+ * Where the blurred disc's plane sits along the spinner, as a fraction of the
+ * spinner's length forward of the hub. See the note at its first use.
+ */
+const DISC_STATION = 0.45;
 
 // ---------------------------------------------------------------------------
 // Shared (cross-type) assets
@@ -586,9 +592,19 @@ function buildTemplate(spec: AircraftSpec, opts: BuildOptions): Template {
   // emissive is the cheapest honest stand-in: it lifts each surface in
   // proportion to what it is painted, so the dial faces come up and the black
   // crackle finish stays black.
+  //
+  // The emissive feedback is now a *floor*, not the lighting. At 0.60 it was
+  // adding six tenths of every surface's own albedo to every surface at once,
+  // which is the definition of flat: no facing, no depth and no direction had
+  // any effect on how bright anything was, and four rounds of critique called
+  // the interior unlit because it effectively was. 'attachCockpitLighting'
+  // below supplies the real thing — a traced sun through the canopy aperture
+  // with the framing's shadow in it, a skylight term shaped by the same
+  // aperture, and a warm bounce off the panel — so this drops to the level that
+  // only keeps a dial legible when the cockpit is genuinely in shadow.
   const cockpitMat = createCelMaterial({
     map: cockpitAtlas.texture,
-    emissive: 0xffd9b0, emissiveMap: cockpitAtlas.texture, emissiveIntensity: 0.60,
+    emissive: 0xffd9b0, emissiveMap: cockpitAtlas.texture, emissiveIntensity: 0.28,
     bands: 3, bandSoftness: 0.07, gloss: 0.20, specular: 0.30, specSteps: 2,
     rimStrength: 0.30, rimPower: 3.4, terminatorWidth: 0.16,
     // Nearly neutral, warmed a hair. The hull's cool skylight tint is right for
@@ -606,7 +622,27 @@ function buildTemplate(spec: AircraftSpec, opts: BuildOptions): Template {
     name: `gunsight_${spec.id}`,
   });
 
-  const materials: THREE.Material[] = [hull, glass, discMat, cockpitMat, sightMat];
+  // Pressed glass over the dial cans. Almost no albedo — it is a surface that
+  // exists to carry one hard specular crescent per instrument and a thin cold
+  // rim round the crown, which is the cue that says "there is glass over that
+  // dial" without hiding the dial. specSteps 1 so the highlight is one shape
+  // with an ink edge rather than a smooth lobe.
+  const dialGlassMat = createCelMaterial({
+    map: cockpitAtlas.texture,
+    color: 0xc9d6dc, transparent: true, opacity: 0.16, depthWrite: false,
+    bands: 2, bandSoftness: 0.02, gloss: 0.015, specular: 3.2, specSteps: 1,
+    rimStrength: 0.60, rimPower: 3.0, shadowTint: 0xc6d2de,
+    name: `dialglass_${spec.id}`,
+  });
+
+  // Everything inside the glasshouse is lit by the glasshouse. See
+  // 'attachCockpitLighting'.
+  const ckRig = cockpitLightRig(spec, prof);
+  attachCockpitLighting(cockpitMat, ckRig);
+  attachCockpitLighting(sightMat, ckRig);
+  attachCockpitLighting(dialGlassMat, ckRig);
+
+  const materials: THREE.Material[] = [hull, glass, discMat, cockpitMat, sightMat, dialGlassMat];
   const geometries: THREE.BufferGeometry[] = [];
   const textures: THREE.Texture[] = [cockpitAtlas.texture];
   const triangles: number[] = [];
@@ -617,6 +653,7 @@ function buildTemplate(spec: AircraftSpec, opts: BuildOptions): Template {
   for (const d of DETAILS) {
     const grp = buildLevel(spec, prof, plans, cuts, d, {
       hull, glass, discMat, dial: sh.dialMat, cockpit: cockpitMat, sight: sightMat,
+      dialGlass: dialGlassMat,
     }, geometries);
     let tris = 0;
     grp.traverse((o) => {
@@ -654,7 +691,7 @@ function buildTemplate(spec: AircraftSpec, opts: BuildOptions): Template {
 
 interface LevelMats {
   hull: CelMaterial; glass: CelMaterial; discMat: THREE.Material; dial: CelMaterial;
-  cockpit: CelMaterial; sight: CelMaterial;
+  cockpit: CelMaterial; sight: CelMaterial; dialGlass: CelMaterial;
 }
 
 function buildLevel(
@@ -746,7 +783,10 @@ function buildLevel(
     const discGeo = prop.disc;
     ownedGeoms.push(discGeo);
     const disc = mesh(discGeo, mats.discMat, 'propDisc', true);
-    disc.position.set(0, 0, prop.hubZ);
+    // Same plane as LOD0/1 — see the note there. A disc that sits at a
+    // different station per LOD visibly jumps forward along the nose when the
+    // aeroplane crosses a threshold.
+    disc.position.set(0, 0, prop.hubZ + prop.spinnerLen * DISC_STATION);
     disc.renderOrder = 4;
     // A translucent smear must never be in the shadow map: it casts a hard
     // black ellipse on the wing and on the ground beneath the aeroplane.
@@ -816,7 +856,13 @@ function buildLevel(
     grp.add(propGrp);
 
     const disc = mesh(prop.disc, mats.discMat, 'propDisc', true);
-    disc.position.set(0, 0, prop.hubZ + 0.02);
+    // Part way along the spinner, not at its base. The blade roots emerge from
+    // the middle of the cone, and a disc plane behind the whole spinner is
+    // seen from any quarter view as a ring sitting *behind* the nose with the
+    // spinner sticking out through it — which is what "the disc does not
+    // encircle the spinner, there is clear sky between the arc and the nose"
+    // was describing in the sunset, low and clouds frames.
+    disc.position.set(0, 0, prop.hubZ + prop.spinnerLen * DISC_STATION);
     disc.renderOrder = 4;
     disc.visible = false;
     disc.castShadow = false;
@@ -882,9 +928,20 @@ function buildLevel(
   // ---- cockpit -------------------------------------------------------------
   if (d.cockpit) {
     const cp = buildCockpit(spec, prof);
-    ownedGeoms.push(cp.interior, cp.sightGlass, cp.pilot);
+    ownedGeoms.push(cp.interior, cp.sightGlass, cp.dialGlass, cp.pilot);
     const interior = mesh(cp.interior, mats.cockpit, 'cockpitInterior', true);
     interior.castShadow = false;
+    // Nothing in the box receives the cascade, and that is the point.
+    //
+    // The cascaded map covers a 64 km world, so its near cascade has texels
+    // the size of the whole aeroplane: the fuselage and hood are one opaque
+    // blob in it and every interior surface samples as fully shadowed. That is
+    // why the panel stayed black no matter what the sun was doing — it was not
+    // that no light reached it, it was that the shadow map said the aeroplane
+    // was on top of it. 'attachCockpitLighting' traces the real occluders
+    // analytically at whatever resolution the fragment needs, so the cascade
+    // has nothing left to contribute here except a false negative.
+    interior.receiveShadow = false;
     interior.layers.enable(LAYER_COCKPIT);
     grp.add(interior);
 
@@ -892,10 +949,21 @@ function buildLevel(
     // graticule blooms the way a projected image on glass does.
     const sight = mesh(cp.sightGlass, mats.sight, 'gunsightGlass', true);
     sight.castShadow = false;
+    sight.receiveShadow = false;
     sight.renderOrder = 5;
     sight.layers.enable(LAYER_COCKPIT);
     sight.layers.enable(LAYER_BLOOM);
     grp.add(sight);
+
+    // Dial covers. Drawn after the panel and after the needles so the glass is
+    // over the instrument rather than under it, and with depthWrite off so a
+    // fourteen-piece transparent layer cannot punch holes in what is behind it.
+    const dg = mesh(cp.dialGlass, mats.dialGlass, 'dialGlass', true);
+    dg.castShadow = false;
+    dg.receiveShadow = false;
+    dg.renderOrder = 4;
+    dg.layers.enable(LAYER_COCKPIT);
+    grp.add(dg);
 
     // Needles: the pivot carries the panel rake and nothing else, so whatever
     // drives the instruments only ever writes 'rotation.z' — a needle angle in
@@ -909,6 +977,7 @@ function buildLevel(
       ownedGeoms.push(n.geometry);
       const nm = mesh(n.geometry, mats.cockpit, `needleMesh_${n.name}`, true);
       nm.castShadow = false;
+      nm.receiveShadow = false;
       nm.layers.enable(LAYER_COCKPIT);
       pivot.add(nm);
       grp.add(pivot);
@@ -916,6 +985,7 @@ function buildLevel(
 
     const pilot = mesh(cp.pilot, mats.cockpit, 'pilot', true);
     pilot.castShadow = false;
+    pilot.receiveShadow = false;
     grp.add(pilot);
 
     const eye = new THREE.Object3D();

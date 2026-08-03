@@ -267,7 +267,14 @@ export class TelemetryModel {
     if (!own.has('roll')) {
       // Roll = angle of the body-right vector out of the horizontal plane,
       // signed against the world-up projection so it stays continuous inverted.
-      const rightY = bodyRight.y;
+      //
+      // Body +X is the aeroplane's *screen-left* wing — X-right/Y-up/Z-forward
+      // is a left-handed labelling and the world is right-handed, so the axis
+      // the model calls "right" renders on the left (measured: body +X · camera
+      // screen-right = −0.999). Negating here makes a positive roll mean "the
+      // wing the pilot can see on their right is down", which is what the bank
+      // scale and the horizon are drawn against.
+      const rightY = -bodyRight.y;
       const upY = bodyUp.y;
       d.roll = Math.atan2(-rightY, upY < 0 ? -Math.abs(upY) : Math.abs(upY)) * 57.29577951;
       if (upY < 0) d.roll = d.roll > 0 ? 180 - d.roll : -180 - d.roll;
@@ -290,7 +297,9 @@ export class TelemetryModel {
     if (speed > 4) {
       const u = vx * bodyFwd.x + vy * bodyFwd.y + vz * bodyFwd.z;
       const w = vx * bodyUp.x + vy * bodyUp.y + vz * bodyUp.z;
-      const s = vx * bodyRight.x + vy * bodyRight.y + vz * bodyRight.z;
+      // Negated with the roll, and for the same reason: body +X is the wing on
+      // the pilot's left, so an unnegated sideslip reads backwards on the ball.
+      const s = -(vx * bodyRight.x + vy * bodyRight.y + vz * bodyRight.z);
       if (!own.has('aoa')) d.aoa = Math.atan2(-w, Math.max(1, u)) * 57.29577951;
       if (!own.has('beta')) d.beta = Math.asin(clamp(s / speed, -1, 1)) * 57.29577951;
     } else if (!own.has('aoa')) {
@@ -312,7 +321,7 @@ export class TelemetryModel {
       this.hasPrev = true;
 
       const gRaw = (accel.x * bodyUp.x + accel.y * bodyUp.y + accel.z * bodyUp.z) / 9.80665;
-      const slipRaw = (accel.x * bodyRight.x + accel.y * bodyRight.y + accel.z * bodyRight.z) / 9.80665;
+      const slipRaw = -(accel.x * bodyRight.x + accel.y * bodyRight.y + accel.z * bodyRight.z) / 9.80665;
       if (!own.has('gLoad')) {
         // The raw differentiated value is noisy at 20 Hz snapshot rate; a short
         // filter matches the mechanical lag of a real g-meter anyway.

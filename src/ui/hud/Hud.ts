@@ -182,6 +182,19 @@ export class Hud {
     setClass(this.root, 'is-off', !on);
   }
 
+  /**
+   * Tells the HUD the camera is inside the cockpit.
+   *
+   * Only the centre stack cares: the ladder has to be occluded by the coaming
+   * and the convergence bracket has to go, because the reflector sight's own
+   * frame already brackets the aiming point. Everything else — tapes, systems,
+   * minimap, contact labels — is head-up furniture that reads the same either
+   * way.
+   */
+  setCockpitView(on: boolean): void {
+    this.center.setCockpit(on);
+  }
+
   /** Dims the whole HUD (used during the killcam ramp and in menus). */
   setDim(on: boolean): void {
     setClass(this.root, 'is-dim', on);

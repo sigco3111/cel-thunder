@@ -759,6 +759,9 @@ export class UiSystem implements Subsystem {
   /** Seconds since the UI came up; gates boot-time chatter. */
   private age = 0;
 
+  private cameraSys: (Subsystem & { mode?: string }) | null = null;
+  private wasCockpit = false;
+
   update(ctx: GameContext): void {
     const dt = ctx.dt;
     this.age += dt;
@@ -767,6 +770,18 @@ export class UiSystem implements Subsystem {
     if (ctx.settings.showHud !== this.prefs.showHud) {
       this.prefs.showHud = ctx.settings.showHud;
       this.hud.setVisible(this.screen === 'flight' && this.prefs.showHud);
+    }
+
+    // The centre HUD needs to know when it is being drawn inside a cockpit, and
+    // the camera does not announce it: screenshot framings assign the mode
+    // directly rather than going through 'setMode', so there is no event to
+    // listen for. Reading the subsystem is what the registry is for, and the
+    // lookup is cached because it cannot change after boot.
+    if (!this.cameraSys) this.cameraSys = ctx.get<Subsystem & { mode?: string }>('camera') ?? null;
+    const inCockpit = this.cameraSys?.mode === 'cockpit';
+    if (inCockpit !== this.wasCockpit) {
+      this.wasCockpit = inCockpit;
+      this.hud.setCockpitView(inCockpit);
     }
 
     // Dimming is derived, never latched: every path that opens or closes an

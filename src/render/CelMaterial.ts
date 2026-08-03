@@ -420,7 +420,7 @@ export function createCelMaterial(p: CelMaterialParams = {}): CelMaterial {
           // Coloured shadows, not grey ones. Take the *hue* of the sky and of
           // the art-directed tint — both normalised to unit luminance first, so
           // this is a chroma shift and not a second darkening — and swing the
-          // fill toward it wherever the key has dropped out. The extra 18 %
+          // fill toward it wherever the key has dropped out. The extra
           // darkening is what separates a cast shadow from a shaded face.
           vec3 skyHue  = uSkyColor    / max( dot( uSkyColor,    CEL_LUMA ), 1e-3 );
           vec3 tintHue = uShadowTint  / max( dot( uShadowTint,  CEL_LUMA ), 1e-3 );
@@ -429,7 +429,18 @@ export function createCelMaterial(p: CelMaterialParams = {}): CelMaterial {
           // grey shadow, which the rubric fails outright.
           vec3 shadeHue = max( mix( vec3( 1.0 ), mix( skyHue, tintHue, 0.55 ), 1.55 ), vec3( 0.0 ) );
           shadeHue = mix( vec3( 1.0 ), shadeHue, shadowMask * 0.85 );
-          ambient *= shadeHue * ( 1.0 - 0.18 * shadowMask );
+          // 0.30, not the 0.18 this shipped with. The number is a *form-shadow
+          // depth*, and it is the only term in the shader that can separate a
+          // surface turned away from the sun from a surface next to it that is
+          // not — which is the whole of the "the aeroplane is camouflaged into
+          // the ground" failure. Measured on the dogfight framing, the port
+          // wing's upper surface sat at (54,71,87) against terrain immediately
+          // behind it at (50,71,83): four levels, held only by the ink stroke
+          // and the roundel. It is safe to make deep because 'shadowMask' is
+          // derived from the resolved key, so it is zero on everything the sun
+          // reaches: the sunlit terrain the wing is seen against does not move
+          // at all, and only the surfaces that are genuinely in shade drop.
+          ambient *= shadeHue * ( 1.0 - 0.30 * shadowMask );
           reflectedLight.indirectDiffuse += ambient;
 
           // --- warm terminator ---------------------------------------------
@@ -482,12 +493,58 @@ export function createCelMaterial(p: CelMaterialParams = {}): CelMaterial {
           // behind the subject the rim runs up to five times the front-lit
           // value, tracing the wing leading edge, the canopy and the tailplane
           // in sun colour.
-          float fres = pow( 1.0 - max( dot( N, V ), 0.0 ), uRimPower );
+          //
+          // THE BACKLIT BOOST RIDES A *TIGHTER* FRESNEL THAN THE BASE TERM, and
+          // that is the whole reason the airframe used to sit at the same value
+          // as everything behind it. Worked through at the hull's authored
+          // 0.34 / power 7: a wing panel at 45 degrees has fres = 0.093, and
+          // with the boost applied to that same fres it collected
+          //     keyLevel(3) * 0.62 * 0.093 * 2.60 * 0.34 = 0.153
+          // of untinted white — on a Dark Earth albedo of 0.15, i.e. a doubling
+          // — across *every interior panel of a near-planar wing at once*,
+          // because eight of the ten framings are lit 70-110 degrees off the
+          // lens and 'backlit' is near 1 in all of them. That is a flat pale
+          // wash sitting exactly where the form's own value structure should
+          // be, and it is why the water framing read as a grey-mauve cut-out
+          // and the dogfight wing measured five levels off the terrain behind
+          // it. Squaring the Fresnel for the boost only (doubling its effective
+          // exponent) takes that 45-degree panel from 0.153 to 0.038 — a
+          // four-fold cut — while the silhouette itself, where N·V is 0.05 and
+          // fres is 0.72, keeps 87 % of its old peak. The rim gets narrower and
+          // the shape underneath it gets its range back.
+          float ndv = max( dot( N, V ), 0.0 );
+          float fres = pow( 1.0 - ndv, uRimPower );
+          float tight = fres * fres;
           float backlit = smoothstep( -0.15, 0.85, -dot( L, V ) );
           float wrap = smoothstep( -0.50, 0.10, ndl );
-          float rim = fres * wrap * ( 0.40 + 2.20 * backlit );
+          float rim = wrap * ( 0.40 * fres + 2.60 * backlit * tight );
           reflectedLight.directDiffuse +=
             uRimColor * uSunColor * ( uKeyLevel * 0.62 ) * rim * uRimStrength;
+
+          // --- silhouette edge light ----------------------------------------
+          // The term above is a *wrap* light: authored wide, so it models the
+          // way light bends round a form. What separates a planform from
+          // terrain of the same value is a different thing — a hot line one or
+          // two pixels inside the ink stroke, along the wing leading edge, the
+          // tip, the fin and the tailplane.
+          //
+          // Fixed exponent 14, deliberately not the authored uRimPower: at the
+          // silhouette (N·V = 0.05) this is 0.49, and on a panel only 45
+          // degrees off the lens it is 3e-8. It is therefore impossible for it
+          // to wash an interior surface no matter how the material is authored,
+          // which is exactly the property the wrap term does not have. Scaled
+          // by uRimStrength so terrain (0.04) and foliage keep it at a level
+          // where a mountain flank cannot grow a halo.
+          //
+          // Net effect on the hull at key 3: the silhouette goes from 1.18 to
+          // 1.78 of sun colour — half a stop hotter and confined to a couple of
+          // pixels — while the interior panels it used to leak onto are down by
+          // four. That trade is the whole item: a bright line just inside the
+          // ink stroke, and a darker, wider-ranged shape behind it.
+          float edge = ndv < 1.0 ? pow( 1.0 - ndv, 14.0 ) : 0.0;
+          reflectedLight.directDiffuse +=
+            uRimColor * uSunColor * ( uKeyLevel * 0.62 )
+            * edge * smoothstep( -0.32, 0.28, ndl ) * uRimStrength * 2.40;
 
           // --- sky rim ------------------------------------------------------
           // A cool counter-rim from the sky hemisphere on the shadow side.
@@ -496,9 +553,20 @@ export function createCelMaterial(p: CelMaterialParams = {}): CelMaterial {
           // falloff is deliberately tighter than the sun rim's — a broad one
           // washes a fully backlit aircraft into a pale blob instead of
           // leaving it the dark graphic shape the shot is built around.
-          float skyFres = fres * fres;
           reflectedLight.directDiffuse +=
-            uSkyColor * skyFres * ( 1.0 - smoothstep( -0.1, 0.35, ndl ) ) * uRimStrength * 1.20;
+            uSkyColor * ( tight * 0.55 + edge * 1.30 )
+            * ( 1.0 - smoothstep( -0.1, 0.35, ndl ) ) * uRimStrength * 1.20;
+
+          // --- underside contact darkening ----------------------------------
+          // A wing's underside sees ground bounce, not sky, and the hemispheric
+          // fill above already knows that. What it does not know is that the
+          // surfaces facing *straight* down are the ones a viewer reads as the
+          // aircraft's contact with the world: leave them at the fill's value
+          // and the belly, the flap undersides and the tailplane underside all
+          // land within a few levels of the terrain they are seen against, and
+          // the planform stops having a bottom edge. Terrain and water never
+          // face downward, so this is an airframe term in practice.
+          reflectedLight.indirectDiffuse *= 1.0 - 0.30 * smoothstep( 0.10, -0.60, N.y );
 
           // --- ink hatching in the darkest band -----------------------------
           if ( uHatch > 0.5 ) {

@@ -290,9 +290,27 @@ export class NetSystem implements Subsystem {
     return frame;
   }
 
+  /**
+   * Asks for a spawn.
+   *
+   * Online the server is authoritative and answers with its own entity id.
+   * Offline the sandbox owns the actor list, so we must ASK it rather than
+   * invent an id: fabricating one (this used to emit 'entityId: 1') re-bound
+   * the local flight state to an entity that did not exist, at the world
+   * origin — which on this map is ~800 m below the terrain surface. The gear
+   * then resolved a 6.5e8 N ground contact, the airframe was destroyed on the
+   * first tick, and the aircraft could never exceed a 46 km/h ground scrape.
+   * That is the difference between "the renderer works" and "the game is
+   * playable", so the id must always come from whoever actually owns actors.
+   */
   requestSpawn(aircraft: string): void {
-    if (this.connected) this.ws?.send(JSON.stringify({ t: 'spawn', aircraft }));
-    else this.ctx.bus.emit('net:spawned', { entityId: 1, aircraft });
+    if (this.connected) {
+      this.ws?.send(JSON.stringify({ t: 'spawn', aircraft }));
+      return;
+    }
+    // The offline sandbox listens for this and replies with 'net:spawned'
+    // carrying the real entity id once the actor exists.
+    this.ctx.bus.emit('game:spawnRequest', { aircraft });
   }
 
   sendChat(text: string): void {

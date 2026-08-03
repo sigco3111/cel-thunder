@@ -281,10 +281,15 @@ export class MouseAimController {
     const bankCos = view.up.dot(WORLD_UP);
     const bankSin = view.right.dot(WORLD_UP);
     const bankAngle = Math.atan2(bankSin, bankCos);   // = −bank for right-wing-low
-    // Do not try to level while pointing steeply up or down (the bank angle is
-    // ill-conditioned there) or while inverted.
+    // Do not try to level while pointing steeply up or down: bank angle is
+    // ill-conditioned near the vertical and the roll it asks for there is
+    // meaningless. Inverted, though, it must still work — 'atan2' already
+    // returns the angle past 90°, so driving it to zero rolls out the short
+    // way. Refusing to level while inverted (which this used to do) meant that
+    // letting go of the mouse after any hard turn left the aeroplane on its
+    // back, and it simply flew into the ground from there.
     const pitchAttitude = Math.asin(clampSym(view.forward.y));
-    const levelValid = Math.abs(pitchAttitude) < 1.05 && bankCos > -0.1;
+    const levelValid = Math.abs(pitchAttitude) < 1.05;
     const levelErr = levelValid ? bankAngle * this.cfg.levelAssist : 0;
 
     this.rollError = rollAim * aimAuthority + levelErr * (1 - aimAuthority);
@@ -474,13 +479,36 @@ export class MouseAimController {
     out.y = clampSym(_e.y * k);
   }
 
-  /** Rebuilds the world reticle from a normalised wire aim (used when replaying). */
-  fromWireAim(view: AircraftView, x: number, y: number): void {
+  /**
+   * Places the reticle at a normalised screen position, [-1,1] with +Y up.
+   *
+   * Used for the unlocked-cursor fallback (before the player's first click, and
+   * anywhere pointer lock is denied) and when replaying a recorded aim.
+   *
+   * 'right' and 'up' are the CAMERA's world axes, and that is the whole point.
+   * This used to build the offset in the aircraft's own body frame, which meant
+   * "cursor to the right of the screen" was read as "target off my right
+   * wingtip" no matter how the aeroplane was banked. The director's job is to
+   * roll until the error sits above the nose and then pull; with the error
+   * pinned to the body's right by construction it could never get there, so it
+   * commanded full aileron forever. The aeroplane barrel-rolled continuously,
+   * never turned, never pulled a g, and mushed into the ground — which is what
+   * "unflyable" looks like from the cockpit.
+   */
+  fromWireAim(
+    view: AircraftView, x: number, y: number,
+    right: THREE.Vector3, up: THREE.Vector3,
+  ): void {
     const perp = Math.hypot(x, y);
     if (perp < 1e-6) { this.aimRaw.copy(view.forward); this.aimDir.copy(view.forward); return; }
     const theta = Math.min(1, perp) * this.cfg.cone;
-    _e.set((x / perp) * Math.sin(theta), (y / perp) * Math.sin(theta), Math.cos(theta));
-    this.aimRaw.copy(_e).applyQuaternion(view.quat).normalize();
-    this.aimDir.copy(this.aimRaw);
+    const s = Math.sin(theta) / perp;
+    // Offset from the nose along the screen axes the player is looking through.
+    _e.copy(view.forward).multiplyScalar(Math.cos(theta))
+      .addScaledVector(right, x * s)
+      .addScaledVector(up, y * s)
+      .normalize();
+    this.aimRaw.copy(_e);
+    this.aimDir.copy(_e);
   }
 }

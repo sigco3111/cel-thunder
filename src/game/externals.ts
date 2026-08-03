@@ -75,6 +75,18 @@ export type FlightState = Record<string, unknown>;
 export interface FlightModule {
   createFlightState(spec: AircraftSpec, pos: V3, rot: Q): FlightState;
   stepFlight(state: FlightState, spec: AircraftSpec, input: InputFrame, env: FlightEnv, dt: number): void;
+  /**
+   * Primes a fresh state for an air start — engine warm and turning, gear up,
+   * blade angle governed for the speed. Optional because the fallback model
+   * has no powerplant to prime, but when the shared model is in use the client
+   * MUST call it: 'createFlightState' leaves the engine cold and idling with
+   * the gear down, and predicting from that against a server that air-started
+   * properly diverges immediately.
+   */
+  spawnInFlight?(
+    state: FlightState, spec: AircraftSpec, env: FlightEnv,
+    altitude: number, speed: number, heading: number, throttle?: number,
+  ): void;
 }
 
 export interface TerrainSampler {
@@ -195,6 +207,9 @@ async function resolveAll(mapSeed: number): Promise<Externals> {
     ? ({
       createFlightState: flMod.createFlightState as FlightModule['createFlightState'],
       stepFlight: flMod.stepFlight as FlightModule['stepFlight'],
+      spawnInFlight: isFn(flMod.spawnInFlight)
+        ? (flMod.spawnInFlight as FlightModule['spawnInFlight'])
+        : undefined,
     })
     : null;
   notes.push(flight ? 'flight=shared' : 'flight=fallback');

@@ -1,8 +1,10 @@
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createServer } from 'node:http';
-import { Room, type Env } from './Room';
+import { Room, type Env, type SpawnSite } from './Room';
 import { C2S, S2C, TICK_HZ, PROTOCOL_VERSION } from '../src/shared/protocol';
-import { v3, type V3 } from '../src/shared/math';
+import { type V3 } from '../src/shared/math';
+import { airDensity, windAt, windField } from '../src/shared/environment';
+import { getHeightfield, type Heightfield } from '../src/world/heightfield';
 
 /**
  * Authoritative game server.
@@ -15,45 +17,44 @@ import { v3, type V3 } from '../src/shared/math';
 
 const PORT = Number(process.env.PORT ?? 8791);
 const MAX_PER_ROOM = 16;
+const MAP_SEED = 1337;
 
 // ---------------------------------------------------------------------------
-// Environment — the server's view of the world. Terrain comes from the same
-// deterministic heightfield the client renders, so hit tests agree.
+// Environment — the server's view of the world.
+//
+// Terrain MUST come from the same baked heightfield the client renders, and
+// air/wind from the same shared module the client predicts with. This used to
+// probe for free 'terrainHeight'/'terrainNormal' exports that the world module
+// never had, silently leaving the server on flat ground while the client flew
+// over 2 km mountains: the client's wheels then sat 800 m under its own
+// terrain, the undercarriage resolved a ~1e8 N contact, and the aeroplane was
+// destroyed on the first tick with the HUD reading five figures of km/h. There
+// is no fallback any more — a server that cannot load the terrain is a server
+// that cannot arbitrate, so it fails loudly instead.
 // ---------------------------------------------------------------------------
 
-let heightAt: (x: number, z: number) => number = () => 0;
-let normalAt: (x: number, z: number, out: V3) => V3 = (_x, _z, out) => { out.x = 0; out.y = 1; out.z = 0; return out; };
+/** One heightfield per seed, held for the room's lifetime. */
+function makeEnv(seed: number): Env {
+  const hf: Heightfield = getHeightfield(seed);
+  const wind = windField(seed);
+  const sites: SpawnSite[] = hf.airfields.map((a) => ({
+    x: a.x, z: a.z, elevation: a.elevation, heading: a.heading, team: a.team,
+  }));
+  if (sites.length < 2) throw new Error(`heightfield seed ${seed} produced ${sites.length} airfields`);
 
-try {
-  // Written by the world subsystem; three.js-free by contract. Loaded through
-  // a computed specifier so the server still type-checks and boots before the
-  // world module exists.
-  const spec = '../src/world/heightfield.js'.replace('.js', '');
-  const hf = await import(/* @vite-ignore */ spec);
-  if (typeof (hf as any).terrainHeight === 'function') heightAt = (hf as any).terrainHeight;
-  if (typeof (hf as any).terrainNormal === 'function') normalAt = (hf as any).terrainNormal;
-  console.log('[server] terrain heightfield loaded');
-} catch {
-  console.warn('[server] heightfield not available yet — using flat ground');
+  return {
+    airDensity,
+    windAt(p: V3, out: V3): V3 { return windAt(wind, p, out); },
+    terrainHeight(x, z) { return hf.heightAt(x, z); },
+    terrainNormal(x, z, out) { hf.normalAt(x, z, out); return out; },
+    // Wheel friction: the runway rolls, grass drags, water is a ditching.
+    surfaceType(x, z) {
+      const t = hf.typeAt(x, z);
+      return t === 'runway' ? 0 : t === 'water' ? 2 : 1;
+    },
+    airfield(team) { return sites.find((s) => s.team === team) ?? sites[0]; },
+  };
 }
-
-const env: Env = {
-  /**
-   * ISA density. Below the tropopause temperature falls linearly at 6.5 K/km
-   * and density follows the standard exponent; above 11 km it is isothermal.
-   */
-  airDensity(y: number): number {
-    const h = Math.max(0, Math.min(20000, y));
-    if (h < 11000) {
-      const T = 288.15 - 0.0065 * h;
-      return 1.225 * Math.pow(T / 288.15, 4.2559);
-    }
-    return 0.36391 * Math.exp(-(h - 11000) / 6341.6);
-  },
-  windAt(_p: V3, out: V3): V3 { out.x = 3.2; out.y = 0; out.z = 1.1; return out; },
-  terrainHeight(x, z) { return heightAt(x, z); },
-  terrainNormal(x, z, out) { return normalAt(x, z, out); },
-};
 
 // ---------------------------------------------------------------------------
 
@@ -64,11 +65,20 @@ function findRoom(): Room {
     if (r.players.size < MAX_PER_ROOM) return r;
   }
   const id = `room-${rooms.size + 1}`;
-  const seed = 1337 + rooms.size * 7919;
-  const r = new Room(id, seed, 'Normandy Coast', env);
+  // Every room shares the map seed: the heightfield bake costs ~0.6 s and
+  // ~17 MB, and one map is what the client is built to render anyway.
+  const r = new Room(id, MAP_SEED, 'Normandy Coast', makeEnv(MAP_SEED));
   rooms.set(id, r);
-  console.log(`[server] created ${id} (seed ${seed})`);
+  console.log(`[server] created ${id} (seed ${MAP_SEED})`);
   return r;
+}
+
+// Bake at boot rather than on the first join: 0.6 s of dead air while a player
+// is already connected reads as a hang.
+{
+  const hf = getHeightfield(MAP_SEED);
+  const fields = hf.airfields.map((a) => `${a.name} (${a.x.toFixed(0)}, ${a.z.toFixed(0)}) @ ${a.elevation.toFixed(0)} m`);
+  console.log(`[server] terrain ready — ${fields.join(' | ')}`);
 }
 
 const http = createServer((req, res) => {

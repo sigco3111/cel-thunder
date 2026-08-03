@@ -43,11 +43,13 @@ import type { AircraftSpec } from '../../shared/aircraft';
 import { boxOf } from '../textures/atlas';
 import type { GaugeName, Rect, UvBox } from '../textures/atlas';
 import {
-  MeshBuilder, boxGeom, cylGeom, flipWinding, mergeGeoms, quadGeom, sphereGeom, trs, uvIn,
+  MeshBuilder, boxGeom, cylGeom, flipWinding, latheGeom, mergeGeoms, quadGeom, sphereGeom, trs, uvIn,
 } from './geom';
 import type { FuselageProfile } from './fuselage';
+import { bubbleCanopy } from './fuselage';
 import { canopyOpening } from './canopy';
 import type { CanopyOpening } from './canopy';
+import type { CelMaterial } from '../../render/CelMaterial';
 import {
   Rand, ctx2d, drawText, fbm, hex, makeCanvas, makeTexture, rgba, roundRectPath, scratches,
 } from '../textures/canvas2d';
@@ -240,6 +242,18 @@ export interface CockpitResult {
   interior: THREE.BufferGeometry;
   /** Reflector-sight glass — its own translucent, emissive material. */
   sightGlass: THREE.BufferGeometry;
+  /**
+   * Shallow domed covers over every dial, as one geometry.
+   *
+   * The panel is a single flat quad, and a flat quad has exactly one normal, so
+   * a stepped specular over it is either entirely on or entirely off — which is
+   * why the instrument panel read as a printed sticker. Fourteen 3 mm crowns of
+   * real curvature give the highlight somewhere to *be*: each dial catches its
+   * own hard crescent, and the crescents slide across the panel as the head
+   * moves. Two hundred triangles for the single strongest "this is glass" cue
+   * in the cockpit.
+   */
+  dialGlass: THREE.BufferGeometry;
   needles: NeedleDef[];
   pilot: THREE.BufferGeometry;
   /** Where the pilot's eyes are: the cockpit camera anchor. */
@@ -392,7 +406,7 @@ export function buildCockpit(spec: AircraftSpec, prof: FuselageProfile): Cockpit
   }
 
   // --- sidewall structure and consoles --------------------------------------
-  parts.push(buildSidewalls(prof, open, floorY, zSeat, zPanel, darkBox, alloyBox, leatherBox));
+  parts.push(buildSidewalls(prof, open, floorY, zSeat, zPanel, darkBox, alloyBox, leatherBox, tubBox));
 
   const eyePoint = new THREE.Vector3(0, yEye, zEye);
 
@@ -426,10 +440,31 @@ export function buildCockpit(spec: AircraftSpec, prof: FuselageProfile): Cockpit
     }
   }
 
+  // --- dial covers ----------------------------------------------------------
+  // A 3 mm crown on a 44 mm dial is about right for the pressed glass in a
+  // wartime instrument can, and it is enough curvature for the Blinn lobe to
+  // resolve into one hard crescent per dial rather than one flat sheet.
+  const caps: THREE.BufferGeometry[] = [];
+  for (const g of PANEL_GAUGES) {
+    const bulge = g.r * 0.15;
+    const prof: { r: number; y: number }[] = [];
+    for (let i = 0; i <= 3; i++) {
+      const s = i / 3;
+      // Circular crown: r = R·sin, y = bulge·cos, so the rim meets the bezel
+      // tangentially and the apex is flat-ish. A cone would give a hard ring.
+      prof.push({ r: g.r * 1.005 * Math.cos(s * Math.PI * 0.5), y: bulge * Math.sin(s * Math.PI * 0.5) });
+    }
+    const cap = latheGeom(prof, 14, cellBox('alloy'), 1);
+    const at = place(g.x, g.y, -0.0015);
+    cap.applyMatrix4(trs([at.x, at.y, at.z], [-Math.PI / 2 + PANEL_TILT, 0, 0]));
+    caps.push(cap);
+  }
+
   void rad;
   return {
     interior: mergeGeoms(parts),
     sightGlass,
+    dialGlass: mergeGeoms(caps),
     needles,
     pilot: buildPilot(spec, floorY, zSeat, eyePoint, canvasBox, leatherBox, darkBox),
     eyePoint,
@@ -584,7 +619,7 @@ function buildCoaming(
  */
 function buildSidewalls(
   prof: FuselageProfile, open: CanopyOpening, floorY: number, zSeat: number, zPanel: number,
-  dark: UvBox, alloy: UvBox, leather: UvBox,
+  dark: UvBox, alloy: UvBox, leather: UvBox, tub: UvBox,
 ): THREE.BufferGeometry {
   const parts: THREE.BufferGeometry[] = [];
   const yMid = floorY + 0.30;
@@ -598,6 +633,16 @@ function buildSidewalls(
 
   for (const sx of [-1, 1]) {
     // Top longeron, running from the firewall aft past the seat.
+    //
+    // Painted, not polished. This rail is two of the three "pale grey
+    // untextured slabs" the critique has been flagging since round 3: it runs
+    // diagonally out of both bottom corners of the cockpit framing, it was
+    // mapped to the bare-alloy cell, and bare alloy is the brightest thing on
+    // the sheet — so the two largest objects in the lower third of the frame
+    // were flat light grey with a hard sheen on them. A real RAF cockpit rail
+    // is interior green over the same structure, and the tub cell carries
+    // frames, rivet rows and a baked light-to-dark section ramp, so mapping it
+    // there gives the rail both a colour that belongs in the box and a texture.
     const zA = zPanel - 0.02, zB = open.z1 + 0.10;
     const n = 10;
     const b = new MeshBuilder();
@@ -609,7 +654,9 @@ function buildSidewalls(
       o.x = sx * (w - (j === 1 || j === 2 ? 0.032 : 0));
       o.y = y + (j < 2 ? 0.022 : -0.022);
       o.z = z;
-      const [u, v] = uvIn(alloy, t * 3 % 1, j / 3);
+      // v is walked across the *section* of the rail, so the tub cell's baked
+      // sill-to-floor ramp lands as a lit top edge and a shadowed underside.
+      const [u, v] = uvIn(tub, t * 3 % 1, 0.08 + (j / 3) * 0.52);
       o.u = u; o.v = v;
     }, sx < 0);
     parts.push(b.build(true));
@@ -773,7 +820,7 @@ export interface CockpitAtlas {
 }
 
 const INTERIOR_GREEN = 0x565e46;
-const PANEL_BLACK = 0x1b1a17;
+const PANEL_BLACK = 0x232219;
 const MARK = 0xe8e4d6;
 const DIM = 0x9d998c;
 const WARN = 0xc0392b;
@@ -1238,16 +1285,47 @@ function paintCanvas(g: Ctx2D, r: Rect, rnd: Rand): void {
 }
 
 function paintAlloy(g: Ctx2D, r: Rect, rnd: Rand): void {
-  g.fillStyle = '#8e9298';
+  // Dulled from the old #8e9298. That value is 56 % reflectance — brighter than
+  // anything else in the box including the dial faces — and every alloy fitting
+  // in the cockpit was reading as a white slab against a dark interior. Aircraft
+  // alloy inside a cockpit is scuffed, handled and half-oxidised.
+  g.fillStyle = '#767b81';
   g.fillRect(r.x, r.y, r.w, r.h);
   for (let y = 0; y < r.h; y += 2) {
     for (let x = 0; x < r.w; x += 2) {
       const n = fbm(x * 0.20, y * 0.06, 3, 29);
-      g.fillStyle = rgba(n > 0.5 ? 0xc2c7cc : 0x5c6167, Math.abs(n - 0.5) * 0.8);
+      g.fillStyle = rgba(n > 0.5 ? 0xb0b6bc : 0x484d53, Math.abs(n - 0.5) * 0.9);
       g.fillRect(r.x + x, r.y + y, 2, 2);
     }
   }
-  scratches(g, r, 160, rnd, 0xdfe4e8, 0.35, 6, 34, 0.05, 0.5);
+  // Rolled sheet is not a plain surface: it is bent up at the edges, joined,
+  // and riveted. Three joggle lines and two rivet rows are what turn this cell
+  // from "flat grey" into "a piece of aeroplane" wherever it lands.
+  for (const [y, dark] of [[36, 0.34], [122, 0.28], [204, 0.34]] as [number, number][]) {
+    g.fillStyle = rgba(0x141719, dark);
+    g.fillRect(r.x, r.y + y, r.w, 3);
+    g.fillStyle = 'rgba(214,222,230,0.26)';
+    g.fillRect(r.x, r.y + y + 3, r.w, 2);
+  }
+  for (const y of [22, 190]) {
+    for (let i = 0; i < 16; i++) {
+      const x = r.x + 8 + i * 15.5;
+      g.fillStyle = 'rgba(20,24,26,0.45)';
+      g.beginPath(); g.arc(x, r.y + y + 1.3, 2.5, 0, 6.2832); g.fill();
+      g.fillStyle = 'rgba(196,204,212,0.55)';
+      g.beginPath(); g.arc(x, r.y + y, 2.3, 0, 6.2832); g.fill();
+    }
+  }
+  // Handling wear: the bright scratches stay, but they are now bright against a
+  // darker ground rather than a wash on top of an already pale one.
+  scratches(g, r, 160, rnd, 0xdfe4e8, 0.28, 6, 34, 0.05, 0.5);
+  for (let i = 0; i < 10; i++) {
+    g.fillStyle = rgba(0x2a2620, rnd.range(0.10, 0.26));
+    g.beginPath();
+    g.ellipse(r.x + rnd.next() * r.w, r.y + rnd.next() * r.h,
+      rnd.range(8, 30), rnd.range(5, 18), rnd.next() * 3, 0, 6.2832);
+    g.fill();
+  }
 }
 
 function paintNeedle(g: Ctx2D, r: Rect): void {
@@ -1265,48 +1343,507 @@ function paintNeedle(g: Ctx2D, r: Rect): void {
 }
 
 /**
- * The gunsight graticule, painted on transparency so the reflector plate is
- * glass with an image floating on it rather than a grey card.
+ * The reflector plate: coated glass, and nothing else.
+ *
+ * There used to be a graticule painted here — a ring, twelve deflection ticks,
+ * two range bars and a pipper — and it was the whole of the cockpit's "seven
+ * stacked elements" failure. A reflector sight collimates its graticule at
+ * infinity, so the image is fixed to the *gun boresight*, not to the plate: it
+ * does not move when the pilot's head moves, and it is drawn dead centre of the
+ * frame. A graticule painted on the plate is instead fixed to the plate, which
+ * is 60 cm from the eye and mounted 5 cm below and forward of it, so it sat
+ * offset down-and-right of the aiming point and drew a second ring and a second
+ * pipper around a second candidate place to shoot at. The screen-space gunsight
+ * in CenterHud *is* the collimated image, and it is the one the critique passed
+ * in hud.png. So the plate carries what a real plate carries: a green-tinted
+ * anti-reflection coating, one raking sheen, and the scratches and dust of a
+ * piece of glass that has been in an aeroplane.
  */
 function paintReticle(g: Ctx2D, r: Rect): void {
   g.clearRect(r.x, r.y, r.w, r.h);
-  const cx = r.x + r.w * 0.5, cy = r.y + r.h * 0.5;
-  // Faint tint and a raking reflection on the glass itself.
-  g.fillStyle = 'rgba(150,178,180,0.10)';
+  const rnd = new Rand(0x9e31);
+  // Magnesium-fluoride bloom: a real coated plate is faintly gold-green in
+  // transmission and violet in reflection. Kept under 12 % so the world through
+  // it is not tinted, only *slightly* cooled.
+  g.fillStyle = 'rgba(140,168,150,0.11)';
   g.fillRect(r.x, r.y, r.w, r.h);
+  // One hard-edged raking sheen: stepped, not a soft lobe, per the art
+  // direction. This is the only thing on the plate that says "glass".
   const sheen = g.createLinearGradient(r.x, r.y + r.h, r.x + r.w, r.y);
-  sheen.addColorStop(0, 'rgba(255,255,255,0)');
-  sheen.addColorStop(0.45, 'rgba(226,240,255,0.10)');
-  sheen.addColorStop(0.55, 'rgba(226,240,255,0.02)');
-  sheen.addColorStop(1, 'rgba(255,255,255,0)');
+  sheen.addColorStop(0.00, 'rgba(255,255,255,0)');
+  sheen.addColorStop(0.36, 'rgba(255,255,255,0)');
+  sheen.addColorStop(0.37, 'rgba(214,238,255,0.20)');
+  sheen.addColorStop(0.47, 'rgba(214,238,255,0.20)');
+  sheen.addColorStop(0.48, 'rgba(214,238,255,0.06)');
+  sheen.addColorStop(0.58, 'rgba(214,238,255,0.06)');
+  sheen.addColorStop(0.59, 'rgba(255,255,255,0)');
+  sheen.addColorStop(1.00, 'rgba(255,255,255,0)');
   g.fillStyle = sheen;
   g.fillRect(r.x, r.y, r.w, r.h);
+  // Wipe marks and grit. Faint enough to be texture rather than damage.
+  scratches(g, r, 26, rnd, 0xdfeaf2, 0.13, 12, 70, 0.9, 0.9);
+  for (let i = 0; i < 14; i++) {
+    g.fillStyle = rgba(0xc8d4d8, rnd.range(0.05, 0.16));
+    g.beginPath();
+    g.arc(r.x + rnd.next() * r.w, r.y + rnd.next() * r.h, rnd.range(0.7, 2.1), 0, 6.2832);
+    g.fill();
+  }
+  // Bevelled edge: the plate is 4 mm laminate, and the ground edge catches
+  // light all the way round. Without it the glass has no thickness.
+  g.strokeStyle = 'rgba(226,240,248,0.30)';
+  g.lineWidth = 5;
+  g.strokeRect(r.x + 4, r.y + 4, r.w - 8, r.h - 8);
+}
 
-  const ring = r.w * 0.30;
-  g.strokeStyle = 'rgba(255,196,110,0.95)';
-  g.lineWidth = 3.2;
-  g.beginPath(); g.arc(cx, cy, ring, 0, 6.2832); g.stroke();
-  // Range bars either side, the span the pilot brackets a target between.
-  g.lineWidth = 3.6;
-  for (const sgn of [-1, 1]) {
-    g.beginPath();
-    g.moveTo(cx + sgn * ring, cy);
-    g.lineTo(cx + sgn * r.w * 0.42, cy);
-    g.stroke();
+// ---------------------------------------------------------------------------
+// Cockpit lighting
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the interior shader needs to work out where the sunlight goes,
+ * expressed in the aircraft body frame.
+ *
+ * ## Why this exists at all
+ *
+ * A cockpit is a box with one hole in the roof, and the *shape of that hole*
+ * is the entire lighting design. The critique has said the same thing for four
+ * rounds — "no light enters the cockpit, no sun shaft across the panel, no
+ * shadow of the canopy framing on the coaming, single flat ambient" — and it
+ * was right, because the interior was lit by exactly two things: three's N·L
+ * against a sun that almost never faces any interior surface, and a flat
+ * emissive feedback of the albedo that lifted every surface by the same amount
+ * and therefore modelled nothing.
+ *
+ * A shadow map cannot fix it. The canopy framing is 25 mm tube and the cascade
+ * that covers a 64 km world has metre-scale texels; the whole cockpit is inside
+ * one texel of the first cascade. So the occluder is described analytically
+ * instead — four tubes and a hole, which is all a glasshouse actually is — and
+ * the shader traces one ray per fragment against it. That is exact at any
+ * resolution, costs no map, and moves correctly with the sun and with the
+ * aeroplane's attitude because it is all solved in the body frame.
+ *
+ * ## The model
+ *
+ *   - **The aperture.** The hole the fuselage decking leaves, in the plane of
+ *     the sill: from the rear bow forward past the windscreen arch to the
+ *     windscreen base, half-width tapering the way the canopy stations do.
+ *     A ray from a fragment toward the sun either leaves through it or is
+ *     stopped by the decking.
+ *   - **Two hoops.** The windscreen arch and the rear bow are frames of
+ *     constant z, so a ray is tested against them in their own plane: it is
+ *     blocked where it crosses within a tube radius of the elliptical section.
+ *   - **Three posts.** The windscreen centre post and the two quarter-panel
+ *     divisions, as line segments from the windscreen base to the arch, tested
+ *     by ray-to-segment distance.
+ *
+ * The same aperture, traced straight up with a wide penumbra, gives the
+ * skylight occlusion that puts the footwell in shadow and the coaming in light.
+ */
+export interface CockpitLightRig {
+  /** (zRearBow, zArch, zWindscreenBase, apertureHalfWidth). */
+  ap: THREE.Vector4;
+  /** (sillY at zArch, d(sillY)/dz). */
+  sill: THREE.Vector2;
+  /** Windscreen arch as (z, halfWidth, height, sillY). */
+  arch: THREE.Vector4;
+  /** Intermediate hood bow, same packing. Disabled by making it enormous. */
+  bow1: THREE.Vector4;
+  /** Rear hood bow, same packing. Disabled by making it enormous. */
+  bow2: THREE.Vector4;
+  /** Centroid of the opening, ~35 cm above the sill: where the sky is. */
+  apCentre: THREE.Vector3;
+  /** Windscreen post segments, lower end then upper end. */
+  postA: THREE.Vector3[];
+  postB: THREE.Vector3[];
+  /** Tube radius of each post; ~0 disables it. */
+  postR: THREE.Vector3;
+  /**
+   * The pilot himself, as one fat capsule from the rudder pedals to the
+   * headrest, and the single largest occluder in the box: with the sun over
+   * either shoulder he is what puts the footwell, the stick and half the panel
+   * in shadow. Without him the floor traces straight out through the hood and
+   * comes back as the brightest surface in the frame, which is the opposite of
+   * every cockpit photograph ever taken.
+   */
+  bodyA: THREE.Vector3;
+  bodyB: THREE.Vector3;
+  bodyR: number;
+  /** Instrument-panel bounce source: centre (xyz) and strength (w). */
+  panel: THREE.Vector4;
+  /** Panel normal, pointing at the pilot. */
+  panelN: THREE.Vector3;
+  /** Colour of the bounce off the panel and the sunlit floor. */
+  bounce: THREE.Color;
+}
+
+const sgnpow = (v: number, e: number) => (v < 0 ? -Math.pow(-v, e) : Math.pow(v, e));
+
+export function cockpitLightRig(spec: AircraftSpec, prof: FuselageProfile): CockpitLightRig {
+  const c = spec.geom.canopy;
+  const bubble = bubbleCanopy(spec);
+  // These four lines mirror 'stations' in canopy.ts. They have to: the shadow
+  // caster and the thing casting it must be the same shape or the shadow lands
+  // somewhere the frame is not.
+  const W = c.width * (bubble ? 0.86 : 0.80);
+  const H = c.height * (bubble ? 0.98 : 0.80);
+  const zF = c.z0 + 0.46;   // windscreen base, on the decking
+  const zA = c.z0 + 0.05;   // top of the windscreen arch = forward end of the opening
+  const zR = c.z1;          // rear bow of the sliding hood
+  const sillAt = (z: number) => prof.topY(z) - 0.015;
+
+  // Station shape at the windscreen base (0) and at the arch (3), from the same
+  // table. 'n' is the superellipse exponent; the posts are swept at constant
+  // phi through it.
+  const s0 = bubble
+    ? { w: 0.30 * W, h: 0.16 * H, n: 3.0 }
+    : { w: 0.28 * W, h: 0.14 * H, n: 3.2 };
+  const s3 = bubble
+    ? { w: 0.96 * W, h: 0.98 * H, n: 2.2 }
+    : { w: 0.94 * W, h: 0.97 * H, n: 2.55 };
+  const s5 = bubble
+    ? { w: 0.99 * W, h: 0.98 * H, n: 2.0 }
+    : { w: 0.98 * W, h: 0.95 * H, n: 2.35 };
+  const s6 = bubble
+    ? { w: 0.90 * W, h: 0.88 * H, n: 2.05 }
+    : { w: 0.84 * W, h: 0.80 * H, n: 2.45 };
+  const z5 = zA - (zA - zR) * 0.70;
+
+  const shell = (s: { w: number; h: number; n: number }, z: number, phi: number): THREE.Vector3 => {
+    const e = 2 / s.n;
+    return new THREE.Vector3(
+      s.w * sgnpow(Math.cos(phi), e),
+      sillAt(z) + s.h * sgnpow(Math.sin(phi), e),
+      z,
+    );
+  };
+
+  const rTube = Math.max(0.011, spec.geom.fuseRadius * 0.019);
+  const phis = bubble ? [Math.PI * 0.5] : [Math.PI * 0.5, Math.PI * 0.24, Math.PI * 0.76];
+  const postA: THREE.Vector3[] = [];
+  const postB: THREE.Vector3[] = [];
+  const radii = [0, 0, 0];
+  for (let i = 0; i < 3; i++) {
+    if (i < phis.length) {
+      postA.push(shell(s0, zF, phis[i]));
+      postB.push(shell(s3, zA, phis[i]));
+      radii[i] = rTube * (i === 0 ? 1.25 : 0.8);
+    } else {
+      // Parked far outside the fuselage with a radius the smoothstep can never
+      // reach, which is cheaper than branching in the shader.
+      postA.push(new THREE.Vector3(0, 1e3, 0));
+      postB.push(new THREE.Vector3(0, 1e3, 1));
+      radii[i] = 1e-4;
+    }
   }
-  // Pipper.
-  g.fillStyle = 'rgba(255,214,140,1)';
-  g.beginPath(); g.arc(cx, cy, 4.2, 0, 6.2832); g.fill();
-  g.strokeStyle = 'rgba(255,196,110,0.9)'; g.lineWidth = 2.4;
-  g.beginPath(); g.moveTo(cx, cy - r.h * 0.42); g.lineTo(cx, cy - ring * 0.55); g.stroke();
-  g.beginPath(); g.moveTo(cx, cy + ring * 0.55); g.lineTo(cx, cy + r.h * 0.42); g.stroke();
-  // Deflection ticks on the ring.
-  for (let i = 0; i < 12; i++) {
-    const a = (i / 12) * FULL;
-    g.strokeStyle = 'rgba(255,196,110,0.55)'; g.lineWidth = 2;
-    g.beginPath();
-    g.moveTo(cx + Math.cos(a) * ring * 0.86, cy + Math.sin(a) * ring * 0.86);
-    g.lineTo(cx + Math.cos(a) * ring, cy + Math.sin(a) * ring);
-    g.stroke();
-  }
+
+  // Aperture half-width: the deck cutout follows the canopy station width, and
+  // over the opening proper that is within 6 % of the maximum.
+  const apW = Math.max(0.05, 0.98 * W);
+
+  // Panel bounce source. The panel plate is 58 x 29 cm of dial faces and pale
+  // placards immediately under the sunlight that comes over the sill, and it is
+  // the brightest interior surface in any real cockpit photograph. Its centre
+  // and normal are re-derived here rather than passed, so this stays a pure
+  // function of the spec.
+  const open = canopyOpening(spec, prof);
+  const zPanel = open.z0 + 0.03;
+  const panelY = open.sillY(open.z0) - 0.028 - PANEL_H * 0.5;
+
+  // Same three anchors 'buildCockpit' hangs everything off, so the capsule
+  // cannot drift away from the pilot it stands in for.
+  const cc = spec.geom.canopy;
+  const zSeat = (cc.z0 + cc.z1) * 0.5 - 0.08;
+  const yEye = open.sillY(zSeat + 0.14) + open.height * 0.33;
+  const floorY = yEye - 0.84;
+
+  return {
+    ap: new THREE.Vector4(zR, zA, zF, apW),
+    sill: new THREE.Vector2(sillAt(zA), (sillAt(zF) - sillAt(zR)) / Math.max(0.1, zF - zR)),
+    arch: new THREE.Vector4(zA, s3.w, s3.h, sillAt(zA)),
+    // A blown teardrop hood has no bows at all, so both are pushed to a radius
+    // no ray can ever land on rather than branched around in the shader.
+    bow1: bubble
+      ? new THREE.Vector4(z5, 1e4, 1e4, sillAt(z5))
+      : new THREE.Vector4(z5, s5.w, s5.h, sillAt(z5)),
+    bow2: bubble
+      ? new THREE.Vector4(zR, 1e4, 1e4, sillAt(zR))
+      : new THREE.Vector4(zR, s6.w, s6.h, sillAt(zR)),
+    apCentre: new THREE.Vector3(0, sillAt((zA + zR) * 0.5) + 0.35, (zA + zR) * 0.5),
+    postA,
+    postB,
+    postR: new THREE.Vector3(radii[0], radii[1], radii[2]),
+    bodyA: new THREE.Vector3(0, floorY + 0.24, zSeat + 0.40),
+    bodyB: new THREE.Vector3(0, yEye + 0.02, zSeat - 0.10),
+    bodyR: 0.23,
+    panel: new THREE.Vector4(0, panelY, zPanel, 0.85),
+    panelN: new THREE.Vector3(0, Math.sin(PANEL_TILT), -Math.cos(PANEL_TILT)),
+    bounce: new THREE.Color(0xffc189),
+  };
+}
+
+/**
+ * Patches a cel material so it is lit like the inside of a glasshouse.
+ *
+ * Wraps whatever onBeforeCompile the material already has, the same way
+ * 'attachRoughness' does in build.ts, and injects at '<aomap_fragment>' — after
+ * three has resolved direct lighting and the cel block has added its terminator,
+ * specular and rim, and before 'outgoingLight' is summed. Everything the sun
+ * contributes therefore gets gated by the canopy in one multiply.
+ */
+/** Debug switch: renders (aperture, N.L, frame occlusion) as RGB. Never ship set. */
+const CK_DEBUG = false;
+
+export function attachCockpitLighting(mat: CelMaterial, rig: CockpitLightRig): void {
+  const base = mat.onBeforeCompile;
+  const baseKey = mat.customProgramCacheKey;
+  const u: Record<string, THREE.IUniform> = {
+    uCkAp: { value: rig.ap },
+    uCkSill: { value: rig.sill },
+    uCkArch: { value: rig.arch },
+    uCkBow1: { value: rig.bow1 },
+    uCkBow2: { value: rig.bow2 },
+    uCkApC: { value: rig.apCentre },
+    uCkPostA: { value: rig.postA },
+    uCkPostB: { value: rig.postB },
+    uCkPostR: { value: rig.postR },
+    uCkBodyA: { value: rig.bodyA },
+    uCkBodyB: { value: rig.bodyB },
+    uCkBodyR: { value: rig.bodyR },
+    uCkPanel: { value: rig.panel },
+    uCkPanelN: { value: rig.panelN },
+    uCkBounce: { value: rig.bounce },
+  };
+
+  mat.onBeforeCompile = (shader, renderer) => {
+    base.call(mat, shader, renderer);
+    Object.assign(shader.uniforms, u);
+    const fs = shader.fragmentShader;
+    // The depth/normal prepass reuses this callback with an unlit shader that
+    // has no reflectedLight to modify. Recognise it and leave it alone.
+    if (!fs.includes('uniform float uHatchScale;')) return;
+
+    // Everything below traces rays in the *body* frame, which means undoing
+    // the model rotation. That has to happen in the vertex shader: three only
+    // declares 'modelMatrix' for the vertex stage, and reaching for it in the
+    // fragment stage fails the link outright ("undeclared identifier"), taking
+    // the whole cockpit material with it. The sun direction is constant across
+    // a draw, so interpolating it costs nothing and stays exact.
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', /* glsl */`
+        #include <common>
+        uniform vec3 uSunDir;
+        varying vec3 vCkObj;
+        varying vec3 vCkObjN;
+        varying vec3 vCkSunObj;
+      `)
+      .replace('#include <worldpos_vertex>', /* glsl */`
+        #include <worldpos_vertex>
+        vCkObj = transformed;
+        vCkObjN = objectNormal;
+        // modelMatrix has no scale on an aircraft, so its upper 3x3 is
+        // orthonormal and post-multiplying is the inverse rotation.
+        vCkSunObj = uSunDir * mat3( modelMatrix );
+      `);
+
+    shader.fragmentShader = (CK_DEBUG ? '#define CK_DEBUG 1\n' : '') + fs
+      .replace('uniform float uHatchScale;', /* glsl */`
+        uniform float uHatchScale;
+        uniform vec4  uCkAp;
+        uniform vec2  uCkSill;
+        uniform vec4  uCkArch;
+        uniform vec4  uCkBow1;
+        uniform vec4  uCkBow2;
+        uniform vec3  uCkApC;
+        uniform vec3  uCkPostA[ 3 ];
+        uniform vec3  uCkPostB[ 3 ];
+        uniform vec3  uCkPostR;
+        uniform vec3  uCkBodyA;
+        uniform vec3  uCkBodyB;
+        uniform float uCkBodyR;
+        uniform vec4  uCkPanel;
+        uniform vec3  uCkPanelN;
+        uniform vec3  uCkBounce;
+        varying vec3  vCkObj;
+        varying vec3  vCkObjN;
+        varying vec3  vCkSunObj;
+
+        float ckSillY( float z ) { return uCkSill.x + uCkSill.y * ( z - uCkAp.y ); }
+
+        // Half-width of the hole in the decking at station z. Constant over the
+        // cockpit cutout, narrowing to a third of that where the windscreen
+        // closes down onto the nose, rounded off at both ends the way a
+        // stressed-skin cutout is.
+        float ckWidth( float z ) {
+          float f = clamp( ( z - uCkAp.y ) / max( 1e-3, uCkAp.z - uCkAp.y ), 0.0, 1.0 );
+          float w = uCkAp.w * ( 1.0 - 0.70 * f * f * ( 3.0 - 2.0 * f ) );
+          w *= sqrt( clamp( ( z - uCkAp.x ) / 0.18, 0.0, 1.0 ) );
+          w *= sqrt( clamp( ( uCkAp.z - z ) / 0.12, 0.0, 1.0 ) );
+          return w;
+        }
+
+        // Does a ray from p along L get out through the hole? 'soft' is the
+        // penumbra half-width in metres at the aperture, which is also what
+        // makes the skylight term a soft occlusion rather than a hard stencil.
+        float ckAperture( vec3 p, vec3 L, float soft ) {
+          if ( L.y < 0.06 ) return smoothstep( -0.03, 0.06, L.y );
+          float t = ( ckSillY( p.z ) - p.y ) / L.y;
+          if ( t <= 0.0 ) return 1.0;
+          t = ( ckSillY( p.z + t * L.z ) - p.y ) / L.y;
+          if ( t <= 0.0 ) return 1.0;
+          vec3 q = p + L * t;
+          float s = soft * ( 1.0 + 0.75 * t );
+          float inx = smoothstep( 0.0, s, ckWidth( q.z ) - abs( q.x ) );
+          float inz = smoothstep( -s, s, q.z - uCkAp.x )
+                    * smoothstep( -s, s, uCkAp.z - q.z );
+          return inx * inz;
+        }
+
+        // A frame hoop lives in one z plane, so the test is: cross that plane,
+        // and see whether you land on the elliptical section. e is the
+        // superellipse-ish radius squared, so 1.0 is exactly on the frame.
+        float ckHoop( vec3 p, vec3 L, vec4 h ) {
+          if ( abs( L.z ) < 3e-3 ) return 0.0;
+          float t = ( h.x - p.z ) / L.z;
+          if ( t <= 0.0 ) return 0.0;
+          vec3 q = p + L * t;
+          if ( q.y < h.w - 0.02 ) return 0.0;
+          float ex = q.x / h.y;
+          float ey = ( q.y - h.w ) / h.z;
+          float e = ex * ex + ey * ey;
+          return 1.0 - smoothstep( 0.05, 0.20, abs( e - 1.0 ) );
+        }
+
+        // Closest approach of the ray to a post, as a soft bar.
+        float ckSeg( vec3 p, vec3 L, vec3 a, vec3 b, float r ) {
+          vec3 d = b - a;
+          vec3 m = p - a;
+          float dd = dot( d, d );
+          float dl = dot( d, L );
+          float dm = dot( d, m );
+          float lm = dot( L, m );
+          float den = dd - dl * dl;
+          float t = den > 1e-5 ? ( dl * dm - lm * dd ) / den : -lm;
+          t = max( t, 0.0 );
+          float s = clamp( ( dm + dl * t ) / max( dd, 1e-6 ), 0.0, 1.0 );
+          float dist = length( ( p + L * t ) - ( a + d * s ) );
+          return 1.0 - smoothstep( r, r * 3.2, dist );
+        }
+      `)
+      .replace('#include <aomap_fragment>', /* glsl */`
+        {
+          // Body frame — see the vertex-stage note above.
+          vec3 ckL = normalize( vCkSunObj );
+          vec3 ckN = normalize( vCkObjN );
+          vec3 ckP = vCkObj;
+
+          // --- direct sun through the glasshouse -------------------------
+          float ckSun = ckAperture( ckP, ckL, 0.035 );
+          float ckFr = max( ckHoop( ckP, ckL, uCkArch ), ckHoop( ckP, ckL, uCkBow1 ) );
+          ckFr = max( ckFr, ckHoop( ckP, ckL, uCkBow2 ) );
+          ckFr = max( ckFr, ckSeg( ckP, ckL, uCkPostA[ 0 ], uCkPostB[ 0 ], uCkPostR.x ) );
+          ckFr = max( ckFr, ckSeg( ckP, ckL, uCkPostA[ 1 ], uCkPostB[ 1 ], uCkPostR.y ) );
+          ckFr = max( ckFr, ckSeg( ckP, ckL, uCkPostA[ 2 ], uCkPostB[ 2 ], uCkPostR.z ) );
+          // The pilot is a soft occluder, not a tube: a body has no penumbra
+          // edge worth resolving at this scale, so the falloff is wide and the
+          // shadow it throws is a broad soft mass rather than a bar.
+          ckFr = max( ckFr, 0.90 * ckSeg( ckP, ckL, uCkBodyA, uCkBodyB, uCkBodyR ) );
+          ckSun *= 1.0 - 0.93 * ckFr;
+          // Not to zero: perspex is 92 % transmissive and the frames are
+          // 25 mm tube, so a framing shadow is a strong grey bar, not a hole.
+          reflectedLight.directDiffuse *= mix( 0.06, 1.0, ckSun );
+
+          // Depth below the sill, squared: the classic cockpit occlusion, used
+          // by both the sun term and the fill below.
+          float ckDepth = clamp( ( ckSillY( ckP.z ) - ckP.y ) / 0.95, 0.0, 1.0 );
+
+          // --- the shaft itself ------------------------------------------
+          //
+          // Three's own direct term cannot carry this on its own and it is
+          // worth being explicit about why, because it is not a fudge. An
+          // instrument panel is crackle black: 0x1b1a17 is 0.011 in linear
+          // light. Multiplied by the key and Lambert's 1/pi, a fully sunlit
+          // panel differs from a fully shadowed one by about a hundredth of a
+          // unit — under a fortieth of a stop — so the aperture solved above
+          // lands on a surface with no dynamic range to show it with, and the
+          // frame stays "unlit" no matter how correct the occlusion is.
+          //
+          // A real pilot does not see it that way, because his eye is adapted
+          // to the box and not to the sky outside it. This is that adaptation:
+          // a second banded key, gated by the same aperture and the same frame
+          // shadows, at a level that makes the patch a value step rather than a
+          // rounding error. It is stepped in two hard stages so it reads as cel
+          // shading and not as a smooth wash.
+          float ckNdl = max( dot( ckN, ckL ), 0.0 );
+          float ckBand = 0.42 * smoothstep( 0.02, 0.10, ckNdl )
+                       + 0.58 * smoothstep( 0.26, 0.34, ckNdl );
+          // Depth below the sill damps it as well as the fill. Only the pilot
+          // is traced as a solid occluder; the seat pan, the panel case, the
+          // sidewall consoles, the control column and the pilot's own thighs
+          // are not, and between them they are most of what stands over a
+          // footwell. Without this the floorboards come back brighter than the
+          // instrument panel, which is the wrong subject for the frame.
+          float ckLit = mix( 1.0, 0.55, ckDepth * ckDepth );
+          reflectedLight.directDiffuse +=
+            uSunColor * diffuseColor.rgb * ckSun * ckBand * ckLit * uKeyLevel * 0.58;
+          // Warm terminator on the edge of the patch, the same trick the hull
+          // uses, so the boundary is a drawn edge rather than a step.
+          float ckEdge = ckSun * ( 1.0 - ckSun ) * 4.0;
+          reflectedLight.directDiffuse +=
+            uTerminatorTint * uSunColor * diffuseColor.rgb * ckEdge * uKeyLevel * 0.22;
+          // Sheen: sunlit crackle enamel and doped fabric both throw a broad
+          // low highlight, and it is the only thing that says the panel is a
+          // surface with a finish on it rather than a printed card.
+          vec3  ckV = normalize( cameraPosition - vCelWorldPos );
+          vec3  ckH = normalize( normalize( uSunDir ) + ckV );
+          float ckSpec = pow( max( dot( normalize( normal * mat3( viewMatrix ) ), ckH ), 0.0 ), 150.0 );
+          // One hard step, not two. Two steps put a flat 50 % plateau across
+          // every large near-planar surface in the box at once, which washed
+          // the whole footwell pale and read as a sheet of dirty glass laid
+          // over the cockpit rather than as a highlight.
+          ckSpec = step( 0.30, ckSpec );
+          reflectedLight.directDiffuse += uSunColor * ckSpec * ckSun * 0.06 * uKeyLevel;
+
+          // --- skylight through the same hole ----------------------------
+          // Traced straight up with a 30 cm penumbra, which is roughly the
+          // angular size of the opening seen from the footwell.
+          //
+          // The facing term is taken against the *centre of the opening*, not
+          // against world up. An instrument panel is a near-vertical surface
+          // looking aft: by N.y it faces nothing and stays black, but it looks
+          // straight at a metre-wide hole full of sky and is in fact the second
+          // brightest thing in any real cockpit photograph. Aiming the fill at
+          // the hole is what tells those two cases apart.
+          float ckSky = ckAperture( ckP, vec3( 0.0, 1.0, 0.0 ), 0.30 );
+          vec3  ckToAp = normalize( uCkApC - ckP );
+          float ckFace = 0.30 + 0.70 * max( dot( ckN, ckToAp ), 0.0 );
+          float ckAo = mix( 1.0, 0.38, ckDepth * ckDepth );
+          reflectedLight.indirectDiffuse *= mix( 0.20, 1.45, ckSky * ckFace ) * ckAo;
+
+          // --- bounce off the instrument panel ---------------------------
+          // Treated as a small area source facing the pilot: cosine at the
+          // receiver, cosine at the panel, inverse square with a softening
+          // radius so nothing blows up where the coaming touches it. This is
+          // the warm counter-fill that a real cockpit gets off its own dial
+          // faces and placards, and it is what stops the tub walls and the
+          // pilot's chest from being one dead value.
+          vec3 ckD = uCkPanel.xyz - ckP;
+          float ckD2 = dot( ckD, ckD );
+          vec3 ckW = ckD * inversesqrt( max( ckD2, 1e-4 ) );
+          float ckB = max( dot( ckN, ckW ), 0.0 )
+                    * max( dot( -ckW, uCkPanelN ), 0.0 )
+                    / ( 0.13 + ckD2 );
+          reflectedLight.indirectDiffuse +=
+            uCkBounce * diffuseColor.rgb * ckB * uCkPanel.w
+            * clamp( uKeyLevel * 0.33, 0.12, 1.25 );
+
+          #ifdef CK_DEBUG
+            reflectedLight.directDiffuse = vec3( ckSun, max( dot( ckN, ckL ), 0.0 ), ckFr );
+            reflectedLight.indirectDiffuse = vec3( 0.0 );
+            totalEmissiveRadiance = vec3( 0.0 );
+          #endif
+        }
+        #include <aomap_fragment>
+      `);
+  };
+  mat.customProgramCacheKey = () => baseKey.call(mat) + '|ckpit' + (CK_DEBUG ? '|dbg' : '');
 }

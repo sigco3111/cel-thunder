@@ -153,7 +153,9 @@ export class WorldSystem implements Subsystem {
     const tu = this.terrain.material.terrainUniforms;
     tu.uDetailFar.value = q === 'low' ? 3200 : q === 'medium' ? 5000 : 7000;
     tu.uFieldStrength.value = q === 'low' ? 0.55 : 1.0;
-    tu.uFieldEdgeDist.value = q === 'low' ? 1500 : q === 'medium' ? 2600 : 4200;
+    // Ground metres per pixel past which hedgerow geometry is not evaluated.
+    // A footprint budget, not a distance: see uHedgeMaxPx in terrainMaterial.
+    tu.uHedgeMaxPx.value = q === 'low' ? 9.0 : q === 'medium' ? 17.0 : 30.0;
     this.veg.setQuality(q);
   }
 

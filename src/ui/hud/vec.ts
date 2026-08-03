@@ -20,6 +20,7 @@ export class VecStage {
   private litPass: SVGGElement;
   private n = 0;
   private lits = new WeakMap<SVGGElement, SVGUseElement>();
+  private pairs = new WeakMap<SVGGElement, SVGUseElement[]>();
 
   constructor(parent: Element, cls = '') {
     this.svg = svg('svg', { class: cls }, parent);
@@ -40,11 +41,28 @@ export class VecStage {
   layer(cls = '', id?: string, inkCls = ''): SVGGElement {
     const gid = id ?? `ctv${this.n++}`;
     const g = svg('g', { id: gid }, this.defs);
-    svg('use', { href: `#${gid}`, class: `ct-vec-ink ${inkCls}` }, this.inkPass);
+    const ink = svg('use', { href: `#${gid}`, class: `ct-vec-ink ${inkCls}` }, this.inkPass);
     const lit = svg('use', { href: `#${gid}`, class: `ct-vec-lit ${cls}` }, this.litPass);
     this.lits.set(g, lit);
+    this.pairs.set(g, [ink, lit]);
     return g;
   }
+
+  /**
+   * Both visible instances of a layer.
+   *
+   * Needed for anything that has to affect the mark as it is *drawn* rather
+   * than as it is defined — a clip path, in particular. Setting clip-path on
+   * the '<g>' inside '<defs>' does nothing useful, because the clip would then
+   * be evaluated in the referenced element's own space rather than in the
+   * screen space the occluder (an instrument coaming) actually lives in.
+   */
+  uses(g: SVGGElement): SVGUseElement[] {
+    return this.pairs.get(g) ?? [];
+  }
+
+  /** The '<defs>' block, for clip paths and gradients the layers reference. */
+  get definitions(): SVGDefsElement { return this.defs; }
 
   /** The bright instance of a layer — the handle for per-state colouring. */
   lit(g: SVGGElement): SVGUseElement | undefined {

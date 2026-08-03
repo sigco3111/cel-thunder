@@ -83,6 +83,55 @@ function pathBack(i: number, n: number, rnd: number): number {
   return (i + rnd) / n;
 }
 
+/**
+ * Per-stamp size multiplier, biased small with a long tail.
+ *
+ * A plume whose stamps all come out of the same narrow size band reads as a
+ * string of beads however it is shaded, because the repeat is in the *scale*
+ * and the eye measures scale before it measures anything else. Squaring a
+ * uniform draw gives a population where most stamps are small, a few are
+ * two-and-a-half times bigger, and no two neighbours match — which is what
+ * makes a plume read as one body of gas.
+ */
+function sizeJitter(core: VfxCore): number {
+  const u = core.rng.next();
+  return 0.58 + u * u * 1.95;
+}
+
+/**
+ * SMOKE HAS TO HAVE A CORE. Read this before touching any emitter below.
+ *
+ * Every stamp the particle shader draws is *flat*: coverage is hard-thresholded
+ * against the tile's alpha channel and the surviving fragments all get the same
+ * opacity. There is no core-to-edge density inside one billboard and there
+ * cannot be one — which is exactly what the critique measured, twice: "every
+ * puff is the same flat ~45 % translucency with the terrain fully readable
+ * through it, no core-to-edge density variation anywhere".
+ *
+ * The density profile therefore has to be built out of the *population*, not
+ * out of one sprite. So every plume here is emitted as two interleaved
+ * populations from the same source:
+ *
+ *   CORE      small, dark, nearly opaque, barely eroded, short-lived, tight to
+ *             the plume axis, and it grows only slightly — so the vertex
+ *             shader's expansion thinning leaves it dense.
+ *   ENVELOPE  two to five times larger, paler, half the opacity, heavily
+ *             eroded, long-lived, thrown wide, and it balloons — so it thins
+ *             to nothing on its own.
+ *
+ * Overlaid, the cores stack along the axis into an opaque spine and the
+ * envelopes feather it out to transparent at the edges. That is a real
+ * optical-depth gradient across the plume, and it is also what finally kills
+ * the "bead necklace": the two populations have different sizes, different
+ * lifetimes and different opacities, so no two adjacent stamps are comparable.
+ */
+const enum Puff { Core = 0, Envelope = 1 }
+
+/** Which population this stamp belongs to. Cores are the minority by count. */
+function puffKind(core: VfxCore): Puff {
+  return core.rng.next() < 0.36 ? Puff.Core : Puff.Envelope;
+}
+
 export function updateDamageFx(
   core: VfxCore,
   fx: AircraftFx,
@@ -143,32 +192,41 @@ export function updateDamageFx(
         // wind authority both climbing aft — same construction as the fire
         // column, at a tenth of the scale.
         const s = core.rng.next();
+        const kind = puffKind(core);
+        const jit = sizeJitter(core);
         const back = s * 2.6;
-        const spread = 0.28 + back * 0.22;
+        const spread = (kind === Puff.Core ? 0.09 : 0.30) + back * (kind === Puff.Core ? 0.09 : 0.24);
         p.x = anch.ex - a.vx * u - a.fwd.x * back + core.sym(spread);
         p.y = anch.ey - a.vy * u - a.fwd.y * back + core.sym(spread * 0.8);
         p.z = anch.ez - a.vz * u - a.fwd.z * back + core.sym(spread);
         p.vx = a.vx * wake + core.sym(2 + s * 4);
         p.vy = a.vy * wake + core.rand(0.5, 3.5);
         p.vz = a.vz * wake + core.sym(2 + s * 4);
-        p.life = core.rand(0.7, 1.9);
-        // Wide size spread. Uniform stamps read as a repeated motif; a plume
-        // whose components differ by 2-3x in radius reads as a single volume
-        // because the eye can no longer isolate one of them.
-        p.size0 = Math.max(minR, core.rand(0.30, 0.75));
-        p.size1 = Math.max(minR * 3, core.rand(2.2, 5.5));
+        if (kind === Puff.Core) {
+          p.life = core.rand(0.30, 0.75);
+          p.size0 = Math.max(minR, core.rand(0.22, 0.42) * jit);
+          p.size1 = p.size0 * core.rand(1.5, 2.2);
+          p.erode = core.rand(0.16, 0.38);
+          p.r = p.g = p.b = 0.80 + s * 0.14;
+          p.a = wWhite;
+        } else {
+          p.life = core.rand(0.9, 2.1);
+          p.size0 = Math.max(minR, core.rand(0.45, 0.95) * jit);
+          p.size1 = Math.max(minR * 3, core.rand(2.4, 5.8) * jit);
+          p.erode = core.rand(0.70, 0.95);
+          // Steam brightens as it expands and catches the sun from every side
+          // — the opposite of soot, and the reason the two stages never get
+          // confused even when both are backlit.
+          p.r = p.g = p.b = 0.96 + s * 0.22;
+          p.a = 0.64 * wWhite * (1 - s * 0.3);
+        }
         p.rot = core.rand(0, 6.283); p.spin = core.sym(1.9);
         p.drag = core.rand(1.4, 2.6);
         p.grav = -0.12;
         p.wind = 0.7 + s * 0.9; p.turb = 0.5 + s * 0.9;
         p.ramp = RAMP.SmokeWhite;
         p.tile = core.rng.next() < 0.30 + s * 0.35 ? TILE.Wisp : smokeTile();
-        p.erode = core.rand(0.70, 0.95); p.band = 0.7;
-        // Steam brightens as it expands and catches the sun from every side —
-        // the opposite of soot, and the reason the two stages never get
-        // confused even when both are backlit.
-        p.r = p.g = p.b = 0.92 + s * 0.22;
-        p.a = 0.85 * wWhite * (1 - s * 0.3);
+        p.band = 0.7;
         core.smoke.emit(now, p);
       }
     }
@@ -183,27 +241,50 @@ export function updateDamageFx(
       const n = core.count(3, anch.ex, anch.ey, anch.ez);
       for (let i = 0; i < n; i++) {
         const u = pathBack(i, n, core.rng.next()) * period;
+        // How far down the trail this stamp is born, 0…1. Value, size, opacity
+        // and lifetime are all functions of it, so the trail has a *near end*
+        // and a *far end* rather than being a row of interchangeable lobes at
+        // one value — which is precisely what a critique of this trail called
+        // "near-identical brown/grey lobes at near-even spacing on a
+        // near-straight line, all the same size, opacity and age".
         const s = core.rng.next();
+        const kind = puffKind(core);
+        const jit = sizeJitter(core);
         const back = 0.6 + s * s * 4.5;
-        const spread = 0.32 + back * 0.24;
+        const spread = (kind === Puff.Core ? 0.11 : 0.34) + back * (kind === Puff.Core ? 0.09 : 0.26);
         p.x = anch.ex - a.vx * u - a.fwd.x * back + core.sym(spread);
         p.y = anch.ey - a.vy * u - a.fwd.y * back + core.sym(spread * 0.8);
         p.z = anch.ez - a.vz * u - a.fwd.z * back + core.sym(spread);
         p.vx = a.vx * (wake - s * 0.12) + core.sym(1.6 + s * 3.5);
         p.vy = a.vy * (wake - s * 0.12) + core.rand(0.4, 2.6);
         p.vz = a.vz * (wake - s * 0.12) + core.sym(1.6 + s * 3.5);
-        p.life = core.rand(1.6, 4.2);
-        p.size0 = Math.max(minR, core.rand(0.40, 1.05) * (0.8 + s * 0.7));
-        p.size1 = Math.max(minR * 3, core.rand(3.2, 8.0) * (0.8 + s * 0.7));
+        if (kind === Puff.Core) {
+          // The spine. Short, dark, dense and hardly growing, so it stays
+          // opaque for its whole life and then is simply gone — which is the
+          // other half of the note: the trail has to *die*, not thin out to a
+          // permanent 45 % haze that never resolves.
+          p.life = core.rand(0.35, 0.85);
+          p.size0 = Math.max(minR, core.rand(0.26, 0.58) * jit);
+          p.size1 = p.size0 * core.rand(1.5, 2.3);
+          p.erode = core.rand(0.20, 0.42);
+          p.tile = smokeTile();
+          p.r = p.g = p.b = 0.50 + s * 0.26 + core.sym(0.05);
+          p.a = 0.35 + wGrey * 0.65;
+        } else {
+          p.life = core.rand(1.3, 3.2);
+          p.size0 = Math.max(minR, core.rand(0.5, 1.15) * jit);
+          p.size1 = Math.max(minR * 3, core.rand(3.4, 8.5) * jit);
+          p.erode = core.rand(0.60, 0.82) + s * 0.22;
+          p.tile = core.rng.next() < 0.10 + s * 0.55 ? TILE.Torn : smokeTile();
+          p.r = p.g = p.b = 0.80 + s * 0.60 + core.sym(0.06);
+          p.a = 0.62 * (0.35 + wGrey * 0.65) * (1 - s * 0.40);
+        }
         p.rot = core.rand(0, 6.283); p.spin = core.sym(1.2);
         p.drag = core.rand(0.9, 1.8);
         p.grav = -0.08;
         p.wind = 0.7 + s * 1.1; p.turb = 0.6 + s * 1.1;
         p.ramp = RAMP.SmokeOil;
-        p.tile = core.rng.next() < 0.10 + s * 0.45 ? TILE.Torn : smokeTile();
-        p.erode = core.rand(0.54, 0.78) + s * 0.20; p.band = 0.9;
-        p.r = p.g = p.b = 0.72 + s * 0.55 + core.sym(0.06);
-        p.a = 0.95 * (0.35 + wGrey * 0.65) * (1 - s * 0.3);
+        p.band = 0.9;
         core.smoke.emit(now, p);
       }
     }
@@ -255,26 +336,39 @@ export function updateDamageFx(
         for (let i = 0; i < bn; i++) {
           const u = pathBack(i, bn, core.rng.next()) * 0.028;
           const s = core.rng.next();
+          const kind = puffKind(core);
+          const jit = sizeJitter(core);
           const back = 1.0 + s * 3.5;
-          const spread = 0.4 + back * 0.26;
+          const spread = (kind === Puff.Core ? 0.14 : 0.42) + back * (kind === Puff.Core ? 0.10 : 0.28);
           p.x = ax - a.vx * u - a.fwd.x * back + core.sym(spread);
           p.y = ay - a.vy * u - a.fwd.y * back + core.sym(spread * 0.8);
           p.z = az - a.vz * u - a.fwd.z * back + core.sym(spread);
           p.vx = a.vx * (0.26 - s * 0.12) + core.sym(1.8 + s * 4);
           p.vy = a.vy * (0.26 - s * 0.12) + core.rand(0.5, 3.0);
           p.vz = a.vz * (0.26 - s * 0.12) + core.sym(1.8 + s * 4);
-          p.life = core.rand(2.4, 6.0);
-          p.size0 = core.rand(0.7, 1.8) * (0.8 + s * 0.6);
-          p.size1 = core.rand(5.0, 13.0) * (0.8 + s * 0.6);
+          if (kind === Puff.Core) {
+            p.life = core.rand(0.6, 1.4);
+            p.size0 = core.rand(0.45, 1.05) * jit;
+            p.size1 = p.size0 * core.rand(1.5, 2.4);
+            p.erode = core.rand(0.20, 0.44);
+            p.tile = smokeTile();
+            p.r = p.g = p.b = 0.36 + s * 0.26;
+            p.a = wBlack;
+          } else {
+            p.life = core.rand(2.0, 5.0);
+            p.size0 = core.rand(0.8, 2.0) * jit;
+            p.size1 = core.rand(5.5, 14.0) * jit;
+            p.erode = core.rand(0.54, 0.78) + s * 0.24;
+            p.tile = core.rng.next() < 0.08 + s * 0.52 ? TILE.Torn : smokeTile();
+            p.r = p.g = p.b = 0.70 + s * 0.66 + core.sym(0.06);
+            p.a = 0.60 * wBlack * (1 - s * 0.35);
+          }
           p.rot = core.rand(0, 6.283); p.spin = core.sym(0.7);
           p.drag = core.rand(0.5, 1.0);
           p.grav = -0.10;
           p.wind = 0.8 + s * 1.2; p.turb = 0.7 + s * 1.4;
           p.ramp = RAMP.SmokeBlack;
-          p.tile = core.rng.next() < 0.08 + s * 0.48 ? TILE.Torn : smokeTile();
-          p.erode = core.rand(0.48, 0.74) + s * 0.22; p.band = 1.1;
-          p.r = p.g = p.b = 0.62 + s * 0.62 + core.sym(0.06);
-          p.a = wBlack * (1 - s * 0.3);
+          p.band = 1.1;
           core.smoke.emit(now, p);
         }
       }
@@ -320,7 +414,11 @@ export function updateDamageFx(
       // licks tiled solid over the whole forward fuselage and the aircraft
       // stopped being readable at all, which is a worse failure than the
       // original blob because it also destroys the silhouette.
-      const n = core.count(2.2, anch.ex, anch.ey, anch.ez);
+      // Raised from 2.2 alongside the shorter stretch: once a lick stopped
+      // being a five-metre rod there was simply not enough of it on screen, and
+      // three or four small tongues that overlap only at their roots is what
+      // reads as flame rather than as a row of lozenges.
+      const n = core.count(3.4, anch.ex, anch.ey, anch.ez);
       for (let i = 0; i < n; i++) {
         const u = pathBack(i, n, core.rng.next()) * firePeriod;
         // How far aft of the cowling this lick starts. Flame does not all come
@@ -340,9 +438,16 @@ export function updateDamageFx(
         // continuous orange bar down the fuselage; fanning them across the
         // width of the cowling and half a metre of height lets consecutive
         // stamps sit beside one another and read as separate tongues.
+        // Pushed further outboard and spread symmetrically about the thrust
+        // line rather than hanging below it. The fire group's soft-depth band
+        // is only half a metre, so a lick whose centre sits inside the wing or
+        // the cowl does not dissolve against it — it gets *cut* by the depth
+        // test, which is the razor-straight diagonal edge the critique found
+        // running across the wing. Emitting clear of the skin is the only lever
+        // this emitter has on that.
         const side = (i & 1) === 0 ? -1 : 1;
-        const lat = side * core.rand(0.55, 1.30);
-        const drop = -core.rand(0.05, 0.60) + core.sym(0.18);
+        const lat = side * core.rand(0.78, 1.55);
+        const drop = core.sym(0.5);
         p.x = anch.ex - a.vx * u - a.fwd.x * back + a.right.x * lat + a.up.x * drop;
         p.y = anch.ey - a.vy * u - a.fwd.y * back + a.right.y * lat + a.up.y * drop;
         p.z = anch.ez - a.vz * u - a.fwd.z * back + a.right.z * lat + a.up.z * drop;
@@ -369,24 +474,35 @@ export function updateDamageFx(
         // Short. The flame is the *source*, not the plume: on a real burning
         // fighter it is a tongue a few metres long at the cowling and the smoke
         // does all the work behind it.
-        p.life = core.rand(0.10, 0.26);
-        p.size0 = core.rand(0.22, 0.46);
-        p.size1 = core.rand(0.60, 1.30);
+        p.life = core.rand(0.09, 0.22);
+        p.size0 = core.rand(0.18, 0.38);
+        p.size1 = core.rand(0.40, 0.80);
         p.rot = 0; p.spin = 0;
         p.drag = core.rand(0.35, 0.9);
         p.grav = -0.5;
         p.wind = 0.2; p.turb = 1.1;
         // 'stretch' is metres of extra length per m/s of screen-space velocity.
-        // At 0.032 a lick is roughly two and a half times as long as it is wide
-        // at 50 m/s of apparent motion and collapses to a round flare when the
-        // aircraft is stationary on the ground, which is correct for both.
-        p.stretch = 0.032;
+        //
+        // 0.032 was far too much once the framings put the aeroplane broadside
+        // to the lens: at 110 m/s of apparent motion a lick came out four and a
+        // half times its own width — five metres of it on a nine-metre
+        // aeroplane — and a dozen of those overlapping is the "flat orange
+        // gradient blob and a white-hot capsule painted onto the surface" the
+        // critique found. 0.011 keeps the aft lean without turning a tongue
+        // into a rod, and still collapses to a round flare on the ground.
+        p.stretch = 0.008;
         p.ramp = RAMP.FireStream;
         p.tile = i % 2 === 0 ? TILE.Flame : TILE.FlameB;
         // Flicker: modulating the erosion per particle is what gives stepped
-        // fire its nervous, hand-drawn edge instead of a smooth taper.
-        p.erode = core.rand(0.18, 0.72);
-        p.band = core.rand(1.4, 2.2);
+        // fire its nervous, hand-drawn edge instead of a smooth taper. Biased
+        // higher than before so consecutive licks tear apart instead of
+        // welding into one continuous bar.
+        p.erode = core.rand(0.55, 1.25);
+        // The interior highlight, which the emissive path adds as
+        // 'col += col·lobeDepth·band'. Above about 1.6 it saturates the middle
+        // of every stamp to white and the tongue becomes a capsule with a
+        // hot core painted down it.
+        p.band = core.rand(0.85, 1.45);
         // Tinted decisively warm. The FireStream ramp opens on near-white, and
         // a dozen overlapping opaque stamps sitting in that band fuse into a
         // single yellow-white bar that reads as a welding arc rather than as
@@ -416,7 +532,11 @@ export function updateDamageFx(
         p.rot = core.rand(0, 6.283); p.spin = core.sym(6);
         p.drag = 0.4; p.grav = -0.3; p.wind = 0; p.turb = 0.4;
         p.stretch = 0.014;
-        p.ramp = RAMP.FireCore; p.tile = TILE.Star;
+        // A disc, not the seven-point Star tile. The white-hot root is meant
+        // to be the brightest *point* of the fire, and a star sprite at that
+        // brightness is the flat yellow sparkle the critique found at the wing
+        // root in damage.png — the same asset it found on the guns.
+        p.ramp = RAMP.FireCore; p.tile = TILE.Ember;
         p.erode = 0.05; p.band = 2.2;
         p.r = 1; p.g = 0.95; p.b = 0.78; p.a = 1;
         core.fire.emit(now, p);
@@ -511,6 +631,8 @@ export function updateDamageFx(
         // end has to start *clear of the airframe*: soft-depth erosion dissolves
         // anything within a couple of metres of a surface, so smoke emitted on
         // the fuselage is simply deleted and the plume appears detached.
+        const kind = puffKind(core);
+        const jit = sizeJitter(core);
         const back = 2.2 + t * t * 8.0;
         // How far down the plume this stamp is born, 0…1. Everything else in
         // this emitter is a function of it, which is what turns a column of
@@ -521,7 +643,7 @@ export function updateDamageFx(
         // Dispersion. A plume does not travel as a rigid tube — the shear layer
         // at its edge tears it open, so the spread has to grow down its length
         // rather than being a constant jitter about the flight path.
-        const spread = 0.5 + back * 0.28;
+        const spread = (kind === Puff.Core ? 0.16 : 0.55) + back * (kind === Puff.Core ? 0.10 : 0.30);
         p.x = anch.ex - a.vx * u - a.fwd.x * back + core.sym(spread);
         p.y = anch.ey - a.vy * u - a.fwd.y * back + core.sym(spread * 0.8);
         p.z = anch.ez - a.vz * u - a.fwd.z * back + core.sym(spread);
@@ -534,7 +656,6 @@ export function updateDamageFx(
         p.vx = a.vx * carry + core.sym(fan);
         p.vy = a.vy * carry + core.rand(0.8, 3.4);
         p.vz = a.vz * carry + core.sym(fan);
-        p.life = core.rand(3.0, 7.5);
         // The size ramps with how far aft the stamp starts, so the column has a
         // taper: tight and dark at the fire, broad and breaking up downstream.
         // The floor matters as much as the slope — a half-metre stamp at the
@@ -542,8 +663,32 @@ export function updateDamageFx(
         // four hundred metres away, and a burning fighter has to be legible
         // from ten kilometres.
         const grow = 0.60 + back * 0.055;
-        p.size0 = Math.max(minR, core.rand(1.1, 2.6) * grow);
-        p.size1 = Math.max(minR * 3, core.rand(7.0, 16.5) * grow);
+        if (kind === Puff.Core) {
+          // The opaque spine of the column. Short-lived and barely growing, so
+          // it holds the ramp's dense end for its whole life and then resolves
+          // to nothing — while the envelope around it is what actually reaches
+          // ten kilometres.
+          p.life = core.rand(0.8, 1.8);
+          p.size0 = Math.max(minR, core.rand(0.8, 1.7) * grow * jit);
+          p.size1 = p.size0 * core.rand(1.6, 2.5);
+          p.erode = core.rand(0.20, 0.44);
+          p.tile = smokeTile();
+          p.r = p.g = p.b = 0.46 + s * 0.32 + core.sym(0.05);
+          p.a = 1;
+        } else {
+          p.life = core.rand(2.6, 6.5);
+          p.size0 = Math.max(minR, core.rand(1.2, 2.8) * grow * jit);
+          p.size1 = Math.max(minR * 3, core.rand(7.5, 17.5) * grow * jit);
+          p.erode = core.rand(0.52, 0.78) + s * 0.24;
+          // The far end is emitted as the Torn remnant much more often, so the
+          // plume literally comes apart downstream rather than merely fading.
+          p.tile = core.rng.next() < 0.08 + s * 0.52 ? TILE.Torn : smokeTile();
+          // Value staging down the length: near-black at the fire, greying out
+          // as it disperses. This is the gradient that makes a plume read as
+          // one continuous body of gas.
+          p.r = p.g = p.b = 0.72 + s * 0.70 + core.sym(0.07);
+          p.a = (1 - s * 0.34) * 0.60;
+        }
         p.rot = core.rand(0, 6.283); p.spin = core.sym(0.7);
         p.drag = core.rand(0.5, 1.0);
         p.grav = -0.1;
@@ -551,17 +696,7 @@ export function updateDamageFx(
         // is still moving with the aeroplane, old soot belongs to the air mass.
         p.wind = 0.75 + s * 1.30; p.turb = 0.7 + s * 1.5;
         p.ramp = RAMP.SmokeBlack;
-        // The far end is emitted as the Torn remnant much more often, so the
-        // plume literally comes apart downstream rather than merely fading.
-        p.tile = core.rng.next() < 0.08 + s * 0.52 ? TILE.Torn : smokeTile();
-        p.erode = core.rand(0.46, 0.72) + s * 0.24; p.band = 1.0;
-        // Value staging down the length: near-black at the fire, greying out as
-        // it disperses. This is the gradient that makes a plume read as one
-        // continuous body of gas — a column of stamps at one random value is
-        // the "chain of identical stickers" read, and it is the tint, not the
-        // shading, that was producing it.
-        p.r = p.g = p.b = 0.62 + s * 0.66 + core.sym(0.07);
-        p.a = 1 - s * 0.34;
+        p.band = 1.0;
         core.smoke.emit(now, p);
       }
 
@@ -585,15 +720,15 @@ export function updateDamageFx(
         p.vx = a.vx * 0.42 + core.sym(2.5);
         p.vy = a.vy * 0.42 + core.rand(0.5, 3.0);
         p.vz = a.vz * 0.42 + core.sym(2.5);
-        p.life = core.rand(0.9, 1.8);
-        p.size0 = Math.max(minR, core.rand(1.8, 3.3));
-        p.size1 = Math.max(minR * 2, core.rand(4.4, 8.0));
+        p.life = core.rand(0.7, 1.5);
+        p.size0 = Math.max(minR, core.rand(1.3, 2.6) * sizeJitter(core));
+        p.size1 = Math.max(minR * 2, core.rand(3.0, 5.4));
         p.rot = core.rand(0, 6.283); p.spin = core.sym(1.1);
         p.drag = core.rand(0.6, 1.2); p.grav = -0.1;
         p.wind = 0.7; p.turb = 0.8;
         p.ramp = RAMP.SmokeBlack;
         p.tile = smokeTile();
-        p.erode = core.rand(0.40, 0.62); p.band = 1.1;
+        p.erode = core.rand(0.24, 0.46); p.band = 1.1;
         // The root of the column is the darkest, densest smoke in the frame —
         // it is soot that has existed for a tenth of a second. Keeping it well
         // below the ramp's own value is what anchors the far end's grey to
@@ -653,25 +788,39 @@ export function updateDamageFx(
       for (let i = 0; i < n; i++) {
         const u = pathBack(i, n, core.rng.next()) * period;
         const s = core.rng.next();
+        const kind = puffKind(core);
+        const jit = sizeJitter(core);
         const back = 1.0 + s * s * 6.0;
-        _v.set(core.sym(0.6 + back * 0.22), core.sym(0.5 + back * 0.18), core.sym(0.6 + back * 0.22));
+        const w = kind === Puff.Core ? 0.22 : 0.66;
+        _v.set(core.sym(w + back * 0.22), core.sym(w * 0.8 + back * 0.18), core.sym(w + back * 0.22));
         p.x = anch.ex - a.vx * u - a.fwd.x * back + _v.x;
         p.y = anch.ey - a.vy * u - a.fwd.y * back + _v.y;
         p.z = anch.ez - a.vz * u - a.fwd.z * back + _v.z;
         p.vx = a.vx * (0.28 - s * 0.14) + core.sym(1.8 + s * 4);
         p.vy = a.vy * (0.28 - s * 0.14) + core.rand(0.5, 3);
         p.vz = a.vz * (0.28 - s * 0.14) + core.sym(1.8 + s * 4);
-        p.life = core.rand(2.5, 5.5);
-        p.size0 = Math.max(minR, core.rand(0.6, 1.6) * (0.8 + s * 0.7));
-        p.size1 = Math.max(minR * 3, core.rand(4.5, 11.0) * (0.8 + s * 0.7));
+        if (kind === Puff.Core) {
+          p.life = core.rand(0.6, 1.3);
+          p.size0 = Math.max(minR, core.rand(0.4, 0.9) * jit);
+          p.size1 = p.size0 * core.rand(1.5, 2.3);
+          p.erode = core.rand(0.20, 0.44);
+          p.tile = smokeTile();
+          p.r = p.g = p.b = 0.52 + s * 0.24;
+          p.a = 1;
+        } else {
+          p.life = core.rand(2.0, 4.4);
+          p.size0 = Math.max(minR, core.rand(0.7, 1.7) * jit);
+          p.size1 = Math.max(minR * 3, core.rand(4.8, 11.5) * jit);
+          p.erode = core.rand(0.58, 0.80) + s * 0.22;
+          p.tile = core.rng.next() < 0.10 + s * 0.50 ? TILE.Torn : smokeTile();
+          p.r = p.g = p.b = 0.86 + s * 0.44;
+          p.a = 0.60 * (1 - s * 0.35);
+        }
         p.rot = core.rand(0, 6.283); p.spin = core.sym(0.8);
         p.drag = 0.8; p.grav = -0.09;
         p.wind = 0.75 + s * 1.15; p.turb = 0.7 + s * 1.3;
         p.ramp = RAMP.SmokeGrey;
-        p.tile = core.rng.next() < 0.10 + s * 0.45 ? TILE.Torn : smokeTile();
-        p.erode = core.rand(0.52, 0.76) + s * 0.22; p.band = 0.9;
-        p.r = p.g = p.b = 0.78 + s * 0.40;
-        p.a = 0.95 * (1 - s * 0.3);
+        p.band = 0.9;
         core.smoke.emit(now, p);
       }
     }

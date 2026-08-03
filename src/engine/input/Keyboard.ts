@@ -17,6 +17,19 @@ import { shouldSwallow } from './bindings';
  */
 export class Keyboard {
   readonly codes = new Set<string>();
+  /**
+   * Keys that went down since the input system last sampled, whether or not
+   * they are still down now.
+   *
+   * The system samples once a frame and derives "pressed" from the difference
+   * between two consecutive samples. A tap shorter than a frame — 8 ms on a
+   * 120 Hz mouse hand, and routinely that short for gear, flaps and throttle
+   * presets — goes down and up between two samples and is simply never seen.
+   * Latching it here means a press is never lost no matter how brief; the
+   * system unions this into its code set and clears it after each frame, so a
+   * one-frame tap still reads as exactly one press.
+   */
+  readonly tapped = new Set<string>();
   /** True while a text field or contenteditable owns the keyboard. */
   textFocus = false;
   /** Raw printable characters typed since the last drain (chat capture). */
@@ -54,7 +67,7 @@ export class Keyboard {
       tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable === true;
     if (editable !== this.textFocus) {
       this.textFocus = !!editable;
-      if (this.textFocus) this.codes.clear();
+      if (this.textFocus) { this.codes.clear(); this.tapped.clear(); }
     }
   };
 
@@ -62,6 +75,7 @@ export class Keyboard {
     if (this.textFocus) return;
     if (e.repeat) return;
     this.codes.add(e.code);
+    this.tapped.add(e.code);
     if (e.key.length === 1) this.typed.push(e.key);
     // Only swallow keys the browser would otherwise act on (scroll, focus
     // traversal, back-navigation). Everything else stays available so the
@@ -75,7 +89,10 @@ export class Keyboard {
 
   private onVisibility = (): void => { if (document.hidden) this.clear(); };
 
-  clear = (): void => { this.codes.clear(); };
+  clear = (): void => { this.codes.clear(); this.tapped.clear(); };
+
+  /** Called once per sampled frame, after the codes have been read. */
+  clearTaps(): void { this.tapped.clear(); }
 
   drainTyped(): string[] {
     if (this.typed.length === 0) return EMPTY;

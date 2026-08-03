@@ -137,6 +137,18 @@ export class Mouse {
     this.syncPrompt();
   };
 
+  /**
+   * Makes the unlocked absolute-cursor path inert again until the player
+   * genuinely moves the mouse.
+   *
+   * Called on spawn. Without it the cursor is still sitting wherever the player
+   * left it — on the Deploy button, low and to one side — and because that
+   * position *is* the reticle in the unlocked fallback, the flight director
+   * reads it as a standing command and bunts the aeroplane into a diving turn
+   * the instant it appears in the world.
+   */
+  releaseAbsoluteAim(): void { this.movedUnlocked = false; }
+
   /** Tells the mouse whether the current game state wants the pointer captured. */
   setCaptureDesired(want: boolean): void {
     if (this.wantLock === want) return;
@@ -167,11 +179,18 @@ export class Mouse {
       // 'unadjustedMovement' asks the browser for raw, un-accelerated deltas.
       // It is only supported on Chromium; elsewhere the call either ignores the
       // argument or rejects, and we fall back to the plain request.
-      const req = (this.el as unknown as { requestPointerLock?: (o?: unknown) => unknown })?.requestPointerLock;
-      const p = req ? req.call(this.el, { unadjustedMovement: true }) : undefined;
+      const el = this.el;
+      const req = (el as unknown as { requestPointerLock?: (o?: unknown) => unknown })?.requestPointerLock;
+      if (!el || !req) return;
+      const p = req.call(el, { unadjustedMovement: true });
       if (p && typeof (p as Promise<void>).catch === 'function') {
         (p as Promise<void>).catch(() => {
-          try { (this.el as unknown as { requestPointerLock: () => unknown }).requestPointerLock(); } catch { /* denied */ }
+          // The retry returns a promise of its own in Chromium, and leaving it
+          // unhandled surfaces as an "unhandled rejection" in the console —
+          // which is indistinguishable from a real fault in any harness that
+          // treats console errors as failures. Swallow it here: a denied lock
+          // is an expected outcome, not an error.
+          try { swallow(req.call(el)); } catch { /* denied */ }
         });
       }
     } catch { /* denied — the prompt stays up and the next click retries */ }
@@ -225,4 +244,9 @@ export class Mouse {
     this.promptVisible = show;
     this.prompt.style.opacity = show ? '1' : '0';
   }
+}
+
+/** Ignores a rejected pointer-lock promise without leaving it unhandled. */
+function swallow(p: unknown): void {
+  if (p && typeof (p as Promise<void>).catch === 'function') (p as Promise<void>).catch(() => {});
 }

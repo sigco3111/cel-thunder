@@ -62,6 +62,30 @@ interface PredSample {
   t: FlightTransform;
 }
 
+/** Everything the flight model publishes that the presentation layer reads. */
+export interface AirData {
+  /** Indicated airspeed, m/s. */
+  ias: number;
+  /** True airspeed, m/s. */
+  tas: number;
+  alpha: number;
+  gLoad: number;
+  mach: number;
+  stall: number;
+  /** Altitude ASL, m. */
+  altitude: number;
+  /** Height above the terrain directly below, m. */
+  agl: number;
+  vertSpeed: number;
+  pitchAngle: number;
+  rollAngle: number;
+  heading: number;
+  throttle: number;
+  health: number;
+  damage: number;
+  onGround: boolean;
+}
+
 export interface PredictionStats {
   /** Snapshots reconciled since boot. */
   corrections: number;
@@ -231,6 +255,25 @@ export class FlightSystem implements Subsystem {
       v3(auth.px, auth.py, auth.pz),
       q(auth.qx, auth.qy, auth.qz, auth.qw),
     );
+
+    // Match the powerplant, gear and fuel state the server spawned with.
+    // 'createFlightState' hands back a cold engine at idle with the gear down;
+    // stepping that against a server that air-started with a warm engine
+    // produces a metre of divergence per tick and a permanent rubber-band.
+    // The transform written immediately below overrides the pose this sets.
+    if (this.model.spawnInFlight) {
+      const speed = Math.hypot(auth.vx, auth.vy, auth.vz);
+      const heading = headingOf(auth.qx, auth.qy, auth.qz, auth.qw);
+      this.model.spawnInFlight(
+        this.localFlight, this.localSpec, this.env,
+        auth.py, speed, heading, auth.throttle,
+      );
+      const f = this.localFlight as Record<string, unknown>;
+      f.gear = auth.gear; f.gearTarget = auth.gear;
+      f.flaps = auth.flaps; f.flapsTarget = auth.flaps;
+      f.damage = auth.damage; f.health = auth.health;
+    }
+
     _auth.px = auth.px; _auth.py = auth.py; _auth.pz = auth.pz;
     _auth.vx = auth.vx; _auth.vy = auth.vy; _auth.vz = auth.vz;
     _auth.qx = auth.qx; _auth.qy = auth.qy; _auth.qz = auth.qz; _auth.qw = auth.qw;
@@ -382,8 +425,15 @@ export class FlightSystem implements Subsystem {
   // Introspection for the HUD and debug overlay
   // -------------------------------------------------------------------------
 
-  /** Air data for the HUD; undefined when the model does not publish it. */
-  get airData(): { ias: number; tas: number; alpha: number; gLoad: number; mach: number; stall: number } | undefined {
+  /**
+   * Air data straight from the flight model, for the HUD and for the
+   * playability harness. Undefined until an aircraft is bound.
+   *
+   * This is deliberately the *model's* own numbers rather than anything
+   * re-derived from the replicated entity: it is what lets a test assert that
+   * the two agree instead of assuming they do.
+   */
+  get airData(): AirData | undefined {
     const f = this.localFlight ?? this.sandbox?.playerFlight;
     if (!f) return undefined;
     return {
@@ -393,6 +443,16 @@ export class FlightSystem implements Subsystem {
       gLoad: readFlightScalar(f, ['gLoad', 'g'], 1),
       mach: readFlightScalar(f, ['mach'], 0),
       stall: readFlightScalar(f, ['stall'], 0),
+      altitude: readFlightScalar(f, ['altitude'], 0),
+      agl: readFlightScalar(f, ['agl'], 0),
+      vertSpeed: readFlightScalar(f, ['vertSpeed'], 0),
+      pitchAngle: readFlightScalar(f, ['pitchAngle'], 0),
+      rollAngle: readFlightScalar(f, ['rollAngle'], 0),
+      heading: readFlightScalar(f, ['heading'], 0),
+      throttle: readFlightScalar(f, ['throttle'], 0),
+      health: readFlightScalar(f, ['health'], 1),
+      damage: readFlightScalar(f, ['damage'], 0),
+      onGround: (f as { onGround?: boolean }).onGround === true,
     };
   }
 
@@ -418,6 +478,14 @@ function resolveDebugFlag(): boolean {
   } catch {
     return false;
   }
+}
+
+/** Compass heading of a body +Z axis rotated by this quaternion, radians. */
+function headingOf(x: number, y: number, z: number, w: number): number {
+  // Forward = q · (0,0,1) · q⁻¹, expanded for just the x and z components.
+  const fx = 2 * (x * z + w * y);
+  const fz = 1 - 2 * (x * x + y * y);
+  return Math.atan2(fx, fz);
 }
 
 function copyEntity(a: EntityState, b: EntityState): void {

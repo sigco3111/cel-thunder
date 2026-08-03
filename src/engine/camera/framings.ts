@@ -481,12 +481,20 @@ export const FRAMINGS: Record<FramingName, FramingSpec> = {
    */
   cockpit: {
     mode: 'cockpit',
-    // Mid-morning rather than mid-afternoon: the sun is off the nose to the
-    // left, which throws the windscreen post's shadow across the panel and
-    // lights the coaming instead of flattening it.
-    timeOfDay: 9.3,
+    // The sun has to be BEHIND the pilot's shoulder, and it took working the
+    // geometry to see why. The instrument panel faces aft and 7 degrees up, so
+    // its normal is roughly (0, -0.13, -0.99) in the body frame: for any sun
+    // less than about 97 degrees off the nose, N dot L is negative and the
+    // panel cannot be sunlit at all, whatever the aperture does. That is the
+    // arithmetic behind four rounds of "no light enters the cockpit" — the shot
+    // was composed with the sun ahead, and the largest surface in the frame was
+    // geometrically incapable of receiving it. At 8.1 hours and 135 degrees off
+    // the nose to the left the light comes in over the port sill, rakes across
+    // the panel and the starboard tub wall, and the sill rail, the windscreen
+    // arch legs and the hood bows put real bars across it.
+    timeOfDay: 8.1,
     weather: CUMULUS,
-    fov: 66,
+    fov: 60,
     // Distance/bearing/height are only consulted if no aircraft is spawned, in
     // which case the shot degrades to a composed external view rather than to
     // an empty sky.
@@ -496,8 +504,9 @@ export const FRAMINGS: Record<FramingName, FramingSpec> = {
     frameX: -0.20,
     frameY: 0.12,
     dutch: -0.06,
-    sunBias: 0.8,
-    sunRel: 1.15,
+    sunBias: 1.0,
+    sunLocked: true,
+    sunRel: 1.73,
     // Banked, so the horizon runs diagonally across the canopy and the ground
     // shows through one side of the hood. A straight-and-level cockpit shot is
     // a photograph of an instrument panel; a banked one is a photograph of

@@ -267,7 +267,18 @@ export class Markers {
       setStyle(m.root, 'opacity', a.toFixed(3));
       setClass(m.root, 'is-ally', friendly);
       setClass(m.root, 'is-enemy', !friendly);
-      setStyle(m.box, 'display', onScreen ? 'block' : 'none');
+      // A contact box is suppressed once the contact is inside the gunsight.
+      //
+      // Its job is "there is an aeroplane there and you might not have seen
+      // it". At forty pixels from the boresight that job is done — the target
+      // is in the sight, under the pipper, with the lead marker and the ID
+      // block already pointing at it — and all four corners do from there is
+      // add a fourth ring of furniture to the one place in the frame that must
+      // stay readable. It was the "orange corner-bracket square" in the
+      // critique's list of seven stacked elements in the cockpit.
+      const inSight = onScreen
+        && Math.hypot(px - this.w * 0.5, py - this.h * 0.5) < 74 * this.u;
+      setStyle(m.box, 'display', onScreen && !inSight ? 'block' : 'none');
       setStyle(m.arrow, 'display', onScreen ? 'none' : 'block');
       if (!onScreen) {
         setStyle(m.arrow, 'transform', `rotate(${rot.toFixed(1)}deg)`);

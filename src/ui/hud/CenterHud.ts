@@ -75,6 +75,12 @@ export class CenterHud {
   private fpmY = 0;
   private fpmOn = false;
 
+  /** True while the camera is inside the cockpit. See 'setCockpit'. */
+  private cockpit = false;
+  private clipRect: SVGRectElement;
+  private clipId: string;
+  private ladderUses: SVGUseElement[] = [];
+
   constructor(parent: HTMLElement) {
     this.stage = new VecStage(parent, 'ct-center-svg');
 
@@ -86,6 +92,23 @@ export class CenterHud {
     // silhouette regardless of what is behind it.
     this.gLadder = this.stage.layer('', undefined, 'is-heavy');
     this.gLadderInner = svg('g', undefined, this.gLadder);
+
+    // Occluder for the ladder in cockpit view.
+    //
+    // A conformal pitch ladder is drawn at infinity, so in an external view it
+    // may legitimately cross anything. Inside a cockpit it may not: the '10'
+    // and '20' rungs were printing across the instrument panel, over the
+    // gauges, below the canopy sill — a hundred-metre-away sky mark painted on
+    // a surface eighty centimetres from the eye, which is the one thing a
+    // conformal element must never do. The airframe has no depth in the HUD's
+    // world, so the sill is described here instead: a rect clipping everything
+    // below the coaming line, computed from the same focal length the ladder
+    // is placed with so it stays correct when the FOV moves.
+    this.clipId = `ct-ck-sill-${(Math.random() * 1e6) | 0}`;
+    const clip = svg('clipPath', { id: this.clipId, clipPathUnits: 'userSpaceOnUse' },
+      this.stage.definitions);
+    this.clipRect = svg('rect', { x: 0, y: 0, width: 4096, height: 2160 }, clip);
+    this.ladderUses = this.stage.uses(this.gLadder);
 
     this.gBank = this.stage.layer('is-dim');
     this.gBankPtr = svg('g', undefined, this.gBank);
@@ -182,6 +205,47 @@ export class CenterHud {
    */
   setFov(fovDeg: number): void {
     this.f = (this.h * 0.5) / Math.tan(clamp(fovDeg, 20, 130) * 0.5 * DEG);
+    if (this.cockpit) this.applySillClip();
+  }
+
+  /**
+   * Puts the camera inside or outside the cockpit.
+   *
+   * Two things change. The ladder gets clipped at the coaming (see the clip
+   * path built in the constructor), and the convergence bracket is dropped —
+   * from the pilot's seat the reflector sight's own frame, hood and mounting
+   * already draw a box round the aiming point, and adding four more corners on
+   * top of it is how the cockpit ended up with seven marks stacked at one
+   * place while the external HUD had three.
+   */
+  setCockpit(on: boolean): void {
+    if (on === this.cockpit) return;
+    this.cockpit = on;
+    this.applySillClip();
+    setAttr(this.retBracket, 'display', on ? 'none' : 'inline');
+  }
+
+  /**
+   * Depression of the canopy sill below the boresight, degrees.
+   *
+   * Measured off the rendered cockpit rather than assumed: the coaming's top
+   * edge sits 165 px below frame centre at 1080p on a 66 degree lens, and
+   * atan(165 / 831) is 11.2. Expressing it as an angle rather than as a pixel
+   * row is what keeps it right when the FOV breathes or the window resizes.
+   */
+  private applySillClip(): void {
+    const yCut = this.cockpit
+      ? Math.round(this.cy + this.f * Math.tan(11.2 * DEG))
+      : 1e5;
+    setAttr(this.clipRect, 'y', -1e4);
+    setAttr(this.clipRect, 'x', -1e4);
+    setAttr(this.clipRect, 'width', 1e5);
+    setAttr(this.clipRect, 'height', yCut + 1e4);
+    // 'none' rather than an empty attribute: an empty clip-path is invalid and
+    // browsers disagree about whether that means "no clip" or "clip everything".
+    for (const u of this.ladderUses) {
+      setAttr(u, 'clip-path', this.cockpit ? `url(#${this.clipId})` : 'none');
+    }
   }
 
   resize(w: number, h: number, u: number, fovDeg: number): void {
@@ -329,6 +393,8 @@ export class CenterHud {
       `M ${-hw} 0 L ${-hgap} 0 M ${-hw} ${-7 * U} L ${-hw} ${7 * U} ` +
       `M ${hgap} 0 L ${hw} 0 M ${hw} ${-7 * U} L ${hw} ${7 * U}`);
 
+    this.applySillClip();
+
     // Bank arc -------------------------------------------------------------
     while (this.gBank.firstChild) this.gBank.removeChild(this.gBank.firstChild);
     this.gBank.appendChild(this.gBankPtr);
@@ -375,6 +441,17 @@ export class CenterHud {
     // --- ladder -----------------------------------------------------------
     setSvgTransform(this.gLadder, `translate(${this.cx},${this.cy}) rotate(${(-t.roll).toFixed(2)})`);
     const pitch = t.pitch;
+    // Where the lead marker falls in the ladder's own rotated frame, so a rung
+    // figure can stand aside for it. The ladder is drawn under
+    // 'translate(cx,cy) rotate(-roll)'; undoing that is one rotation by -roll
+    // of the screen-space offset. R5 asked for the reticle stack to be
+    // untangled and hud.png delivered, but the '10' figure still printed
+    // through the lead bracket, which is the last of the collisions.
+    const lr = -t.roll * DEG;
+    const ldx = lead.x - this.cx, ldy = lead.y - this.cy;
+    const leadLx = ldx * Math.cos(lr) + ldy * Math.sin(lr);
+    const leadLy = -ldx * Math.sin(lr) + ldy * Math.cos(lr);
+    const leadOn = lead.visible;
     for (const bar of this.bars) {
       const rel = bar.deg - pitch;
       const show = Math.abs(rel) < 26;
@@ -386,6 +463,15 @@ export class CenterHud {
       const y = -this.f * Math.tan(rel * DEG);
       setSvgTransform(bar.g, `translate(0,${y.toFixed(1)})`);
       if (bar.deg === 0) setSvgTransform(this.horizon, `translate(0,${y.toFixed(1)})`);
+      // Blank a rung's figures while the lead marker is on top of them.
+      const tl = bar.g.children[1] as SVGTextElement | undefined;
+      const tr = bar.g.children[2] as SVGTextElement | undefined;
+      if (tl && tr && Math.abs(bar.deg) % 10 === 0 && bar.deg !== 0) {
+        const near = leadOn && Math.abs(leadLy - y) < 17 * U;
+        const dd = String(Math.abs(bar.deg));
+        setText(tl, near && leadLx < 0 ? '' : dd);
+        setText(tr, near && leadLx > 0 ? '' : dd);
+      }
     }
     // The horizon bar belongs to the 0° rung; keep it in sync even when the
     // rung itself is culled, so the world line never disappears mid-loop.
@@ -399,8 +485,18 @@ export class CenterHud {
     setSvgTransform(this.gSlipBall, `translate(${(clamp(t.slip, -1, 1) * 11 * U).toFixed(1)},0)`);
 
     // --- flight-path marker ----------------------------------------------
-    setAttr(this.gFpm, 'display', this.fpmOn ? 'inline' : 'none');
-    if (this.fpmOn) setSvgTransform(this.gFpm, `translate(${this.fpmX.toFixed(1)},${this.fpmY.toFixed(1)})`);
+    // Suppressed when it lands on the sight. The FPM is a ring with side arms
+    // and the pipper is a ring with four arms and a hub: sitting on top of each
+    // other they are one indecipherable knot of circles, and the critique
+    // counted the overlap as a second candidate aiming point. It is also the
+    // one moment the FPM has nothing to say — coincident with the boresight
+    // means the aeroplane is going exactly where it is pointing, which the
+    // pipper already tells you. 84 px is just outside the 66 px range ring and
+    // its tick stubs.
+    const fpmClear = Math.hypot(this.fpmX - this.cx, this.fpmY - this.cy) > 84 * U;
+    const fpmShow = this.fpmOn && fpmClear;
+    setAttr(this.gFpm, 'display', fpmShow ? 'inline' : 'none');
+    if (fpmShow) setSvgTransform(this.gFpm, `translate(${this.fpmX.toFixed(1)},${this.fpmY.toFixed(1)})`);
 
     // --- lead pip ---------------------------------------------------------
     const showLead = lead.visible;

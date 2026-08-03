@@ -771,8 +771,9 @@ export class RenderSystem implements Subsystem {
    *   ink:   opacity, width, depthSens, normalSens, normalWeight, idWeight,
    *          darken, saturate, tintAmount, fadeStart, fadeEnd,
    *          interiorFadeStart, interiorFadeEnd, aoStrength
-   *   grade: exposure, contrast, shoulder, bloom, vignetteDark, vignetteDesat,
-   *          chromatic, grain, lutAmount
+   *   grade: exposure, contrast, shoulder, knee, kneeSat, pivot, gain,
+   *          vignetteDark, vignetteDesat, vignetteAmount, chromatic, grain,
+   *          lutAmount
    *
    * @returns false if the knob is unknown.
    */
@@ -822,6 +823,11 @@ export class RenderSystem implements Subsystem {
         case 'exposure': celGlobals.uExposure.value = value; return true;
         case 'contrast': this.tuned.gradeContrast = value; u.uContrast.value = value; return true;
         case 'shoulder': u.uShoulder.value = value; return true;
+        // Display-referred shoulder: where the top of the range stops being a
+        // straight line, and how much chroma survives the compression. See the
+        // shoulder block in GradePass.
+        case 'knee': u.uKnee.value = value; return true;
+        case 'kneeSat': u.uKneeSat.value = value; return true;
         case 'pivot': this.tuned.gradePivot = value; u.uPivot.value = value; return true;
         case 'gain': this.tuned.gradeGain = value; u.uGain.value = value; return true;
         case 'vignetteDark': u.uVignetteDark.value = value; return true;

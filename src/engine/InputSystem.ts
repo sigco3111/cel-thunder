@@ -207,6 +207,8 @@ export class InputSystem implements Subsystem {
     this.bailProgress = 0;
     // Defer the reticle reset until the view has a valid orientation.
     this.pendingAimReset = true;
+    // ...and stop the stale cursor position from immediately undoing it.
+    this.mouse.releaseAbsoluteAim();
   }
   private pendingAimReset = true;
 
@@ -262,6 +264,7 @@ export class InputSystem implements Subsystem {
     // Roll the edge buffers over for the next frame.
     this.prevCodes.clear();
     for (const c of this.codes) this.prevCodes.add(c);
+    this.keyboard.clearTaps();
     this.pulseBits = 0;
   }
 
@@ -289,6 +292,8 @@ export class InputSystem implements Subsystem {
     this.codes.clear();
     if (this.suspended) return;
     for (const c of this.keyboard.codes) this.codes.add(c);
+    // Sub-frame taps, so a quick stab at the gear lever is never swallowed.
+    for (const c of this.keyboard.tapped) this.codes.add(c);
     for (const c of this.mouse.codes) this.codes.add(c);
     for (const c of this.gamepad.codes) this.codes.add(c);
   }
@@ -473,16 +478,39 @@ export class InputSystem implements Subsystem {
   }
 
   /** Direct (non-assisted) axis values from whichever device is live. */
+  /**
+   * The player's stick, in the flight model's sign convention.
+   *
+   * ## Why roll and yaw are negated
+   *
+   * The model's body frame is documented as "+X right wing, +Y up, +Z forward,
+   * right-handed". Those three cannot all be true: X-right / Y-up / Z-forward
+   * is the *left*-handed convention, and a rotation cannot change handedness,
+   * so once that frame is placed in three.js's right-handed world the body +X
+   * axis comes out on the **left** of the screen. Measured, not assumed: with
+   * the chase camera looking straight down the nose, body +X dotted with the
+   * camera's screen-right axis is −0.999.
+   *
+   * Everything inside the model is self-consistent, so this is invisible until
+   * a *player-facing* word meets the screen — and then it is glaring: "roll
+   * right" banked the aeroplane to the left and turned it left. Mirroring
+   * flips roll and yaw and leaves pitch alone, which is exactly the two axes
+   * corrected here.
+   *
+   * This is the one place the pilot's intent becomes model input (the mouse
+   * director already works in measured screen axes and needs no correction),
+   * so it is the one place the correction belongs.
+   */
   private manualAxes(out: { pitch: number; roll: number; yaw: number }): void {
     if (this.device === 'gamepad' && this.gamepad.connected) {
       out.pitch = this.gamepad.pitch;
-      out.roll = this.gamepad.roll;
-      out.yaw = this.gamepad.yaw;
+      out.roll = -this.gamepad.roll;
+      out.yaw = -this.gamepad.yaw;
       return;
     }
     out.pitch = applyCurve(this.keyPitch, this.stickCurve);
-    out.roll = applyCurve(this.keyRoll, this.stickCurve);
-    out.yaw = applyCurve(this.keyYaw, this.stickCurve);
+    out.roll = -applyCurve(this.keyRoll, this.stickCurve);
+    out.yaw = -applyCurve(this.keyYaw, this.stickCurve);
   }
 
   private axisScratch = { pitch: 0, roll: 0, yaw: 0 };
@@ -513,7 +541,7 @@ export class InputSystem implements Subsystem {
       // The absolute cursor is mapped straight through the aim cone instead: the
       // canvas edge is the cone edge, which is the only mapping that stays
       // consistent when the player clicks and the relative path takes over.
-      this.aim.fromWireAim(view, this.mouse.nx, this.mouse.ny);
+      this.aim.fromWireAim(view, this.mouse.nx, this.mouse.ny, _camRight, _camUp);
     } else if (this.scheme === 'mouse' && this.device !== 'gamepad' && mouseFree) {
       this.aim.steer(this.mouseDx, this.mouseDy, _camRight, _camUp, ctx.settings.mouseSensitivity);
     } else if (this.scheme === 'mouse' && this.device === 'gamepad' && !this.lookActive) {
@@ -574,7 +602,9 @@ export class InputSystem implements Subsystem {
       // Realistic: the virtual stick (or the pad) drives the surfaces directly.
       if (this.device === 'mouse') {
         f.pitch = applyCurve(this.stickY, this.stickCurve);
-        f.roll = applyCurve(this.stickX, this.stickCurve);
+        // Negated for the same reason as manualAxes: stick right must bank the
+        // aeroplane toward the right of the screen.
+        f.roll = -applyCurve(this.stickX, this.stickCurve);
         f.yaw = ax.yaw;
       } else {
         f.pitch = ax.pitch; f.roll = ax.roll; f.yaw = ax.yaw;

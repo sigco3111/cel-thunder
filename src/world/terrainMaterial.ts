@@ -332,12 +332,23 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
     uDetailFar: { value: 7000.0 },
     uFieldStrength: { value: 1.0 },
     /**
-     * Range beyond which hedgerow geometry stops being evaluated. The second
-     * Voronoi pass — the one that measures distance to the parcel boundary — is
-     * roughly half the cost of the farmland block, and past this range a hedge
-     * is under a pixel wide, so it buys nothing but shimmer.
+     * Ground metres per screen pixel beyond which hedgerow geometry stops being
+     * evaluated.
+     *
+     * This used to be a *camera distance* (4.2 km), and that single number was
+     * the reason the field system terminated on a visible curved boundary in
+     * every high frame for four rounds: inside the ring the county had
+     * hedgerows, outside it the identical parcels rendered as flat untextured
+     * polygons. Distance is the wrong variable. A hedge is a line, and whether
+     * a line can be drawn depends on how many metres of ground one pixel
+     * covers — which folds camera distance, field of view, resolution and,
+     * crucially, the grazing angle into one term. Hedges are now drawn wherever
+     * the footprint can carry them, with the line's opacity falling in exact
+     * proportion to how far it is stretched past its true width (see the
+     * boundary block), so the web thins out the way a real hedgerow landscape
+     * does instead of stopping dead on a circle.
      */
-    uFieldEdgeDist: { value: 4200.0 },
+    uHedgeMaxPx: { value: 30.0 },
 
     // Terrain-local aerial perspective. These shadow the shared celGlobals
     // uniforms of the same name (assigned after CelMaterial's own, so they
@@ -463,7 +474,7 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
         uniform float uDetailNear;
         uniform float uDetailFar;
         uniform float uFieldStrength;
-        uniform float uFieldEdgeDist;
+        uniform float uHedgeMaxPx;
         uniform vec2  uRoadA;
         uniform vec2  uRoadB;
         uniform float uRoadOn;
@@ -584,6 +595,17 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
           // only produces shimmer; dissolve it into flat biome colour instead.
           float detail = 1.0 - smoothstep( uDetailNear, uDetailFar, camDist );
 
+          // Ground metres covered by one screen pixel.
+          //
+          // Every level-of-detail decision below is made against this rather
+          // than against camera distance. A hedge 8 km away seen from directly
+          // above and the same hedge 800 m away seen at a grazing angle are the
+          // same rendering problem; only the footprint knows that. Using
+          // distance instead is what produced a *curved boundary* across the
+          // landscape in every high frame — a contour of constant range has no
+          // business being visible in a picture of farmland.
+          float px = max( length( dPx.xz ), length( dPy.xz ) );
+
           vec4 mask = texture2D( uMask, ( P.xz + uMapHalf ) / uMapSize );
           float moisture = mask.r;
           float river    = mask.g;
@@ -607,8 +629,12 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
 
           float wSand = 1.0 - smoothstep( uBeachTop - uBeachFade, uBeachTop + uBeachFade, P.y );
           wSand *= 1.0 - smoothstep( 0.25, 0.5, slope );
-          // River banks are sand/shingle too.
-          wSand = max( wSand, smoothstep( 0.45, 0.85, river ) * ( 1.0 - smoothstep( 0.2, 0.45, slope ) ) * 0.55 );
+          // River banks are shingle too — but only the bed itself. The old
+          // threshold caught the whole floodplain and painted hectares of
+          // hillside a pale near-white, which from altitude read as a scatter
+          // of bald patches and was the single loudest source of the "confetti"
+          // note against hero. Shingle is a ribbon, not a region.
+          wSand = max( wSand, smoothstep( 0.66, 0.95, river ) * ( 1.0 - smoothstep( 0.2, 0.45, slope ) ) * 0.34 );
 
           float wGrass = clamp( 1.0 - wRock - wSnow - wSand, 0.0, 1.0 );
           float total = wRock + wSnow + wSand + wGrass + 1e-4;
@@ -634,21 +660,28 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
             // single highest-value fetch in this shader.
             const mat2 GR = mat2( 0.7373, -0.6755, 0.6755, 0.7373 );
             vec2 guv2 = ( GR * P.xz ) * gs * 0.2874;
-            vec3 g = mix(
+            vec3 gTex = mix(
               textureGrad( uGrassAlb, guv, dPx.xz * gs, dPy.xz * gs ).rgb,
               textureGrad( uGrassAlb, guv2, ( GR * dPx.xz ) * gs * 0.2874, ( GR * dPy.xz ) * gs * 0.2874 ).rgb,
               0.42 );
             // Blend toward the tile's own mean at distance so the terrain
             // reads as biome blocks, not as a vibrating texture.
-            g = mix( sRGB( vec3( 0.300, 0.372, 0.205 ) ), g, 0.35 + 0.65 * detail );
+            vec3 g = mix( sRGB( vec3( 0.300, 0.372, 0.205 ) ), gTex, 0.35 + 0.65 * detail );
 
             float forest = forestDensity( P.xz, P.y, slope, moisture, macro );
             // Forest floor: darker, bluer, and with canopy-scale mottling that
-            // keeps reading after the tree billboards have faded out. The
-            // mottling has to be at canopy scale (~25 m crowns clumping over
-            // ~160 m) or the wood reads as a flat green stain from 500 m.
-            float canopy = tFbm( P.xz * 0.0062 ) * 0.65 + tNoise( P.xz * 0.041 ) * 0.35;
-            vec3 forestCol = mix( sRGB( vec3( 0.126, 0.196, 0.124 ) ), sRGB( vec3( 0.222, 0.322, 0.182 ) ), canopy );
+            // keeps reading after the tree billboards have faded out. Three
+            // scales — ~25 m crowns, ~160 m clumping, and a ~740 m stand term.
+            // The stand term is the one that matters from altitude: without it
+            // every wood in a high frame collapses to a single flat dark-green
+            // stain the moment the finer octaves drop below a pixel, which is
+            // what made the wooded half of hud and dogfight read as untextured
+            // paint against the fields.
+            float canopy = tFbm( P.xz * 0.0062 ) * 0.56
+                         + tNoise( P.xz * 0.041 ) * 0.28
+                         + tNoise( P.xz * 0.00135 ) * 0.44;
+            canopy = clamp( canopy * 0.86, 0.0, 1.0 );
+            vec3 forestCol = mix( sRGB( vec3( 0.108, 0.174, 0.114 ) ), sRGB( vec3( 0.248, 0.352, 0.196 ) ), canopy );
             g = mix( g, forestCol, forest * 0.86 );
 
             // --- farmland ------------------------------------------------
@@ -657,49 +690,71 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
             // deliberately widespread. What it must not be is regular: see
             // FIELD_GLSL for why the parcels are a merged Voronoi rather than a
             // warped lattice.
-            float farm = ( 1.0 - smoothstep( 0.12, 0.46, forest ) ) * uFieldStrength
-              * ( 1.0 - smoothstep( 0.16, 0.33, slope ) )
-              * smoothstep( 3.0, 26.0, P.y ) * ( 1.0 - smoothstep( 520.0, 860.0, P.y ) )
-              * smoothstep( 0.92, 0.44, macro )
+            // Land that is *enclosed* at all: not wooded, not steep, not
+            // flooded, off the aerodrome, below the moor line.
+            float enclosed = ( 1.0 - smoothstep( 0.12, 0.46, forest ) )
+              * ( 1.0 - smoothstep( 0.19, 0.38, slope ) )
+              * smoothstep( 2.0, 22.0, P.y ) * ( 1.0 - smoothstep( 600.0, 980.0, P.y ) )
               // Floodplain and riverbank stay as rough grazing.
-              * ( 1.0 - smoothstep( 0.30, 0.62, river ) )
+              * ( 1.0 - smoothstep( 0.34, 0.66, river ) )
               // Aerodrome grass, not arable.
               * smoothstep( 1.0, 1.55, padT( P.xz ) );
+            // How *arable* the district is. This used to gate cultivation
+            // outright, which meant the entire field system — parcels, hedges,
+            // crop colour, everything — switched off along one contour of a
+            // smooth noise field, and the landscape ended on a soft but
+            // perfectly readable curve with flat green beyond it. Enclosure is
+            // near-universal in this country; only the crop changes. So the
+            // district term now only *thins* the patchwork toward rough
+            // grazing, and the parcel web never terminates anywhere.
+            float district = smoothstep( 0.94, 0.40, macro );
+            float farm = enclosed * mix( 0.38, 1.0, district ) * uFieldStrength;
             if ( farm > 0.003 ) {
               float mergeP = parcelMergeP( P.xz );
-              // Hedgerow geometry is sub-texel past a few kilometres; below
-              // that the second Voronoi loop is pure shimmer, so drop it and
-              // keep only the parcel colours, which are the read at altitude.
-              bool wantEdge = camDist < uFieldEdgeDist;
+              // Hedgerows are drawn wherever a screen pixel is small enough to
+              // carry one. Past that the second Voronoi loop is pure shimmer,
+              // but the cut is made on footprint and preceded by a fade, so
+              // there is no ring anywhere in the picture.
+              float edgeFade = 1.0 - smoothstep( uHedgeMaxPx * 0.62, uHedgeMaxPx, px );
+              bool wantEdge = edgeFade > 0.002;
               vec4 pc = parcelAt( P.xz, P.y, mergeP, wantEdge );
               float id = pc.z;
               float id2 = tHash( pc.xy + 4211.0 );
               float id3 = tHash( pc.xy + 7717.0 );
+              // Out in the grazing districts the rotation skews to ley and
+              // permanent pasture rather than to cereal, so the thinning of
+              // the patchwork also reads as a change of land use.
+              id2 = mix( 0.58 + 0.42 * id2, id2, district );
 
               // Ploughing runs along the parcel, so the direction is per
               // parcel, not per pixel, and neighbouring parcels rarely agree.
               float ang = id * 3.14159;
               vec2 dir = vec2( cos( ang ), sin( ang ) );
-              // Two scales of ploughing. The furrows themselves are 5-11 m and
-              // only survive to ~1.2 km before they alias, so a coarser strip
-              // pattern (~150 m, the width of a real medieval strip field)
-              // carries the read at altitude.
+              float across = dot( P.xz, dir );
+
+              // TWO scales of working, and the second one is the whole reason
+              // this landscape now reads as farmland from altitude.
+              //
+              // Drill rows are 5-12 m. Their screen period drops below a pixel
+              // at about a kilometre, and past that sampling them produced the
+              // moire that used to lay pale bands across the county — so they
+              // are faded out analytically, exactly when their own footprint
+              // reaches Nyquist. That left NOTHING above a kilometre: every
+              // parcel in hero, dogfight and hud came out a flat slab of paint
+              // with no crop direction at all. The tramline strips below are
+              // 34-96 m, which is still eight pixels wide from four kilometres
+              // up, and they carry the direction cue after the rows have gone.
               float pitch = mix( 0.52, 1.30, id2 );
-              float fphase = dot( P.xz, dir ) * pitch;
-              // Analytic anti-aliasing, not a distance ramp. A 5-11 m furrow
-              // seen at a shallow angle from 600 m has a screen period well
-              // under a pixel, and sampling it there produced the moire that
-              // laid pale horizontal bands right across the county — bands that
-              // crossed field boundaries and therefore read as a rendering
-              // fault rather than as ploughing. Fade each pattern out exactly
-              // when its own footprint reaches the Nyquist limit.
+              float fphase = across * pitch;
               float furAA = 1.0 - smoothstep( 0.9, 2.6, fwidth( fphase ) );
               float fur = sin( fphase );
               fur = floor( fur * 1.5 + 1.5 ) / 2.0;          // 3 hard tonal steps
               fur *= furAA;
-              float sphase = dot( P.xz, dir ) * 0.042;
-              float strip = floor( sin( sphase ) * 1.0 + 1.0 )
-                          * ( 1.0 - smoothstep( 0.9, 2.6, fwidth( sphase ) ) );
+
+              float spitch = 6.2831853 / mix( 34.0, 96.0, id3 );
+              float sphase = across * spitch;
+              float stripAA = 1.0 - smoothstep( 0.9, 2.6, fwidth( sphase ) );
+              float strip = ( floor( sin( sphase ) * 1.5 + 1.5 ) / 2.0 ) * stripAA;
 
               // Crop rotation. Weighted so that pasture and cereal dominate and
               // bare earth is the minority — a landscape of ploughed brown
@@ -720,42 +775,111 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
               // Ploughing is a texture cue, not a pattern: the albedo is
               // posterised a few lines further down, so a 20% modulation here
               // comes out the other side as a full tonal step and the county
-              // ends up hatched. Keep both patterns inside one quantisation
+              // ends up hatched. Keep the drill rows inside one quantisation
               // band so they read as surface rather than as stripes.
-              crop *= 0.925 + 0.15 * fur * arable;
-              crop *= 0.963 + 0.065 * strip * arable;
-              crop *= 0.93 + 0.15 * tFbm( P.xz * 0.085 );
+              crop *= 0.930 + 0.14 * fur * arable;
+              // The tramlines carry MORE contrast once the drill rows have
+              // faded, so the total amount of visible working stays roughly
+              // constant from two hundred metres to six kilometres instead of
+              // collapsing to a flat polygon somewhere in between.
+              // Grass leys and permanent pasture are cut and grazed rather than
+              // drilled, so they get the same tramlines at a third of the
+              // contrast — enough to give a 400 m foreground field a scale
+              // reference instead of leaving it one unbroken slab of paint.
+              float worked = max( arable, 0.42 );
+              crop *= 1.0 + ( strip - 0.5 ) * mix( 0.23, 0.115, furAA ) * worked;
+
+              // Within-field variation: soil, drainage, and the lie of the
+              // land. Offset PER PARCEL, so the pattern belongs to the field
+              // and changes across the hedge instead of washing over it. The
+              // 76 m octave is what survives to altitude; the 27 m and 12 m
+              // ones are faded on footprint so they cannot alias.
+              vec2 fo = pc.xy * 3.7;
+              float soil = tNoise( P.xz * 0.0132 + fo ) - 0.5;
+              soil += ( tNoise( P.xz * 0.0355 + fo ) - 0.5 ) * 0.62
+                    * ( 1.0 - smoothstep( 3.0, 9.0, px ) );
+              // The amplitude has to clear a quantisation band to survive. The
+              // albedo is posterised into seven steps a few lines below, so a
+              // 10% wobble sits inside one band and is thrown away — which is
+              // precisely why a 400 m pasture rendered as one flat slab even
+              // with the variation already present. Give it enough to cross a
+              // step and it comes out the far side as posterised patches of
+              // soil and drainage, which is both the truthful read and the
+              // house style.
+              crop *= 1.0 + soil * ( 0.27 + 0.19 * ( 1.0 - arable ) );
+              crop *= 1.0 + ( tFbm( P.xz * 0.085 ) - 0.5 ) * 0.24
+                    * ( 1.0 - smoothstep( 1.6, 5.0, px ) );
+
+              // Surface grain. The crop colour REPLACES the grass tile, so
+              // without this a cultivated parcel is a flat slab of paint —
+              // which is exactly how the whole foreground of low.png came out.
+              // Modulating the crop by the tile's own value relief puts a real
+              // surface back on the field, and because it comes from a
+              // world-space mip-mapped texture its on-screen frequency scales
+              // with distance for free: no hand-tuned stipple, no perspective
+              // mismatch, and it dissolves to nothing at range on its own.
+              float grain = dot( gTex, vec3( 0.2126, 0.7152, 0.0722 ) ) * ( 1.0 / 0.1421 );
+              // Kept deliberately below the amplitude of the soil term above.
+              // The albedo is posterised, so the two variations ADD before they
+              // are stepped: push both hard and a smooth grain turns into hard
+              // salt-and-pepper speckle, which is the "stipple" that got this
+              // texture deleted a round ago. Broad variation carries the read,
+              // grain only carries the surface.
+              // Clump the roughness with the same field that drives the soil,
+              // so the sward is smooth in some parts of a field and rough in
+              // others. A grain of constant amplitude over four hundred metres
+              // reads as film noise laid over the picture; a grain that varies
+              // reads as ground.
+              float grainAmt = 0.40 * ( 0.70 + 0.60 * clamp( soil + 0.5, 0.0, 1.0 ) );
+              crop *= mix( 1.0, clamp( grain, 0.62, 1.50 ), grainAmt );
 
               if ( wantEdge ) {
                 // Boundary furniture, in metres of distance from the bisector.
                 // The raw Voronoi bisector is a dead-straight segment; a real
                 // hedge wanders by a couple of metres, and without that wobble
-                // the whole county reads as a Voronoi diagram.
+                // the whole county reads as a Voronoi diagram. The wobble is
+                // 22 m across, so it has to be faded on footprint like
+                // everything else or it becomes boundary shimmer.
                 float edgeM = pc.w * PARCEL_M
-                            + ( tNoise( P.xz * 0.045 ) - 0.5 ) * 5.0;
-                // Widen a little with distance so the line stays at least a
-                // pixel, but nowhere near enough to turn into a black web.
-                float lodW = min( 2.4, 1.0 + camDist * 0.0009 );
+                            + ( tNoise( P.xz * 0.045 ) - 0.5 ) * 5.0
+                              * ( 1.0 - smoothstep( 3.0, 11.0, px ) );
                 // Not every boundary is planted. Open holdings divided only by
                 // a change of crop are as characteristic as bocage, and mixing
                 // the two is what stops the boundary web reading as a mesh.
-                float hedged = step( 0.22, tHash( pc.xy + 331.0 ) );
+                float hedged = step( 0.30, tHash( pc.xy + 331.0 ) );
                 // A minority are a metalled track with pale verges.
                 // Decorrelated from 'id' on purpose: reusing it would make
                 // every tracked boundary share a ploughing direction.
-                float track = step( 0.84, fract( id * 7.31 + id3 * 3.13 ) );
-                float wHedge = ( 2.5 + 2.0 * id3 ) * lodW;
-                float hedge = ( 1.0 - smoothstep( wHedge * 0.5, wHedge, edgeM ) )
-                            * max( hedged, track );
+                float track = step( 0.85, fract( id * 7.31 + id3 * 3.13 ) );
+
+                // True half-width of the planted boundary, in metres.
+                float hw = 2.6 + 2.2 * id3;
+                // Filtered half-width. The line is never allowed to be thinner
+                // than about three quarters of a pixel, and its opacity drops
+                // in exact proportion to how far it had to be widened — so the
+                // integrated darkness it contributes to the pixel is conserved.
+                // That is the whole trick: it is a correctly mip-mapped line.
+                // It cannot shimmer, because it is never sub-pixel; it cannot
+                // vanish on a ring, because nothing switches; and from ten
+                // kilometres up the hedgerow web comes out as the faint grey
+                // reticulation it actually is in a photograph.
+                float fw = max( hw, px * 0.75 );
+                float hedge = ( 1.0 - smoothstep( fw * 0.45, fw, edgeM ) )
+                            * ( hw / fw ) * max( hedged, track ) * edgeFade;
                 vec3 hedgeCol = mix(
-                  sRGB( vec3( 0.152, 0.214, 0.126 ) ),      // hedge / treeline
+                  sRGB( vec3( 0.163, 0.222, 0.132 ) ),      // hedge / treeline
                   sRGB( vec3( 0.520, 0.470, 0.372 ) ),      // chalk track
                   track );
+                // Per-boundary value spread, or every stroke in the county is
+                // the identical dark navy line and the parcels read as a
+                // stained-glass window rather than as land.
+                hedgeCol *= 0.78 + 0.46 * tHash( pc.xy + 1777.0 );
                 // Headland: the turning strip a plough leaves unsown inside
                 // every boundary. Subtle, but it is the cue that says "worked".
-                float head = 1.0 - smoothstep( wHedge, wHedge + 13.0, edgeM );
+                float head = ( 1.0 - smoothstep( fw, fw + 14.0, edgeM ) )
+                           * ( 1.0 - smoothstep( 5.0, 13.0, px ) );
                 crop = mix( crop, crop * 1.09, head * 0.5 * arable );
-                crop = mix( crop, hedgeCol, hedge * ( 0.80 - 0.24 * track ) );
+                crop = mix( crop, hedgeCol, hedge * ( 0.84 - 0.26 * track ) );
               }
               g = mix( g, crop, farm );
             }
@@ -763,9 +887,16 @@ export function createTerrainMaterial(deps: TerrainMaterialDeps): TerrainMateria
             // --- supply road --------------------------------------------
             if ( uRoadOn > 0.5 ) {
               float rd = roadDistance( P.xz );
-              float lodW = 1.0 + camDist * 0.0012;
-              float carriage = 1.0 - smoothstep( 3.0 * lodW, 4.4 * lodW, rd );
-              float verge    = 1.0 - smoothstep( 5.0 * lodW, 8.5 * lodW, rd );
+              // Footprint-filtered exactly like the hedgerows. The old rule
+              // widened the carriageway in proportion to camera distance with
+              // no cap, so from ten kilometres a 7 m lane rendered as a 110 m
+              // grey band — the "ruler-straight road at constant width" running
+              // to the horizon in hud. Keep it one pixel wide and let its
+              // opacity carry the distance instead.
+              float rw = max( 3.8, px * 0.75 );
+              float vw = max( 7.6, px * 1.30 );
+              float carriage = ( 1.0 - smoothstep( rw * 0.55, rw, rd ) ) * ( 3.8 / rw );
+              float verge    = ( 1.0 - smoothstep( vw * 0.62, vw, rd ) ) * ( 7.6 / vw );
               // The road is graded, so it will not climb a cliff or ford a
               // river bed; fade it out where it would have to.
               float ok = ( 1.0 - smoothstep( 0.16, 0.30, slope ) ) * smoothstep( 1.0, 6.0, P.y )

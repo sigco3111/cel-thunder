@@ -1,3 +1,4 @@
+import * as THREE from 'three';
 import { resetSpawn } from './ParticleEngine';
 import { RAMP, TILE } from './VfxTextures';
 import type { SurfaceKind, VfxCore } from './VfxCore';
@@ -6,16 +7,38 @@ import { DEBRIS_COLORS } from './DebrisSystem';
 /**
  * Guns: what happens at the muzzle, at the breech and at the far end.
  *
- * The muzzle flash is deliberately *not* a blurry blob. It is three stacked
- * stamps with different lifetimes — a cone of burning propellant along the
- * bore, a short star of unburnt powder igniting at the muzzle, and a wash of
- * light — all quantised into two or three hard value steps and all gone inside
- * 45 ms. At 60 fps that means a flash occupies two or three frames, which is
- * why real gun camera footage strobes rather than glows.
+ * ## The muzzle flash, and why it was wrong for four rounds
  *
- * Everything scales with calibre: a 7.7 mm Browning gets a wisp, a 20 mm
- * Hispano gets a star with a smoke ring, a 37 mm gets a bloom you feel.
+ * It used to be three stacked additive stamps: a cone, a seven-point *star*,
+ * and a broad wash. The critique called it "a flat yellow star sprite" in
+ * rounds 3, 4, 5 and 6, and every part of that description was earned:
+ *
+ *  - the star tile is a cartoon sparkle. It has no bore direction in it, no
+ *    depth, and at 128 px of additive white on the bloom layer it swallowed
+ *    both the cone and the wing behind it;
+ *  - all three stamps were given a *random* roll ('p.rot = rand(0, 6.283)'),
+ *    so the one asset that does encode a direction — the cone — pointed
+ *    somewhere new every round. What landed in the capture was a pair of white
+ *    trapezoids hanging under the wing at unrelated angles;
+ *  - three additive stamps at full ramp alpha sum past white immediately, so
+ *    the flash had no colour at all.
+ *
+ * What replaces it is two stamps and no star. A cone of burning propellant is
+ * rolled to point *down the bore in screen space* — the direction is computed
+ * per shot from the barrel axis in view space, so it is right from every
+ * camera position — with a small, shorter-lived hot core inside it at the
+ * muzzle. The cone is tinted decisively orange so that even saturated it stays
+ * a flame rather than a highlight, and the whole event is over in 30-50 ms:
+ * two or three frames, which is why real gun-camera footage strobes rather
+ * than glows. When the bore points within about 15° of the lens there is no
+ * meaningful screen direction to roll to, so the flash is drawn as the round
+ * bloom you actually see looking down a barrel instead.
+ *
+ * Everything still scales with calibre: a 7.7 mm Browning gets a wisp, a 20 mm
+ * Hispano gets a flame and a smoke ring, a 37 mm gets a bloom you feel.
  */
+
+const _bore = new THREE.Vector3();
 
 export interface MuzzleOptions {
   /** Millimetres — drives every dimension below. */
@@ -50,55 +73,89 @@ export function spawnMuzzleFlash(
   // 0.30 + 0.055·cal gave a 20 mm Hispano a 1.4 m base, and with the star tile
   // reaching 2.9× that, an eight-metre flash on a nine-metre aeroplane — a
   // white blowout that swallowed the wing every time the guns were held down.
-  // A real 20 mm muzzle flash is under a metre.
-  const s = 0.22 + cal * 0.030;
+  // A real 20 mm muzzle flash is under a metre — and measured on a wing gun in
+  // the capture, 0.22 + 0.030·cal still put a 1.7 m cone under an 11 m wing.
+  // Two thirds of that reads as gunfire rather than as a flare hung off the
+  // leading edge.
+  const s = 0.15 + cal * 0.020;
   const avx = o.vx ?? 0, avy = o.vy ?? 0, avz = o.vz ?? 0;
 
   const tint = o.tint ?? 0xfff0c0;
   const tg = ((tint >> 8) & 0xff) / 255;
   const tb = (tint & 0xff) / 255;
 
-  // --- the cone along the bore ---------------------------------------------
-  p.x = x + dx * s * 0.35; p.y = y + dy * s * 0.35; p.z = z + dz * s * 0.35;
-  p.vx = avx + dx * 6; p.vy = avy + dy * 6; p.vz = avz + dz * 6;
-  p.life = 0.030 + cal * 0.0012;
-  p.size0 = s * 1.5; p.size1 = s * 2.4;
-  // The cone tile points +Y in sprite space; the billboard rotation is chosen
-  // per shot so the flare does not appear stapled to the screen axes.
-  p.rot = core.rand(0, 6.283);
+  // --- which way the bore points, on screen --------------------------------
+  //
+  // The Cone tile is authored with its apex at sprite +Y and its base at -Y,
+  // and the vertex shader rolls the quad by 'p.rot' in the *view* XY plane. So
+  // the roll that makes the cone come out of the barrel is the one that maps
+  // sprite +Y onto the barrel axis in view space. With the shader's
+  // '(x·cos − y·sin, x·sin + y·cos)', sprite +Y lands on (−sin, cos), so the
+  // angle is atan2(−bx, by) of the view-space bore.
+  //
+  // Doing it here rather than with the shader's velocity-alignment mode is
+  // deliberate: that mode reads the particle's *world* velocity, which for a
+  // gun on an aeroplane is dominated by the aeroplane's 110 m/s and points
+  // straight into the screen on a chase camera — it degenerates exactly in the
+  // three framings that fire.
+  _bore.set(dx, dy, dz).transformDirection(core.camera.matrixWorldInverse);
+  // sin of the angle between the bore and the lens axis.
+  const lateral = Math.hypot(_bore.x, _bore.y);
+  // Inside about 25° of the lens axis the flash is *pointing at the camera*:
+  // there is no screen direction left to draw a cone along, and drawing one
+  // anyway gives the two-hundred-millimetre triangle stapled under the wing
+  // that the first pass produced in the strafing frame. Down the barrel a
+  // flash is a round bloom, so that is what gets drawn.
+  const alongLens = lateral < 0.42;
+  const roll = alongLens ? 0 : Math.atan2(-_bore.x, _bore.y);
+  // Half the cone tile's height, in sprite units: the offset that puts the
+  // *base* of the flame on the muzzle instead of its middle. Scaled by how
+  // much of the cone is actually foreshortened away.
+  const baseOff = alongLens ? 0 : s * 0.75 * lateral;
+
+  // --- the flame cone -------------------------------------------------------
+  p.x = x + dx * baseOff; p.y = y + dy * baseOff; p.z = z + dz * baseOff;
+  p.vx = avx + dx * 5; p.vy = avy + dy * 5; p.vz = avz + dz * 5;
+  p.life = 0.026 + cal * 0.0009;
+  // Seen end-on the flame has no length to show, so the bloom has to carry the
+  // whole event on its diameter or the guns read as a pair of specks.
+  p.size0 = s * (alongLens ? 1.55 : 1.15); p.size1 = s * (alongLens ? 2.75 : 2.05);
+  p.rot = roll;
   p.spin = 0;
-  p.drag = 8; p.grav = 0; p.wind = 0; p.turb = 0;
-  p.ramp = RAMP.MuzzleFlash; p.tile = TILE.Cone;
-  p.erode = 0.05; p.band = 1.8;
-  p.r = 1; p.g = 0.5 + tg * 0.5; p.b = 0.4 + tb * 0.6; p.a = 1;
+  p.drag = 10; p.grav = 0; p.wind = 0; p.turb = 0;
+  p.ramp = RAMP.MuzzleFlash;
+  // Seen end-on a muzzle flash is a disc, not a triangle.
+  p.tile = alongLens ? TILE.Ember : TILE.Cone;
+  // Barely eroded, hard-banded: the flash is a stepped graphic shape, and the
+  // emissive path quantises it into three flat values.
+  p.erode = 0.06; p.band = 1.7;
+  // Decisively orange. Additive on the bloom layer saturates fast, and a flash
+  // authored near white has nowhere to go but a colourless blowout — pulling
+  // green and blue down keeps a flame colour even where it clips.
+  p.r = 1; p.g = 0.44 + tg * 0.22; p.b = 0.14 + tb * 0.26; p.a = 1;
   core.flash.emit(now, p);
 
-  // --- the star at the muzzle ----------------------------------------------
-  p.x = x; p.y = y; p.z = z;
+  // --- the hot core at the muzzle ------------------------------------------
+  // Small, short, and *inside* the cone: this is the white centre that gives
+  // the flash a core-to-edge value ramp instead of one flat additive shape.
+  p.x = x + dx * s * 0.12; p.y = y + dy * s * 0.12; p.z = z + dz * s * 0.12;
   p.vx = avx; p.vy = avy; p.vz = avz;
-  p.life = 0.026 + cal * 0.0016;
-  p.size0 = s * 0.6; p.size1 = s * 1.9;
-  p.rot = core.rand(0, 6.283);
-  p.spin = core.sym(3);
-  p.ramp = RAMP.FireCore; p.tile = TILE.Star;
-  p.erode = 0.05; p.band = 2.2;
-  p.r = 1; p.g = 1; p.b = 1; p.a = 1;
+  p.life = 0.020 + cal * 0.0005;
+  p.size0 = s * (alongLens ? 0.58 : 0.42); p.size1 = s * (alongLens ? 1.00 : 0.72);
+  p.rot = roll; p.spin = 0;
+  p.ramp = RAMP.FireCore; p.tile = alongLens ? TILE.Ember : TILE.Cone;
+  p.erode = 0.04; p.band = 2.4;
+  p.r = 1; p.g = 0.92; p.b = 0.74; p.a = 1;
   core.flash.emit(now, p);
 
-  // --- the wash -------------------------------------------------------------
-  if (cal >= 12) {
-    p.life = 0.045;
-    p.size0 = s * 0.8; p.size1 = s * 2.6;
-    p.rot = core.rand(0, 6.283); p.spin = 0;
-    p.ramp = RAMP.MuzzleFlash; p.tile = TILE.Puff;
-    p.erode = 0.2; p.band = 1.2;
-    // The wash is additive and lands on the bloom layer, so it saturates to a
-    // flat white shape long before it reaches full opacity — which reads as a
-    // rectangle stapled to the wing. Keep it as a lift under the star, not a
-    // shape of its own.
-    p.r = 1; p.g = 0.86; p.b = 0.62; p.a = 0.30;
-    core.flash.emit(now, p);
-  }
+  // --- the light it throws --------------------------------------------------
+  // A battery firing a couple of metres outboard genuinely washes the wing
+  // warm, and it is the other half of what the critique asked for at the guns.
+  // Gated on range rather than on 'shake' — the staged framings deliberately
+  // pass shake: 0 so the shutter is not smeared, and those are exactly the
+  // frames that need the spill. Reported rather than spawned, so the rig's two
+  // lights still go to a burning aircraft first if one is nearer.
+  if (!core.tooFar(x, y, z, 120)) core.fireLight.report(x, y, z, 0.26 + cal * 0.005);
 
   // --- barrel smoke ---------------------------------------------------------
   // Cordite: pale, low-alpha, slow. It is the residue that makes a firing pass
@@ -245,16 +302,23 @@ export function spawnImpactAt(
 
   // A hard little flash at the point of contact for everything but water and
   // foliage — it is the first thing the eye catches and it anchors the hit.
+  //
+  // A *disc*, not the four-point Twinkle tile: that tile is described in its
+  // own definition as "the classic anime hit sparkle", and additive white
+  // sparkles on every strike is what the critique read as "white star blobs
+  // with a soft additive glow". A strike is a hot point with debris coming out
+  // of it; the debris is already emitted above, so this only has to be the
+  // point.
   if (surface !== 'water' && surface !== 'foliage') {
     p.x = x + nx * 0.05; p.y = y + ny * 0.05; p.z = z + nz * 0.05;
     p.vx = p.vy = p.vz = 0;
-    p.life = 0.05 + cal * 0.0008;
-    p.size0 = s * 0.8; p.size1 = s * 2.2;
-    p.rot = core.rand(0, 6.283); p.spin = core.sym(4);
+    p.life = 0.038 + cal * 0.0006;
+    p.size0 = s * 0.55; p.size1 = s * 1.25;
+    p.rot = 0; p.spin = 0;
     p.drag = 8; p.grav = 0; p.wind = 0;
-    p.ramp = RAMP.FlashWhite; p.tile = TILE.Twinkle;
+    p.ramp = RAMP.FlashWhite; p.tile = TILE.Ember;
     p.erode = 0.05; p.band = 2;
-    p.r = p.g = p.b = 1; p.a = 1;
+    p.r = 1; p.g = 0.90; p.b = 0.72; p.a = 1;
     core.flash.emit(now, p);
   }
 }
