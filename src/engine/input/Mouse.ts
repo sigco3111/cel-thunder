@@ -65,8 +65,27 @@ export class Mouse {
    * Once a lock has succeeded we know the capability exists, so a later failure
    * (Chrome rate-limits re-locking for ~1.25 s after an Escape) is transient and
    * must not switch the fallback on.
+   *
+   * A *single* refusal is not proof either, and treating it as proof is what the
+   * player reported as "the mouse is always not focused on the game". Chromium
+   * rejects 'requestPointerLock' outright when the document does not have OS
+   * focus — which is precisely the state a player is in when they alt-tab back
+   * to the game and click: that first click is spent focusing the window, the
+   * lock is refused, and the old code concluded the browser could not capture at
+   * all and handed the aeroplane to the bare cursor forever. So this now needs
+   * 'DENY_AFTER' refusals in a row, and the prompt asks for the focus click in
+   * between.
    */
   lockDenied = false;
+  /** How many times the game has asked for the capture this session. */
+  lockRequests = 0;
+  /** Consecutive refusals since the last successful capture. */
+  lockErrors = 0;
+  /**
+   * The last refusal happened while the document did not have focus — so the
+   * fix is a click to focus the window, not a different browser.
+   */
+  lockNeedsFocus = false;
 
   private el: HTMLElement | null = null;
   private prompt: HTMLElement | null = null;
@@ -80,7 +99,16 @@ export class Mouse {
     this.bound = true;
     this.el = target;
 
+    // A canvas is not focusable by default, so clicking it moves DOM focus to
+    // the document body — or nowhere at all — and 'element.focus()' is a no-op.
+    // Chromium will not grant pointer lock to an unfocused document, so making
+    // the canvas a real focus target is a precondition for the capture, not a
+    // nicety.
+    if (!target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+    target.style.outline = 'none';
+
     target.addEventListener('mousedown', this.onDown);
+    addEventListener('focus', this.onWindowFocus);
     addEventListener('mouseup', this.onUp);
     addEventListener('mousemove', this.onMove);
     target.addEventListener('wheel', this.onWheel, { passive: false });
@@ -97,6 +125,7 @@ export class Mouse {
     this.bound = false;
     const target = this.el;
     target?.removeEventListener('mousedown', this.onDown);
+    removeEventListener('focus', this.onWindowFocus);
     removeEventListener('mouseup', this.onUp);
     removeEventListener('mousemove', this.onMove);
     target?.removeEventListener('wheel', this.onWheel);
@@ -114,7 +143,35 @@ export class Mouse {
   private onDown = (e: MouseEvent): void => {
     this.codes.add(`Mouse${e.button}`);
     if (e.button === 1) e.preventDefault();          // middle-click autoscroll
-    if (this.wantLock && !this.locked) this.requestLock();
+    if (this.wantLock && !this.locked) {
+      // Focus first, synchronously, inside the gesture. A click that lands on
+      // the canvas while the *document* is unfocused is the case Chromium
+      // rejects, and it is the ordinary real-world case: the player alt-tabs
+      // back and clicks, and that click is spent focusing rather than locking.
+      // Taking the focus ourselves means the very same click can then lock, and
+      // if the browser still says no, the second click of a double-click will —
+      // which is exactly the gesture the player already tries.
+      this.takeFocus();
+      this.requestLock();
+    }
+  };
+
+  /**
+   * Pulls window and DOM focus onto the canvas. Must be called from inside a
+   * user gesture and before 'requestPointerLock', never after.
+   */
+  private takeFocus(): void {
+    try { window.focus(); } catch { /* cross-origin frame */ }
+    try { this.el?.focus({ preventScroll: true }); } catch { /* not focusable */ }
+  }
+
+  /**
+   * The window has come back. The capture cannot be retaken here — pointer lock
+   * needs a gesture and this is not one — but the prompt was very possibly
+   * showing the wrong thing, so let it re-read the situation.
+   */
+  private onWindowFocus = (): void => {
+    if (this.lockNeedsFocus) { this.lockNeedsFocus = false; this.syncPrompt(); }
   };
 
   private onUp = (e: MouseEvent): void => { this.codes.delete(`Mouse${e.button}`); };
@@ -151,6 +208,8 @@ export class Mouse {
     if (this.locked) {
       this.hasLocked = true;
       this.lockDenied = false;
+      this.lockErrors = 0;
+      this.lockNeedsFocus = false;
       this.dx = 0; this.dy = 0;
       // Coming back out of lock, the OS restores the cursor to wherever it was
       // when we captured it; that stale position must not snap the reticle.
@@ -165,9 +224,20 @@ export class Mouse {
     this.syncPrompt();
   };
 
-  /** Records a refused lock. See 'lockDenied' for why 'hasLocked' gates it. */
+  /**
+   * Records a refused lock.
+   *
+   * See 'lockDenied' for why 'hasLocked' gates it and why one refusal is not
+   * enough. The refusal is attributed to focus whenever the document did not
+   * have it, because that is both the commonest cause and the only one the
+   * player can do anything about.
+   */
   private noteDenied(): void {
-    if (!this.hasLocked) this.lockDenied = true;
+    this.lockErrors++;
+    let focused = true;
+    try { focused = document.hasFocus(); } catch { /* sandboxed */ }
+    this.lockNeedsFocus = !focused;
+    if (!this.hasLocked && this.lockErrors >= DENY_AFTER) this.lockDenied = true;
   }
 
   /**
@@ -240,6 +310,11 @@ export class Mouse {
     const el = this.el;
     const req = (el as unknown as { requestPointerLock?: (o?: unknown) => unknown })?.requestPointerLock;
     if (!el || !req) return;
+    this.lockRequests++;
+    // Belt and braces: 'requestLock' is also reachable from the Deploy button's
+    // click handler, which is a gesture on a *different* element, so the canvas
+    // may still not hold focus by the time we get here.
+    this.takeFocus();
 
     // 'unadjustedMovement' asks for raw, un-accelerated deltas — much better for
     // aiming, and Chromium-only.
@@ -369,21 +444,36 @@ export class Mouse {
     this.syncPrompt();
   }
 
-  private promptMode: '' | 'invite' | 'denied' = '';
+  private promptMode: '' | 'invite' | 'focus' | 'denied' = '';
 
   private syncPrompt(): void {
     if (!this.prompt) return;
     const show = this.wantLock && !this.locked && !this.promptSuppressed && !this.promptMuted;
-    // Two different things to say, and telling a player the wrong one is worse
-    // than silence. "Click to take the controls" is an instruction; if this
-    // browser has already refused pointer lock, clicking will refuse it again
-    // and the instruction becomes a lie the player will keep obeying. In that
-    // state the cursor genuinely *is* the aim, so say that instead.
-    const mode = !show ? '' : this.lockDenied ? 'denied' : 'invite';
-    if (this.el) this.el.style.cursor = mode === 'invite' ? 'pointer' : '';
+    // Three different things to say, and telling a player the wrong one is
+    // worse than silence.
+    //
+    //   invite  capture is available and untried — "click to take the controls".
+    //   focus   the browser refused, and it refused because the window did not
+    //           have focus. This is the state the player described as "the mouse
+    //           is always not focused on the game", and it used to render as
+    //           either a lie ("click to take the controls", which then does
+    //           nothing) or a shrug ("this browser will not capture the mouse",
+    //           which is false and gives up on their behalf). Tell them the one
+    //           thing that actually works.
+    //   denied  refused repeatedly with the window focused: this embedding
+    //           genuinely cannot capture, and the cursor really is the aim.
+    const mode = !show ? ''
+      : this.lockDenied ? 'denied'
+        : this.lockErrors > 0 ? 'focus'
+          : 'invite';
+    if (this.el) this.el.style.cursor = mode === 'denied' ? '' : 'pointer';
     if (mode !== this.promptMode) {
       this.promptMode = mode;
-      if (mode) this.prompt.innerHTML = mode === 'denied' ? PROMPT_DENIED : PROMPT_INVITE;
+      if (mode) {
+        this.prompt.innerHTML = mode === 'denied' ? PROMPT_DENIED
+          : mode === 'focus' ? PROMPT_FOCUS
+            : PROMPT_INVITE;
+      }
     }
     const useful = mode !== '';
     if (useful === this.promptVisible) return;
@@ -400,6 +490,20 @@ export class Mouse {
   }
 }
 
+/**
+ * Consecutive refusals before the game accepts that this browser cannot capture
+ * the mouse at all, and hands the aim to the bare cursor.
+ *
+ * Two, and the number is a compromise between two ways of being unplayable.
+ * One refusal is not proof — the commonest single refusal in the wild is an
+ * unfocused window, the player's very next click fixes it, and concluding
+ * "denied" from it condemns them to flying with an absolute cursor forever.
+ * But the fallback is also the only control a genuinely locked-out embedding
+ * has, so it cannot be held back for long: at two, the ordinary double-click
+ * both gets its chance to capture *and* settles the question if it fails.
+ */
+const DENY_AFTER = 2;
+
 const PROMPT_SUB = 'style="opacity:.62;font-weight:500;font-size:12.5px;letter-spacing:.02em"';
 
 /** The normal case: capture is available and the player has not taken it. */
@@ -408,6 +512,16 @@ const PROMPT_INVITE =
   + '<i class="ct-lp-mouse"></i>'
   + '<span><b style="color:#ffcf6b;font-weight:700">Click anywhere to take the controls</b>'
   + `<br><span ${PROMPT_SUB}>The mouse aims the aeroplane · Esc releases it</span></span>`;
+
+/**
+ * The browser refused, and the window did not have focus when it did. Keeps the
+ * ring: there IS something to click and clicking it will very probably work.
+ */
+const PROMPT_FOCUS =
+  '<i class="ct-lp-ring"></i>'
+  + '<i class="ct-lp-mouse"></i>'
+  + '<span><b style="color:#ffcf6b;font-weight:700">Click the game window, then click again</b>'
+  + `<br><span ${PROMPT_SUB}>The browser will only capture the mouse for a focused window</span></span>`;
 
 /**
  * The browser has refused pointer lock. No ring — there is nothing to click,

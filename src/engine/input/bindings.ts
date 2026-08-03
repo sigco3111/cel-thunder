@@ -140,9 +140,25 @@ export function labelFor(code: string): string {
  * table the input system dispatches from is the only way a controls screen can
  * be trusted, and it is why 'Legend' and 'SettingsPanel' both source from here.
  */
-export const BINDING_GROUPS: { title: string; items: [Action, string][] }[] = [
+export const BINDING_GROUPS: {
+  title: string;
+  /**
+   * Rows that are not bindings, printed above the group's keys.
+   *
+   * The reference sheet is generated from the binding table, and the mouse is
+   * not in the binding table — so the one control the whole game is flown with
+   * was the only one the control list did not mention. A player who opened it
+   * to find out how to fly came away with a keyboard layout.
+   */
+  lead?: { keys: string; note: string }[];
+  items: [Action, string][];
+}[] = [
   {
     title: 'Flight',
+    lead: [
+      { keys: 'Mouse', note: 'Steers. The aeroplane flies to the reticle — right turns right, back pulls up' },
+      { keys: 'Let go', note: 'Stop moving the mouse and it levels the wings and holds the horizon' },
+    ],
     items: [
       ['pitchUp', 'Pull up / nose up'],
       ['pitchDown', 'Push / nose down'],
@@ -227,10 +243,11 @@ export const BINDING_GROUPS: { title: string; items: [Action, string][] }[] = [
  * that is not a binding at all — the mouse itself.
  */
 export const ESSENTIALS: { actions: Action[]; literal?: string; note: string }[] = [
-  { actions: [], literal: 'Mouse', note: 'Aims — the aeroplane flies to the reticle' },
+  { actions: [], literal: 'Mouse', note: 'Steers — the aeroplane flies to the reticle. Right turns right, back pulls up' },
+  { actions: [], literal: 'Let go', note: 'Stop moving the mouse and it levels off by itself' },
   { actions: ['fire1', 'fire2'], note: 'Machine guns / cannons' },
-  { actions: ['pitchDown', 'pitchUp'], note: 'Pitch, if you would rather not use the mouse' },
-  { actions: ['rollLeft', 'rollRight'], note: 'Roll' },
+  { actions: ['pitchDown', 'pitchUp'], note: 'Pitch — an alternative to the mouse, never a requirement' },
+  { actions: ['rollLeft', 'rollRight'], note: 'Roll — likewise' },
   { actions: ['throttleUp', 'throttleDown'], note: 'Throttle' },
   { actions: ['wep'], note: 'War emergency power' },
   { actions: ['gear', 'flaps'], note: 'Landing gear / flaps' },

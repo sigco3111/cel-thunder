@@ -465,6 +465,14 @@ export class Game implements GameContext {
     // Let boot and the first shader compiles clear before believing anything.
     if (this.frame < 150) { this.cleanFor = 0; this.unstableFor = 0; return; }
 
+    // 0.16 and deliberately not lower. Dropping a rung on a high-refresh panel
+    // means halving the presentation rate, and that doubles the frame quantum
+    // the player's input has to wait for: measured, the same build reads 20 ms
+    // of input latency at full rate and 31 ms at half. Tightening this to 0.12
+    // (tried, reverted) traded a pacing signal the smoothness harness already
+    // calls steady — 1.8 ms of measured jitter over 1 700 frames — for 11 ms of
+    // extra lag on every control input. The judder that genuinely needed fixing
+    // was not this; it was the governor's own failed climbs, handled below.
     const bad = this.pacingMiss > 0.16 || this.frameMs > 40;
     const clean = this.pacingMiss < 0.05;
     this.cleanFor = clean ? this.cleanFor + this.dt : 0;
@@ -475,7 +483,21 @@ export class Game implements GameContext {
     // chases those transients all the way to the bottom of the ladder and is
     // still there long after the view has cleared. Something genuinely broken
     // (half the frames off-cadence) still gets an immediate response.
-    const unstable = this.unstableFor > 1.5 || this.pacingMiss > 0.5;
+    //
+    // A step *up* is different, and the difference is worth a special case: it
+    // is a hypothesis, and the rung below it has *already been observed to
+    // hold*. Judging a failed climb by the same patience as a first descent
+    // charges the player the full 1.5 s of the judder the climb was testing
+    // for — and because the governor re-tests whenever the quarantine expires,
+    // that judder comes back, on a timer, for as long as they play. Measured on
+    // a 120 Hz panel the machine could not quite hold: climb at t+6 s, three
+    // seconds of frames alternating 8.3/16.7 ms, drop at t+9 s, repeat. That
+    // periodic burst is what the player reported as "the plane seems to be
+    // jittering in flight". A climb that goes bad is therefore undone on the
+    // first clear evidence rather than the fifth.
+    const probation = this.time - this.lastClimbAt < CLIMB_PROBATION;
+    const unstable = this.pacingMiss > 0.5
+      || this.unstableFor > (probation ? 0.3 : 1.5);
 
     if (this.governorCooldown > 0) return;
 
@@ -507,7 +529,11 @@ export class Game implements GameContext {
       this.rung--;
       this.lastClimbAt = this.time;
       this.applyRung();
-      this.governorCooldown = 1.5;
+      // Short, because 'applyRung' has just zeroed the pacing signal and this
+      // cooldown is the floor on how long a bad climb can keep juddering. Long
+      // enough that the ~30-frame signal is meaningful again: half a second is
+      // 30 frames at 60 Hz and 60 at 120.
+      this.governorCooldown = 0.5;
       return;
     }
 
@@ -662,6 +688,11 @@ const INITIAL_STEP_UP_DELAY = 6;
 const MAX_STEP_UP_DELAY = 60;
 /** A step down within this long of a step up counts as undoing it. */
 const UNDO_WINDOW = 30;
+/**
+ * How long after a step up the governor treats that rung as unproven and will
+ * abandon it on the first sign of trouble. See 'governor'.
+ */
+const CLIMB_PROBATION = 3;
 /** How long a rung stays quarantined after it failed to hold cadence. */
 const RUNG_QUARANTINE = 75;
 

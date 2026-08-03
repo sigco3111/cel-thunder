@@ -73,6 +73,11 @@ export class ControlLegend {
     for (const grp of BINDING_GROUPS) {
       const col = el('div', 'ct-legend-col', this.grid);
       el('div', 'ct-legend-title', col, grp.title);
+      for (const lead of grp.lead ?? []) {
+        const row = el('div', 'ct-legend-row', col);
+        el('kbd', 'ct-kbd', el('div', 'ct-legend-keys', row), lead.keys);
+        el('div', 'ct-legend-name', row, lead.note);
+      }
       for (const [action, label] of grp.items) {
         const row = el('div', 'ct-legend-row', col);
         // Every binding, not just the primary one: this is the reference sheet,

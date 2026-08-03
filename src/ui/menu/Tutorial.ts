@@ -108,17 +108,31 @@ const STEPS: Step[] = [
   },
   {
     id: 'pitch',
-    title: 'Pull the nose up',
-    keys: (b) => ['Mouse back', ...axisLabel(b, ['pitchUp']).split(' / ')],
-    why: 'Move the mouse and the aeroplane flies to the reticle. It is that simple.',
+    title: 'Move the mouse back to raise the nose',
+    keys: (b) => ['Mouse', ...axisLabel(b, ['pitchUp']).split(' / ')],
+    why: 'The mouse flies the aeroplane. It goes where the reticle points — '
+      + 'the keys are there if you prefer them, but you will not need them.',
     done: (p, base) => p.pitchDeg - base.pitchDeg > 9,
   },
   {
     id: 'roll',
-    title: 'Roll the wings over',
-    keys: (b) => axisLabel(b, ['rollLeft', 'rollRight']).split(' / '),
-    why: 'Aeroplanes turn by banking — roll first, then pull.',
+    title: 'Move the mouse sideways to turn',
+    keys: (b) => ['Mouse', ...axisLabel(b, ['rollLeft', 'rollRight']).split(' / ')],
+    why: 'Mouse right banks right and turns right. Aeroplanes turn by leaning '
+      + 'into it, so the wings go over first and the nose follows.',
     done: (p, base) => bank(p.bankDeg - base.bankDeg) > 28,
+  },
+  {
+    id: 'recover',
+    // The most important thing a first-time pilot can know, and the one thing
+    // that stops a bad attitude becoming a crash: there is always a way out and
+    // it costs no skill at all.
+    title: 'Now stop moving the mouse',
+    keys: () => ['Let go'],
+    why: 'Take your hand off and the aeroplane levels its wings, brings the '
+      + 'nose to the horizon and flies straight. Whatever goes wrong, letting '
+      + 'go fixes it.',
+    done: (p) => bank(p.bankDeg) < 10 && Math.abs(p.pitchDeg) < 10,
   },
   {
     id: 'fire',

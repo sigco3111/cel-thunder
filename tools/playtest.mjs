@@ -59,6 +59,13 @@ const ONLINE_URL = `${WEB}/?server=ws://127.0.0.1:${GAME_PORT}/ws`;
 const KMH = 3.6;
 const DEG = 180 / Math.PI;
 
+/**
+ * Half the spread between the roll demanded for an equal-and-opposite pair of
+ * tiny aim nudges — i.e. how much roll the *error itself* is worth, with any
+ * standing wing-leveller term cancelled out.
+ */
+const nudgeSpan = (d) => (d.nudgeR.rollErr - d.nudgeL.rollErr) / 2;
+
 let suite = '';
 const results = [];
 const check = (name, pass, detail = '') => {
@@ -266,6 +273,17 @@ async function runSuite(browser, mode, url) {
   check('game reaches ready state', booted);
   if (!booted) { await page.close(); return; }
 
+  // Record every pointer-lock outcome from here on. A refused capture used to
+  // be completely silent — the player was left flying an aeroplane that was
+  // chasing a cursor they did not know was uncaptured — so the refusals are
+  // now counted and reported rather than swallowed.
+  await page.evaluate(() => {
+    window.__lockEvents = [];
+    document.addEventListener('pointerlockerror', () => window.__lockEvents.push('error'));
+    document.addEventListener('pointerlockchange', () => window.__lockEvents.push(
+      document.pointerLockElement ? `lock:${document.pointerLockElement.tagName}` : 'unlock'));
+  });
+
   const menuUp = await waitForControl(page, 'button.ct-navitem', 'play');
   await page.screenshot({ path: `${tag}-01-menu.png` });
 
@@ -315,6 +333,73 @@ async function runSuite(browser, mode, url) {
   });
   check('the player has control of the aircraft', !controlling.suspended,
     `scheme=${controlling.scheme}, suspended=${controlling.suspended}`);
+
+  // --- 2b. taking the controls ----------------------------------------------
+  //
+  // Reported by the player as "the mouse is always not focused on the game".
+  // Chromium refuses 'requestPointerLock' outright when the document does not
+  // have OS focus, which is the state a player is in every time they alt-tab
+  // back and click — and the refusal was silent, so from the cockpit it looked
+  // like clicking simply did nothing.
+  console.log('\n2b. Taking the controls');
+
+  // Nothing may be sitting on top of the canvas in flight. A screen overlay
+  // left mounted swallows every click, the lock is never even requested, and
+  // no amount of clicking can recover it.
+  const centreEl = await page.evaluate(() => {
+    const el = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+    const canvas = window.__game?.renderer?.domElement;
+    return {
+      isCanvas: el === canvas,
+      tag: el ? el.tagName + (el.className ? `.${String(el.className).split(' ')[0]}` : '') : 'null',
+      focusable: canvas?.getAttribute('tabindex'),
+    };
+  });
+  check('nothing covers the canvas in flight — the click that captures can land',
+    centreEl.isCanvas, `element at screen centre is ${centreEl.tag}`);
+  check('the canvas is focusable, so the browser will lock to it',
+    centreEl.focusable !== null && centreEl.focusable !== undefined,
+    `tabindex=${centreEl.focusable}`);
+
+  // Click the way a player does when the capture does not take: once, then
+  // again. Deploy has already made one request from inside its own gesture.
+  await page.mouse.move(800, 450, { steps: 4 });
+  await page.mouse.down(); await page.mouse.up();
+  await sleep(500);
+  await page.mouse.down(); await page.mouse.up();
+  await sleep(800);
+
+  const lock0 = await page.evaluate(() => {
+    const m = window.__game?.get?.('input')?.mouse;
+    return m ? {
+      locked: m.locked, denied: m.lockDenied, requests: m.lockRequests,
+      errors: m.lockErrors, needsFocus: m.lockNeedsFocus,
+      hasFocus: document.hasFocus(),
+      active: document.activeElement?.tagName ?? 'null',
+      events: window.__lockEvents.slice(),
+    } : null;
+  });
+  check('clicking the game asks the browser for the mouse',
+    !!lock0 && lock0.requests > 0,
+    lock0 ? `${lock0.requests} request(s), ${lock0.errors} refused, document focus=${lock0.hasFocus}` : 'no mouse device');
+  check('the canvas takes DOM focus when the player clicks it',
+    !!lock0 && lock0.active === 'CANVAS', lock0 ? `activeElement=${lock0.active}` : '');
+
+  // The capture itself cannot be *asserted* here: Chromium will not grant
+  // pointer lock to a window that does not have OS focus, and under automation
+  // it usually does not. What must hold either way is that the player ends up
+  // with a working control scheme rather than an aeroplane that ignores them —
+  // captured, or fallen back to the cursor and saying so.
+  if (lock0?.locked) {
+    check('the pointer is captured', true, `events: ${lock0.events.join(', ')}`);
+  } else {
+    console.log(`  \x1b[33mNOTE\x1b[0m  this environment refused pointer lock`
+      + ` (${lock0?.errors} error(s), events: ${lock0?.events.join(', ') || 'none'});`
+      + ` the cursor fallback is what is being tested below`);
+    check('a refused capture falls back to the cursor instead of ignoring the player',
+      !!lock0 && lock0.denied && lock0.errors > 0,
+      lock0 ? `denied=${lock0.denied} after ${lock0.errors} refusal(s)` : '');
+  }
 
   const s0 = await sample();
   check('flight model is the shared one', !!s0?.shared);
@@ -510,6 +595,256 @@ async function runSuite(browser, mode, url) {
     + ` IAS ${(recovered.air.ias * KMH).toFixed(0)} km/h, AGL ${recovered.air.agl.toFixed(0)} m`);
   await page.screenshot({ path: `${tag}-04-flying.png` });
 
+  // --- 6b. hands off ---------------------------------------------------------
+  //
+  // THE regression test for what the player reported as "atm plane is jittery
+  // and moving around". With the capture held and the mouse untouched, the
+  // aeroplane must fly straight and level, indefinitely.
+  //
+  // The old flight director could not. Its roll law asked for 'atan2(x, y)' of
+  // the pointing error — which is ±90° for a sideways error *however small* —
+  // and the ramp meant to suppress that near zero reached full authority at
+  // 1.1° of error, so in cruise the director sat on the steep part of it and
+  // half a degree of pointing error commanded full aileron. Measured before the
+  // fix, hands off for 12 s: bank swinging ±7°, aileron slamming between ±0.43,
+  // roll rates of 60°/s, forever. After: ±1.4° of bank and ±0.03 of aileron.
+  //
+  // It is not enough for the wings to be level: hands off has to be a true
+  // steady state, and "the attitude is held" is not one. A second defect hid
+  // behind that distinction. With the reticle exactly on the nose the outer
+  // loop asks for nothing at all, which leaves the elevator free — and a
+  // fighter at full throttle with a free elevator pitches slowly up. Measured
+  // uncaptured, hands off, twelve seconds: the nose walked from −3° to −11°,
+  // the aeroplane climbed 187 m and the airspeed decayed 463 → 433 km/h,
+  // monotonically, on its way to a stall. So this measures attitude, altitude
+  // AND airspeed, for thirty seconds, not ten.
+  //
+  // Two things are stubbed for the duration, and both of them are the *setup*
+  // rather than the thing under test:
+  //
+  //   'mouse.locked' is forced, for the same reason the check further down
+  //   clears 'lockDenied'. Chromium will not grant pointer lock to a window
+  //   without OS focus and the harness never has it, yet the relative path is
+  //   the one a player flies, the one the roll bug lived in, and the only one
+  //   where the reticle is a world direction that can drift off the nose.
+  //
+  //   'drain' is neutralised, because hands off has to mean hands off. The
+  //   harness runs headed with the OS cursor over the window, and a single
+  //   stray pointer event is a real command: measured, one 600 px event in an
+  //   otherwise flat 60 s trace rolled the aeroplane to 24° of bank and moved
+  //   it 26 m — correct behaviour, and nothing to do with what is being tested.
+  //   Swallowed events are counted and reported so this can never quietly hide
+  //   an input the test did not intend to make.
+  await levelOff(3000);
+  const handsOff = await page.evaluate(async () => {
+    const input = window.__game.get('input');
+    const m = input.mouse;
+    const wasLocked = m.locked;
+    const realDrain = m.drain.bind(m);
+    let swallowed = 0;
+    m.drain = (out) => {
+      realDrain(out);
+      if (out.dx || out.dy) swallowed++;
+      out.dx = 0; out.dy = 0;
+    };
+    m.locked = true;
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const bankOf = () => Math.atan2(input.view.right.y, input.view.up.y) * 57.2958;
+    const pitchOf = () => Math.asin(Math.max(-1, Math.min(1, input.view.forward.y))) * 57.2958;
+    const air = () => window.__game.get('flight').airData;
+    // Four seconds for the director to finish whatever attitude the previous
+    // phase left, then thirty seconds of measurement.
+    await wait(4000);
+    const a0 = air();
+    const alt0 = a0.altitude;
+    const tas0 = a0.tas * 3.6;
+    const pitch0 = pitchOf();
+    let peakBank = 0;
+    let peakDemand = 0;
+    let peakPitchDrift = 0;
+    const t0 = performance.now();
+    while (performance.now() - t0 < 30000) {
+      await wait(100);
+      peakBank = Math.max(peakBank, Math.abs(bankOf()));
+      peakPitchDrift = Math.max(peakPitchDrift, Math.abs(pitchOf() - pitch0));
+      // The OUTER loop's output, in degrees of roll asked for. Deliberately not
+      // the aileron: a slow aeroplane has little roll authority, so the inner
+      // loop legitimately saturates the surface to make a modest rate, and a
+      // check on the surface would read a correct controller as a broken one.
+      // This is also the exact quantity the roll bug lived in.
+      peakDemand = Math.max(peakDemand, Math.abs(input.aim.rollError) * 57.2958);
+    }
+    const a = air();
+    const out = {
+      bank: bankOf(), peakBank, peakDemand, peakPitchDrift,
+      alt0, alt1: a.altitude, tas0, tas1: a.tas * 3.6,
+      pitch0, pitch1: pitchOf(),
+      theta: input.aim.theta,
+      demand: input.aim.rollError * 57.2958,
+      roll: input.frame.roll, pitch: input.frame.pitch, yaw: input.frame.yaw,
+      vs: a.vertSpeed, spin: a.spinning, swallowed,
+    };
+    m.locked = wasLocked;
+    m.drain = realDrain;
+    return out;
+  });
+  const dAlt = handsOff.alt1 - handsOff.alt0;
+  const dTas = handsOff.tas1 - handsOff.tas0;
+  const dNose = handsOff.pitch1 - handsOff.pitch0;
+  check('hands off for 30 s, the aeroplane flies straight and level',
+    Math.abs(handsOff.bank) < 5 && handsOff.peakBank < 10,
+    `bank ${handsOff.bank.toFixed(1)}° (peak ${handsOff.peakBank.toFixed(1)}°),`
+    + ` ${handsOff.swallowed} stray pointer event(s) swallowed`);
+  // Before the fix this sat at ±17° of demand with excursions past 57°, which
+  // is what saturated the ailerons and produced the roll limit cycle.
+  check('hands off, nothing is asking the aeroplane to roll',
+    Math.abs(handsOff.demand) < 4 && handsOff.peakDemand < 8,
+    `roll demand ${handsOff.demand.toFixed(2)}°, peak ${handsOff.peakDemand.toFixed(2)}°`
+    + ` (aileron ${handsOff.roll.toFixed(3)})`);
+  check('hands off for 30 s, the nose stays where it is',
+    Math.abs(dNose) < 3 && handsOff.peakPitchDrift < 5,
+    `pitch ${handsOff.pitch0.toFixed(1)}° -> ${handsOff.pitch1.toFixed(1)}°`
+    + ` (drift ${dNose >= 0 ? '+' : ''}${dNose.toFixed(1)}°, peak ${handsOff.peakPitchDrift.toFixed(1)}°)`);
+  check('hands off for 30 s, the aeroplane holds its altitude',
+    Math.abs(dAlt) < 50 && Math.abs(handsOff.vs) < 4,
+    `${handsOff.alt0.toFixed(0)} -> ${handsOff.alt1.toFixed(0)} m`
+    + ` (${dAlt >= 0 ? '+' : ''}${dAlt.toFixed(0)} m in 30 s), VS ${handsOff.vs.toFixed(1)} m/s`);
+  // Asymmetric, and physically so. Losing speed hands-off is how a beginner
+  // ends up stalled and is the failure this exists to catch; gaining a little
+  // is the aeroplane settling at the speed a wide-open throttle buys it in
+  // level flight, which is where it spawns short of. Measured after the fix:
+  // +16 km/h over the first 30 s from a cold spawn, converging on +5 per 30 s
+  // thereafter. Before it, −30 km/h and still falling.
+  check('hands off for 30 s, the aeroplane does not bleed speed',
+    dTas > -12 && dTas < 28,
+    `TAS ${handsOff.tas0.toFixed(0)} -> ${handsOff.tas1.toFixed(0)} km/h`
+    + ` (${dTas >= 0 ? '+' : ''}${dTas.toFixed(0)} km/h in 30 s)`);
+
+  // --- 6c. zero input means zero command ------------------------------------
+  //
+  // The end-to-end check above can only ever say "it settled". This one goes at
+  // the flight director directly and says why: with the reticle exactly on the
+  // nose it must ask for nothing at all, and with the reticle a fraction of a
+  // degree off it must ask for a fraction of the aileron — not, as it used to,
+  // all of it.
+  const director = await page.evaluate(() => {
+    const input = window.__game.get('input');
+    const aim = input.aim;
+    const view = input.view;
+    const DEG = 57.2958;
+    const V = view.right.constructor;
+    const right = new V(); const up = new V(); const back = new V();
+    window.__game.camera.matrixWorld.extractBasis(right, up, back);
+
+    // The aircraft cannot respond to these synthetic steps — the view is
+    // frozen — so its live body rates are zeroed for the duration. Otherwise
+    // the inner rate loop spends every step fighting a rotation that never
+    // stops and winds its integrator into the answer, which measures the
+    // harness rather than the director.
+    const w = view.omega;
+    const saved = { x: w.x, y: w.y, z: w.z };
+    w.set(0, 0, 0);
+    // Enough steps for the outer loop's rate-derivative term to wash out, few
+    // enough that the inner integrator stays where it starts.
+    const settle = () => { for (let i = 0; i < 8; i++) aim.update(view, 1 / 60, 0, 0, 0); return aim.out; };
+    // What the outer loop asked for, in degrees of roll. This is the quantity
+    // that was broken: it used to be ±57° for any sideways error at all.
+    const demand = () => ({
+      roll: aim.out.roll,
+      rollErr: aim.rollError * DEG,
+      bank: aim.bankDemand * DEG,
+      theta: aim.theta * DEG,
+    });
+
+    // The pure law, with the level-off assist switched off: reticle exactly on
+    // the nose, nothing else touching it. Every axis must come out at zero.
+    // With the assist ON the answer is deliberately *not* zero — it is the
+    // small bounded nudge toward level described below — so the two have to be
+    // measured separately or one hides the other.
+    const levelOff = aim.cfg.levelOff;
+    aim.cfg.levelOff = 0;
+    aim.reset(view);
+    aim.holdBoresight(view);
+    settle();
+    const boresight = { ...demand(), pitch: aim.out.pitch, yaw: aim.out.yaw };
+    aim.cfg.levelOff = levelOff;
+
+    // ...and with it back on. The assist may ask for something, but only ever
+    // a little, and only ever toward level: an uncaptured aeroplane that could
+    // command more than a nudge is one that can fly itself into the ground.
+    aim.reset(view);
+    aim.holdBoresight(view);
+    settle();
+    const speed = Math.max(1, view.vel.length());
+    const parked = {
+      theta: aim.theta * DEG,
+      pitch: aim.out.pitch,
+      bank: aim.bankDemand * DEG,
+      gamma: Math.asin(Math.max(-1, Math.min(1, view.vel.y / speed))) * DEG,
+    };
+
+    // 10 px of mouse at the shipped sensitivity is 0.77° of pointing error.
+    aim.reset(view); aim.steer(10, 0, right, up, 1); settle();
+    const nudgeR = demand();
+    aim.reset(view); aim.steer(-10, 0, right, up, 1); settle();
+    const nudgeL = demand();
+    // A decisive input: the reticle out at ~10° must ask for real bank.
+    aim.reset(view); aim.steer(130, 0, right, up, 1); settle();
+    const hard = demand();
+
+    w.set(saved.x, saved.y, saved.z);
+    aim.reset(view);
+    aim.holdBoresight(view);
+    return {
+      boresight, parked, nudgeR, nudgeL, hard,
+      bank: Math.atan2(view.right.y, view.up.y) * DEG,
+      levelAssist: aim.cfg.levelAssist,
+      pitchAttitude: Math.asin(Math.max(-1, Math.min(1, view.forward.y))) * DEG,
+    };
+  });
+  const bs = director.boresight;
+  // The wings coming level IS a command, and a correct one — so this asserts
+  // the exact law rather than a budget: with no pointing error the roll demand
+  // must be the standing bank times the leveller's gain, and nothing else.
+  const wantsLevel = director.bank * director.levelAssist;
+  check('reticle on the nose asks for no turn and no pull',
+    Math.abs(bs.bank) < 0.05 && bs.theta < 1e-3
+    && Math.abs(bs.pitch) < 0.02 && Math.abs(bs.yaw) < 0.15,
+    `bank demand ${bs.bank.toFixed(3)}°, theta ${bs.theta.toExponential(1)}°,`
+    + ` elevator ${bs.pitch.toFixed(4)}, rudder ${bs.yaw.toFixed(3)}`);
+  // The level-off assist, bounded. It exists because "reticle on the nose" left
+  // the elevator free, and a fighter at full throttle with a free elevator
+  // pitches up into a stall — but an assist that could command more than a
+  // nudge would be a worse bug than the one it fixes.
+  const pk = director.parked;
+  check('an uncaptured aeroplane is nudged toward level, and only nudged',
+    pk.theta <= 1.21 && Math.abs(pk.bank) < 0.05
+    && (Math.abs(pk.gamma) < 0.2 || Math.sign(pk.pitch) === -Math.sign(pk.gamma)),
+    `reticle ${pk.theta.toFixed(2)}° off the nose (ceiling 1.15°), elevator`
+    + ` ${pk.pitch.toFixed(3)} against a ${pk.gamma.toFixed(2)}° flight path`);
+  check('with the reticle on the nose the only thing asked for is wings level',
+    Math.abs(director.pitchAttitude) > 55 || Math.abs(bs.rollErr - wantsLevel) < 0.4,
+    `roll demand ${bs.rollErr.toFixed(2)}° vs ${wantsLevel.toFixed(2)}° of leveller`
+    + ` (${director.bank.toFixed(1)}° standing bank x ${director.levelAssist})`);
+  // The regression itself. Before the fix, 0.77° of sideways pointing error
+  // asked the aircraft to roll through 57° — 'atan2' of a sideways error is a
+  // right angle however small the error — and that saturated the ailerons.
+  check('a fraction of a degree of aim error asks for a fraction of a degree of roll',
+    Math.abs(nudgeSpan(director) ) < 9,
+    `${director.nudgeR.theta.toFixed(2)}° of error -> roll demand`
+    + ` ${director.nudgeR.rollErr.toFixed(2)}° / ${director.nudgeL.rollErr.toFixed(2)}°`
+    + ` (was ±57° before the fix)`);
+  check('mouse right asks for right bank, mouse left for left',
+    director.nudgeR.bank > 0.2 && director.nudgeL.bank < -0.2
+    && director.hard.bank > director.nudgeR.bank,
+    `nudge ${director.nudgeR.bank.toFixed(1)}° / ${director.nudgeL.bank.toFixed(1)}°,`
+    + ` ${director.hard.theta.toFixed(1)}° of error -> ${director.hard.bank.toFixed(1)}° of bank`);
+  check('a decisive input gets a decisive bank',
+    director.hard.bank > 25 && Math.abs(director.hard.roll) > 0.2,
+    `${director.hard.theta.toFixed(1)}° of error -> ${director.hard.bank.toFixed(1)}° bank,`
+    + ` aileron ${director.hard.roll.toFixed(2)}`);
+  await levelOff(2500);
+
   // --- 7. weapons ------------------------------------------------------------
   console.log('\n7. Weapons');
   const projBefore = await page.evaluate(COUNT_PROJECTILES);
@@ -573,6 +908,69 @@ async function runSuite(browser, mode, url) {
   check('airspeed still plausible after manoeuvring',
     !!final && final.air.ias * KMH > 100 && final.air.ias * KMH < 900,
     final ? `IAS ${(final.air.ias * KMH).toFixed(0)} km/h` : '');
+
+  // --- 9b. presentation ------------------------------------------------------
+  //
+  // Reported by the player as "the plane seems to be jittering in flight".
+  // Neither of the two things that produce that is visible to any other check
+  // here: they all either apply an input and measure the response, or sample a
+  // scalar that is perfectly fine. Judder lives strictly between frames.
+  //
+  //   1. A stale transform. If the simulation ever advanced at a different rate
+  //      from the presentation without interpolating between steps, the
+  //      aeroplane would be drawn at the same attitude twice and then jump.
+  //      Today the two are locked 1:1 by construction — the loop steps the model
+  //      with the frame's own dt — and this is the guard that says so, so that
+  //      anyone who later decouples them has to add the interpolation with it.
+  //
+  //   2. An alternating frame graph. Measured on a 120 Hz panel that could not
+  //      quite hold it: the quality governor climbed to full rate, the frames
+  //      came out 8.3, 16.7, 8.3, 16.7 — a "100 fps" average that reads as
+  //      constant judder — and it stayed there for three seconds before backing
+  //      off, on a timer, forever. The proportional miss rate below is the same
+  //      signal the governor steers on, so this asserts that it converged.
+  const pacing = await page.evaluate(async () => {
+    const g = window.__game;
+    const rows = [];
+    for (let i = 0; i < 260; i++) {
+      await new Promise((r) => requestAnimationFrame(r));
+      const e = g.entities.get(g.localEntityId);
+      if (!e) continue;
+      rows.push({ frame: g.frame, dt: g.dt, qx: e.qx, qy: e.qy, qz: e.qz, qw: e.qw, px: e.px, py: e.py, pz: e.pz });
+    }
+    // One row per frame the game actually ran, in order.
+    const steps = [];
+    for (const r of rows) if (!steps.length || r.frame !== steps[steps.length - 1].frame) steps.push(r);
+    let stale = 0;
+    let miss = 0;
+    for (let i = 1; i < steps.length; i++) {
+      const a = steps[i]; const b = steps[i - 1];
+      if (a.qx === b.qx && a.qy === b.qy && a.qz === b.qz && a.qw === b.qw
+        && a.px === b.px && a.py === b.py && a.pz === b.pz) stale++;
+      // The governor's own signal: a step of more than 40 % between adjacent
+      // intervals is a straddled vsync, not ordinary noise.
+      if (Math.abs(a.dt - b.dt) > 0.4 * Math.min(a.dt, b.dt)) miss++;
+    }
+    const n = Math.max(1, steps.length - 1);
+    return {
+      frames: steps.length, stale: stale / n, miss: miss / n,
+      presentEvery: g.presentEvery, refreshHz: g.refreshHz, quality: g.quality,
+      medianDt: steps.map((r) => r.dt).sort((x, y) => x - y)[steps.length >> 1] * 1000,
+    };
+  });
+  check('the aircraft transform advances on every frame the game draws',
+    pacing.frames > 60 && pacing.stale < 0.02,
+    `${(pacing.stale * 100).toFixed(1)}% of ${pacing.frames} drawn frames repeated the previous transform`);
+  // The assertion is that the ladder *converged*, not that the hardware was
+  // fast. A machine that cannot hold its refresh rate is expected to settle on
+  // a lower rung with a locked cadence, and that passes with a miss rate near
+  // zero; the failure this catches is the one that was measured — a governor
+  // stuck at full rate with the frames alternating 8.3/16.7 ms, which lands at
+  // 0.5 and above.
+  check('frame pacing does not alternate between one and two refreshes',
+    pacing.miss < 0.30,
+    `${(pacing.miss * 100).toFixed(1)}% off-cadence at ${pacing.medianDt.toFixed(1)} ms`
+    + ` (${pacing.quality}, present 1/${pacing.presentEvery} of ${pacing.refreshHz} Hz)`);
 
   if (mode === 'online') {
     const p = final?.pred;
@@ -903,33 +1301,49 @@ async function controlsAndOnboarding(page, tag, check) {
     const theta = input.aim.theta;
     const cone = input.aim.out.conePull;
     const air0 = window.__game.get('flight').airData;
-    await wait(2500);
+    let peakTheta = 0;
+    for (let i = 0; i < 60; i++) {
+      await wait(100);
+      peakTheta = Math.max(peakTheta, input.aim.theta);
+    }
     const air1 = window.__game.get('flight').airData;
     m.lockDenied = was;
     return {
-      theta, cone,
+      theta, cone, peakTheta,
       bank0: Math.abs(air0.rollAngle * 57.2958),
       bank1: Math.abs(air1.rollAngle * 57.2958),
-      dPitch: Math.abs((air1.pitchAngle - air0.pitchAngle) * 57.2958),
-      vs: air1.vertSpeed,
+      vs0: air0.vertSpeed, vs1: air1.vertSpeed,
       nx: m.nx, ny: m.ny, moved: m.movedUnlocked,
     };
   });
   // Put the cursor somewhere unhelpful first so the check has something to
   // catch: dead centre would pass even with the bug present.
-  // The reticle sitting on the nose is the assertion; the attitude is only
-  // corroboration, and it is deliberately expressed as "not diverging" rather
-  // than "level". This check runs at the end of a suite that has just flown a
-  // bombing run, so the aeroplane can legitimately still be rolling out of the
-  // pull-off when it starts — and a fixed bank threshold would then fail on
-  // leftover attitude while the thing being tested was working perfectly.
-  const holding = !!held && held.theta < 0.05 && held.cone < 0.15
-    && held.dPitch < 20 && held.bank1 < Math.max(45, held.bank0 + 6);
-  check('an uncaptured mouse holds attitude instead of flying at the cursor', holding,
+  //
+  // The reticle staying on the nose is the assertion. It is expressed as a hard
+  // ceiling — 'PARK_LEAD' plus a whisker — because that is exactly the property
+  // that makes an uncaptured pointer safe: the director may nudge the aeroplane
+  // toward level, and it may do nothing else, no matter where the cursor is or
+  // what the aeroplane is doing. The cursor sits at (0.85, −0.84); the bug this
+  // catches put the reticle there, which is theta ≈ 0.5 rad and conePull 1.00.
+  //
+  // The attitude half used to be "pitch does not change much", and that has
+  // stopped being the right corroboration: the reticle on the nose left the
+  // elevator free and the aeroplane pitched slowly up into a stall, so an
+  // uncaptured aeroplane now levels *off* rather than holding whatever it had.
+  // Pitch therefore should change — toward level — and what must be asserted is
+  // that the vertical speed is being taken out rather than put in. This check
+  // runs at the end of a suite that has just flown a bombing run, so it starts
+  // from whatever the pull-off left behind, which is the point.
+  const settling = !!held
+    && Math.abs(held.vs1) < Math.max(6, Math.abs(held.vs0) * 0.75);
+  const holding = !!held && held.theta < 0.05 && held.peakTheta < 0.05
+    && held.cone < 0.15 && settling && held.bank1 < Math.max(45, held.bank0 + 6);
+  check('an uncaptured mouse levels the aeroplane off instead of flying at the cursor', holding,
     held
-      ? `theta ${held.theta.toFixed(3)} rad, conePull ${held.cone.toFixed(2)},`
-      + ` bank ${held.bank0.toFixed(0)}° -> ${held.bank1.toFixed(0)}°,`
-      + ` VS ${held.vs.toFixed(0)} m/s (cursor at ${held.nx.toFixed(2)}, ${held.ny.toFixed(2)})`
+      ? `theta ${held.theta.toFixed(3)} rad (peak ${held.peakTheta.toFixed(3)}, ceiling 0.035),`
+      + ` conePull ${held.cone.toFixed(2)}, bank ${held.bank0.toFixed(0)}° -> ${held.bank1.toFixed(0)}°,`
+      + ` VS ${held.vs0.toFixed(0)} -> ${held.vs1.toFixed(0)} m/s`
+      + ` (cursor at ${held.nx.toFixed(2)}, ${held.ny.toFixed(2)})`
       : 'no mouse device');
   // Leave the aeroplane pointing somewhere sensible for the final screenshot.
   await page.mouse.move(800, 450, { steps: 8 });

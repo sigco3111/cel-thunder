@@ -25,11 +25,24 @@ import { clamp01, clampSym, smoothstep } from './curves';
  * independently.
  *
  *   outer (attitude -> body rate)
- *     The rotation that takes the nose onto the aim vector is decomposed in the
- *     body frame into a roll angle and a pitch angle. Aeroplanes turn by
- *     banking, so lateral error becomes a roll command and the pull only builds
- *     as the wings come round to meet it — 'cos(bank error)' does that
- *     naturally and continuously, with no mode switching.
+ *     The pointing error is split in two. Its *azimuth* half — the heading
+ *     difference between the nose and the reticle, measured about the world
+ *     vertical — becomes a **bank angle demand**, because that is how an
+ *     aeroplane turns; its *elevation* half becomes a pull, and the pull only
+ *     builds as the wings come round to meet it, which 'cos(bank error)' does
+ *     naturally and continuously with no mode switching.
+ *
+ *     Measuring the turn demand about the world vertical rather than in the
+ *     body frame is what makes the loop stable. A body-frame lateral error
+ *     vanishes the moment the aircraft banks — the error simply rotates round
+ *     to sit above the nose — so a bank demand built from it collapses before
+ *     the aircraft has turned at all, rolls back level, and starts again. The
+ *     azimuth error is invariant under roll, so the demand only decays as the
+ *     nose actually comes round.
+ *
+ *     Zero azimuth error means zero bank demand, and holding zero bank is
+ *     exactly what a wing leveller does — so there is no separate leveller and
+ *     no crossfade between two laws that disagree. See section 3.
  *
  *   limiter (body rate -> achievable body rate)
  *     The commanded pitch rate is clamped by three separate physical ceilings:
@@ -75,7 +88,7 @@ export interface MouseAimConfig {
    * error is large, so it can never wind up during a manoeuvre.
    */
   attitudeIGain: number;
-  /** Outer-loop roll gain, 1/s. */
+  /** Outer-loop roll gain, 1/s — how hard the director closes on the bank it wants. */
   rollGain: number;
   /** Inner-loop proportional gain on rate error. */
   ratePGain: number;
@@ -83,6 +96,38 @@ export interface MouseAimConfig {
   rateIGain: number;
   /** How strongly the wings self-level when the player is tracking straight. */
   levelAssist: number;
+  /**
+   * Bank angle commanded per radian of azimuth pointing error.
+   *
+   * This is the entire turn law and the single number that decides how a turn
+   * feels. Too low and the aeroplane wallows after the reticle; too high and
+   * the outer loop closes faster than the roll rate can follow and the nose
+   * hunts either side of the target.
+   */
+  turnGain: number;
+  /** Hard ceiling on the bank the director will command, rad. */
+  maxBank: number;
+  /**
+   * Seconds of lead taken from the rate at which the azimuth error is already
+   * closing. This is the damping term of the outer loop: without it the bank
+   * demand has no idea the turn is working, holds full bank all the way to the
+   * target and sails past it.
+   */
+  turnLead: number;
+  /**
+   * How fast the reticle relaxes back to straight-and-level once the player
+   * stops moving the mouse, 1/s. 0 disables it.
+   *
+   * The reticle is a *world* direction: left alone at the edge of the cone it
+   * commands a max-rate turn forever, which is correct for a simulator and
+   * lethal for a beginner. Relaxing it means "let go of the mouse" is always a
+   * valid recovery — the wings come level, the nose comes to the horizon, and
+   * the aeroplane flies itself — which is the single most important property a
+   * first flight can have.
+   */
+  levelOff: number;
+  /** Seconds the mouse must be still before 'levelOff' starts. */
+  relaxDelay: number;
   /** Enable the stall/g protections. */
   instructor: boolean;
   /** Rudder coordination strength. 0 disables auto-rudder. */
@@ -109,6 +154,14 @@ export const DEFAULT_MOUSE_AIM: MouseAimConfig = {
   ratePGain: 1.9,
   rateIGain: 1.4,
   levelAssist: 0.55,
+  // 10° of azimuth error asks for 42° of bank and 18° saturates it — decisive
+  // enough that the aeroplane visibly goes where the reticle is pointed,
+  // shallow enough near centre that tracking does not wobble.
+  turnGain: 4.2,
+  maxBank: 1.31,            // 75°: a 3.9 g turn, and still a recoverable attitude
+  turnLead: 0.22,
+  levelOff: 0.8,
+  relaxDelay: 0.45,
   instructor: true,
   coordination: 1,
 };
@@ -140,10 +193,45 @@ const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const MANUAL_GAIN = 2.2;
 const authority = (m: number): number => Math.min(1, Math.abs(m) * MANUAL_GAIN);
 
+/**
+ * How far off the nose the reticle is allowed to sit while the capture is not
+ * held, radians. See 'parkLevel'.
+ *
+ * Two degrees — deliberately a fifteenth of the aim cone, because this is a
+ * nudge toward level and not a place the player asked to point, and an
+ * uncaptured aeroplane that could command more than a nudge would be a worse
+ * bug than the one it fixes. Through the outer loop's gain it is 8.6 deg/s of
+ * pitch authority: enough to take the nose down out of a 40 degree zoom climb
+ * in five seconds, which is the state a player leaves behind when they press
+ * Escape in the middle of something, and roughly twelve times the 0.7 deg/s
+ * nose-up drift it exists to cancel.
+ */
+const PARK_LEAD = 0.035;
+
+/** Flight-path angle inside which the level-off stops correcting, radians. */
+const FLIGHT_PATH_DEAD = 0.0015;
+
 const _e = new THREE.Vector3();
 const _axis = new THREE.Vector3();
+const _tgt = new THREE.Vector3();
 const _qInv = new THREE.Quaternion();
 const _qRot = new THREE.Quaternion();
+
+/**
+ * Signed heading difference from 'a' to 'b', measured about the world vertical.
+ *
+ * Returns 0 when either vector is within a whisker of vertical, where a heading
+ * is not a thing that exists; the caller blends to a body-referenced law there.
+ */
+function azimuthTo(a: THREE.Vector3, b: THREE.Vector3): number {
+  const fa = Math.hypot(a.x, a.z);
+  const fb = Math.hypot(b.x, b.z);
+  if (fa < 1e-3 || fb < 1e-3) return 0;
+  const ax = a.x / fa, az = a.z / fa;
+  const bx = b.x / fb, bz = b.z / fb;
+  // Positive = a rotation about world +Y takes 'a' onto 'b'.
+  return Math.atan2(az * bx - ax * bz, ax * bx + az * bz);
+}
 
 export class MouseAimController {
   cfg: MouseAimConfig = { ...DEFAULT_MOUSE_AIM };
@@ -162,6 +250,8 @@ export class MouseAimController {
   theta = 0;
   /** Roll angle the director wants, radians (+ = right). */
   rollError = 0;
+  /** Bank angle the turn law is currently asking for, radians. Read by the HUD. */
+  bankDemand = 0;
 
   private pitchI = 0;
   private rollI = 0;
@@ -169,6 +259,14 @@ export class MouseAimController {
   private attI = 0;
   private pushMode = false;
   private betaPrev = 0;
+  private azPrev = 0;
+  private azRate = 0;
+  /** Seconds since the player last moved the reticle. Drives 'levelOff'. */
+  private idleTime = 0;
+  /** The reticle is parked on the nose because the capture is not held. */
+  private parked = false;
+  /** The reticle is the absolute cursor position, not an integrated delta. */
+  private absolute = false;
 
   /** Reset the reticle onto the nose. Call on spawn, respawn or mode change. */
   reset(view: AircraftView): void {
@@ -180,6 +278,10 @@ export class MouseAimController {
     this.yawI = 0;
     this.attI = 0;
     this.pushMode = false;
+    this.azPrev = 0;
+    this.azRate = 0;
+    this.idleTime = 0;
+    this.bankDemand = 0;
     this.out.pitch = 0; this.out.roll = 0; this.out.yaw = 0;
   }
 
@@ -188,16 +290,27 @@ export class MouseAimController {
    *
    * This is what the director does while the pointer is *not* captured but
    * could be — the state between spawning and the player's first click, and
-   * every moment after they press Escape. With no pointing error the outer loop
-   * asks for nothing, the wing leveller rolls the aircraft upright and it holds
-   * a stable attitude, which is the only sane thing to do when the game has no
-   * idea where the player is looking.
+   * every moment after they press Escape. The cursor's position is not a
+   * command in that state (it is wherever the OS left the arrow), so the
+   * reticle goes on the nose and stays there.
+   *
+   * "On the nose" alone is NOT a steady state, and believing it was is what
+   * this comment used to get wrong. With the reticle exactly on the nose the
+   * outer loop asks for nothing at all, which leaves the elevator free — and a
+   * fighter at full throttle with a free elevator does not hold its attitude,
+   * it pitches slowly up. Measured, uncaptured, hands off for twelve seconds:
+   * the nose walked from −3° to −11°, the aeroplane climbed 187 m and the
+   * airspeed decayed 463 → 433 km/h, monotonically, on its way to a stall.
+   * 'parkLevel' below supplies the small, bounded nudge that makes it a real
+   * steady state.
    *
    * Distinct from 'reset', which also clears the PI state; doing that every
    * frame would throw away the trim the integrators have earned and the
    * aeroplane would sag each time the mouse was released.
    */
   holdBoresight(view: AircraftView): void {
+    this.parked = true;
+    this.absolute = false;
     if (!this.initialised || !view.valid) return;
     this.aimRaw.copy(view.forward);
     this.aimDir.copy(view.forward);
@@ -209,11 +322,18 @@ export class MouseAimController {
    * always means "reticle right on screen" regardless of aircraft bank.
    */
   steer(dx: number, dy: number, right: THREE.Vector3, up: THREE.Vector3, userSens: number): void {
+    // Claim the reticle even for a zero delta: this is the relative path, and
+    // saying so is what stops 'levelOff' from being skipped on the frames where
+    // the player happens not to be moving — which are precisely the frames it
+    // exists for.
+    this.parked = false;
+    this.absolute = false;
     if (!this.initialised) return;
     const s = (this.cfg.sensitivity * userSens) / 1000;
     const ax = dx * s;
     const ay = (this.cfg.invertY ? dy : -dy) * s;
     if (ax === 0 && ay === 0) return;
+    this.idleTime = 0;
 
     // Rotate about the camera's up (yaw) and right (pitch) axes. Applying them
     // as two successive small rotations rather than one composite keeps the
@@ -231,6 +351,8 @@ export class MouseAimController {
 
   /** Nudges the reticle by an analogue stick, in radians/second. */
   steerAnalogue(x: number, y: number, right: THREE.Vector3, up: THREE.Vector3, rate: number, dt: number): void {
+    this.parked = false;
+    this.absolute = false;
     if (!this.initialised || (x === 0 && y === 0)) return;
     this.steer(x * rate * dt * 1000, -y * rate * dt * 1000, right, up, 1 / this.cfg.sensitivity);
   }
@@ -260,6 +382,13 @@ export class MouseAimController {
     // know about it before it decides how hard to fight for level wings.
     const mp = clampSym(manualPitch), mr = clampSym(manualRoll), my = clampSym(manualYaw);
     const rollAuthority = authority(mr);
+
+    // ---------------------------------------------------------------------
+    // 0. Relax the reticle back to straight and level once the player lets go.
+    // ---------------------------------------------------------------------
+    this.idleTime += dt;
+    if (Math.abs(mp) > 0.02 || Math.abs(mr) > 0.02 || Math.abs(my) > 0.02) this.idleTime = 0;
+    if (this.parked) this.parkLevel(view); else this.relax(view, dt);
 
     // ---------------------------------------------------------------------
     // 1. Constrain the reticle to the cone in front of the nose.
@@ -311,37 +440,76 @@ export class MouseAimController {
     const pullSign = this.pushMode ? -1 : 1;
 
     // ---------------------------------------------------------------------
-    // 3. Roll command.
+    // 3. Roll command: one law, from the azimuth error to a bank angle held.
+    //
+    // This used to be two laws crossfaded, and they disagreed. The aim half
+    // asked for 'rollAim' — an atan2, so it returns ±90° for a purely sideways
+    // error *however small that error is*; a tenth of a degree off to the side
+    // commanded a ninety degree roll. The crossfade that was supposed to
+    // suppress it reached full authority at 1.1° of pointing error, which in
+    // cruise is nothing at all, so the director sat on the steep part of the
+    // ramp and slammed between "roll ninety degrees" and "level the wings".
+    // Measured hands-off, with the mouse untouched: ±0.5° of pointing error
+    // produced full aileron, ±60°/s of roll rate and a permanent limit cycle.
+    // That is what the player reported as "the plane is jittery".
+    //
+    // Banking in *proportion* to the error removes both the discontinuity and
+    // the wing leveller with it — no error means no bank demand, and holding
+    // zero bank IS levelling the wings, so there is nothing left to hand over
+    // between and no bias where the handover used to be.
     // ---------------------------------------------------------------------
-    // How much of the error is lateral. With no lateral error there is nothing
-    // to bank for, and 'rollAim' becomes numerically meaningless, so fade it
-    // out and let the wing-leveller take over.
-    const latFrac = theta > 1e-5 ? Math.abs(Math.sin(rollAim)) : 0;
-    const aimAuthority = smoothstep(0.10, 0.45, latFrac) * smoothstep(0.004, 0.020, theta);
 
-    // Wing leveller: bank angle relative to the horizon, signed so that
-    // positive means "the right wing is low".
+    // The turn demand is the heading error, taken about the world vertical so
+    // that it does not vanish the instant the aircraft banks (see the header).
+    const azErr = azimuthTo(view.forward, this.aimDir);
+
+    // Filtered closing rate — the damping term of the outer loop. Without it
+    // the demand holds full bank all the way to the target and sails past.
+    if (dt > 1e-5) {
+      const raw = (azErr - this.azPrev) / dt;
+      this.azRate += (raw - this.azRate) * (1 - Math.exp(-dt * 10));
+    }
+    this.azPrev = azErr;
+    // Clamped hard: at a max-rate turn the closing rate alone is worth tens of
+    // degrees of bank, and an unclamped lead cancels the very demand that is
+    // producing it — the aircraft rolls out before the nose arrives, the rate
+    // dies, the demand comes back, and the turn hunts.
+    const lead = Math.max(-0.10, Math.min(0.10, this.azRate * this.cfg.turnLead));
+
+    // Bank angle relative to the horizon, signed so that positive means "the
+    // right wing is low" — the same sense as the demand below.
     const bankCos = view.up.dot(WORLD_UP);
     const bankSin = view.right.dot(WORLD_UP);
-    const bankAngle = Math.atan2(bankSin, bankCos);   // = −bank for right-wing-low
-    // Do not try to level while pointing steeply up or down: bank angle is
-    // ill-conditioned near the vertical and the roll it asks for there is
-    // meaningless. Inverted, though, it must still work — 'atan2' already
-    // returns the angle past 90°, so driving it to zero rolls out the short
-    // way. Refusing to level while inverted (which this used to do) meant that
-    // letting go of the mouse after any hard turn left the aeroplane on its
-    // back, and it simply flew into the ground from there.
+    const bankAngle = Math.atan2(bankSin, bankCos);
+
+    // A positive azimuth error is an error toward body +X, and it takes
+    // negative bank to fly there.
+    const maxBank = this.cfg.maxBank;
+    this.bankDemand = -Math.max(-maxBank, Math.min(maxBank, (azErr + lead) * this.cfg.turnGain));
+
+    // How hard the director closes on the bank it wants. 'levelAssist' is the
+    // strength of the wings-level *default*, and it is a preference the player
+    // can turn off; a real turn demand always closes at full strength, or the
+    // aeroplane could never reach the bank the turn needs.
+    const hold = Math.max(this.cfg.levelAssist, smoothstep(0.004, 0.05, Math.abs(azErr)));
+    const bankTerm = (bankAngle - this.bankDemand) * hold;
+
+    // Near the vertical a horizon-referenced bank angle stops meaning anything
+    // — and so does an azimuth. There, fall back to rolling the lift vector
+    // straight onto the error, scaled by the error so that this branch is zero
+    // at zero too. Inverted is *not* one of these cases and must not be: atan2
+    // already returns the angle past 90°, so driving 'bankAngle' to zero rolls
+    // out the short way, and that is what makes letting go of the mouse a valid
+    // recovery from any attitude.
     const pitchAttitude = Math.asin(clampSym(view.forward.y));
-    const levelValid = Math.abs(pitchAttitude) < 1.05;
-    // Stand down while the player is rolling deliberately. A leveller that
-    // keeps pulling for wings-level against a held roll key is not an
+    const vertical = smoothstep(1.02, 1.36, Math.abs(pitchAttitude));
+    const bodyTerm = rollAim * smoothstep(0.010, 0.09, theta);
+
+    // Stand down while the player is rolling deliberately. A director that
+    // keeps pulling for its own bank against a held roll key is not an
     // assistant, it is a second pilot with different ideas, and the player
     // feels it as controls that mush and then snap back.
-    const levelErr = levelValid
-      ? bankAngle * this.cfg.levelAssist * (1 - rollAuthority)
-      : 0;
-
-    this.rollError = rollAim * aimAuthority + levelErr * (1 - aimAuthority);
+    this.rollError = (bankTerm * (1 - vertical) + bodyTerm * vertical) * (1 - rollAuthority);
 
     // Roll authority. The flight model publishes exactly this number
     // ('authRoll') folding in heavy controls, Mach stiffening and a shot-off
@@ -531,6 +699,100 @@ export class MouseAimController {
     return out;
   }
 
+  /**
+   * Walks the reticle back toward straight and level while the player is not
+   * touching it.
+   *
+   * The reticle is a direction in the *world*, which is the right model for a
+   * gunsight and the wrong one for a beginner's aeroplane: parked at the edge
+   * of the cone after a break turn it commands that break turn forever, and
+   * "let go of the controls" — the one recovery every first-time pilot knows —
+   * does nothing at all. Measured before this existed: 2.5 s of mouse held over
+   * left the aeroplane still pulling 5 s later, 400 m lower and inverted.
+   *
+   * The target is the horizon on the aircraft's *current* heading, so the relax
+   * does two things at once and both of them are what "let go" should mean:
+   * the azimuth error goes to zero, which stops the turn and (the turn law
+   * being what it is) rolls the wings level, and the elevation error goes to
+   * zero, which brings the nose to the horizon and holds the altitude.
+   *
+   * It is deliberately slower than a player's own correction and delayed behind
+   * a beat of stillness, so it reads as the aeroplane settling rather than as
+   * the game taking the stick. Realistic assists set 'levelOff' to zero and get
+   * none of it.
+   */
+  private relax(view: AircraftView, dt: number): void {
+    const rate = this.cfg.levelOff;
+    if (rate <= 0 || this.absolute) return;
+    const idle = this.idleTime - this.cfg.relaxDelay;
+    if (idle <= 0) return;
+    if (!this.levelTarget(view, _tgt)) return;
+
+    // Ramp in over the first half second, so releasing the mouse is a release
+    // and not a grab.
+    const k = 1 - Math.exp(-dt * rate * clamp01(idle / 0.5));
+    if (k <= 0) return;
+    this.aimRaw.lerp(_tgt, k).normalize();
+  }
+
+  /**
+   * The same level-off, for the state where the capture is not held.
+   *
+   * 'holdBoresight' re-seats the reticle on the nose every frame, so a relax
+   * that accumulated would be wiped each time. Instead the reticle is placed a
+   * fixed, small angle off the nose toward level — an offset, not an
+   * accumulation, which is exactly the right shape here. It is a bounded
+   * command that can never grow into "fly at the corner of the screen" no
+   * matter what the aeroplane does, and it is enough: 0.02 rad through the
+   * outer loop's gain is 4.9 deg/s of pitch rate, against a nose-up drift
+   * measured at 0.7 deg/s.
+   */
+  private parkLevel(view: AircraftView): void {
+    if (this.cfg.levelOff <= 0) return;
+    if (!this.levelTarget(view, _tgt)) return;
+    const ang = Math.acos(clampSym(_tgt.dot(view.forward)));
+    if (!(ang > 1e-5)) return;
+    _axis.crossVectors(view.forward, _tgt);
+    if (_axis.lengthSq() < 1e-12) return;
+    _axis.normalize();
+    _qRot.setFromAxisAngle(_axis, Math.min(ang, PARK_LEAD));
+    this.aimRaw.copy(view.forward).applyQuaternion(_qRot).normalize();
+    this.aimDir.copy(this.aimRaw);
+  }
+
+  /**
+   * Where "straight and level" is, as a direction the reticle can be pointed at.
+   *
+   * Dead ahead on the current heading, at the attitude that puts the **flight
+   * path** — not the nose — on the horizon. That distinction is the difference
+   * between holding altitude and not: an aeroplane flown nose-on-the-horizon is
+   * still climbing by its angle of attack, which at cruise is around a degree,
+   * and a degree at 450 km/h is 2 m/s. Two metres a second is sixty metres in
+   * half a minute, every one of them paid for out of airspeed, and it was still
+   * enough drift to fail a thirty-second hands-off test.
+   *
+   * Returns false within ten degrees of the vertical, where "the horizon ahead"
+   * is not a direction; the caller leaves the reticle alone there and picks the
+   * aeroplane up again once it has fallen out of the climb.
+   */
+  private levelTarget(view: AircraftView, out: THREE.Vector3): boolean {
+    out.copy(view.forward);
+    const horiz = Math.hypot(out.x, out.z);
+    if (horiz <= 0.17) return false;
+    const nose = Math.atan2(out.y, horiz);
+    const speed = Math.max(1, view.vel.length());
+    const gamma = Math.asin(clampSym(view.vel.y / speed));
+    // A whisker of deadband, only enough that the loop is not chasing the last
+    // few centimetres a second of climb.
+    const err = Math.abs(gamma) <= FLIGHT_PATH_DEAD
+      ? 0
+      : gamma - Math.sign(gamma) * FLIGHT_PATH_DEAD;
+    const want = Math.max(-0.6, Math.min(0.6, nose - err));
+    const cp = Math.cos(want), sp = Math.sin(want);
+    out.set((out.x / horiz) * cp, sp, (out.z / horiz) * cp);
+    return true;
+  }
+
   /** Reticle offset from the nose, normalised by the cone — what goes on the wire. */
   wireAim(view: AircraftView, out: { x: number; y: number }): void {
     _qInv.copy(view.quat).invert();
@@ -563,6 +825,10 @@ export class MouseAimController {
     view: AircraftView, x: number, y: number,
     right: THREE.Vector3, up: THREE.Vector3,
   ): void {
+    // The cursor *is* the reticle here, so relaxing it would be the game
+    // dragging the pointer out from under the player's hand.
+    this.parked = false;
+    this.absolute = true;
     const perp = Math.hypot(x, y);
     if (perp < 1e-6) { this.aimRaw.copy(view.forward); this.aimDir.copy(view.forward); return; }
     const theta = Math.min(1, perp) * this.cfg.cone;

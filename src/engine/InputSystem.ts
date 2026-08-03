@@ -277,11 +277,13 @@ export class InputSystem implements Subsystem {
    * stops a novice pulling the wings off, the stall guard withholds the last of
    * the elevator before the buffet instead of letting them ride it into a spin,
    * the auto-rudder keeps the ball centred (uncoordinated flight is the main
-   * reason a beginner's shots miss), and the wing leveller means that letting
-   * go of the controls is always a valid recovery — which is the single most
-   * important property a first flight can have.
+   * reason a beginner's shots miss), the wings self-level whenever no turn is
+   * demanded, and the reticle relaxes back to the horizon when the player takes
+   * their hand off the mouse — which together are what make "let go of the
+   * controls" a valid recovery from any attitude, the single most important
+   * property a first flight can have.
    *
-   * Realistic hands all four back. It is a deliberate choice, never a default.
+   * Realistic hands all of it back. It is a deliberate choice, never a default.
    */
   private applyAssists(level: string): void {
     const arcade = level !== 'realistic';
@@ -289,6 +291,7 @@ export class InputSystem implements Subsystem {
     cfg.instructor = arcade;
     cfg.coordination = arcade ? DEFAULT_MOUSE_AIM.coordination : 0;
     cfg.levelAssist = arcade ? DEFAULT_MOUSE_AIM.levelAssist : 0;
+    cfg.levelOff = arcade ? DEFAULT_MOUSE_AIM.levelOff : 0;
     cfg.gLimitFactor = arcade ? DEFAULT_MOUSE_AIM.gLimitFactor : 1.05;
     cfg.stallMargin = arcade ? DEFAULT_MOUSE_AIM.stallMargin : 1.0;
   }
