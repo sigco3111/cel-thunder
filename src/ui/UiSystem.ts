@@ -5,7 +5,10 @@ import {
   DamageBits, EntityKind, EventKind, newEntityState,
   type EntityState, type PlayerInfo,
 } from '../shared/protocol';
-import { AIRCRAFT, AIRCRAFT_BY_ID, aircraftByIndex, aircraftIndex, type AircraftSpec } from '../shared/aircraft';
+import {
+  AIRCRAFT, AIRCRAFT_BY_ID, aircraftByIndex, aircraftIndex, nationTeam,
+  type AircraftSpec,
+} from '../shared/aircraft';
 import { injectStyles } from './styles';
 import { el, clamp, setClass, setStyle } from './dom';
 import { TelemetryModel, type HudTelemetry } from './Telemetry';
@@ -32,6 +35,20 @@ const _aim = new THREE.Vector3();
 const _tmp = new THREE.Vector3();
 const G = 9.80665;
 const QUALITY_TIERS = ['low', 'medium', 'high', 'ultra'] as const;
+/**
+ * Seconds a hit keeps crediting the player for what happens to that aeroplane.
+ *
+ * Long enough to cover the gap between the burst that started a fire and the
+ * server's fire event, short enough that a bandit which broke away and was
+ * finished off by somebody else does not report as the player's work.
+ */
+const MY_VICTIM_MEMORY = 4;
+/**
+ * Seconds a death screen may sit over a living aeroplane before it is closed
+ * as stale. Long enough that a 'Kill' event arriving a frame or two ahead of
+ * the snapshot which carries the 'Destroyed' bit is not mistaken for one.
+ */
+const STALE_DEATH_S = 1.0;
 
 /**
  * The whole interface layer: head-up display, menus, hangar, scoreboard,
@@ -97,6 +114,11 @@ export class UiSystem implements Subsystem {
   private mapName = 'Unknown';
   private minimapAcc = 0;
   private directHitT = 0;
+  /** Entity the player's rounds last landed on, and how long that is trusted. */
+  private myVictim = 0;
+  private myVictimT = 0;
+  /** Seconds a death screen has been up over an aeroplane that is alive. */
+  private deathStale = 0;
   private inputBits = 0;
   private lastDamage = 0;
   private wasAlive = false;
@@ -170,15 +192,15 @@ export class UiSystem implements Subsystem {
     this.death.hide();
     this.matchEnd.hide();
 
-    // Seed the hangar with the last aircraft flown.
-    this.hangar.selectById(this.prefs.lastAircraft);
-    this.spec = this.hangar.current;
-    this.telemetry.setAircraft(this.spec);
-
     // The network subsystem initialises before this one, so its welcome or
     // offline event has already fired and been missed. Read the state directly
-    // instead of waiting for an event that will never come again.
+    // instead of waiting for an event that will never come again. This also
+    // puts the hangar on the right side and seeds it with the last aircraft
+    // flown, in that order — the roster has to exist before a selection can
+    // land in it.
     this.syncNetState();
+    this.spec = this.hangar.current;
+    this.telemetry.setAircraft(this.spec);
 
     this.applyQuality(String(this.ctx.quality ?? 'high'));
     this.bindPointerSfx();
@@ -298,6 +320,9 @@ export class UiSystem implements Subsystem {
       this.menu.setInfo('server', 'Connected', 'ok');
       this.menu.setInfo('map', this.mapName);
       this.menu.setInfo('team', m.team === 0 ? 'Allied' : 'Axis');
+      // The hangar's roster is the side's roster. Told here so the very first
+      // visit already offers the right aircraft, before any screen change.
+      this.hangar.setTeam(m.team === 1 ? 1 : 0);
       this.hud.notices.clear('link');
       this.lastLink = '';
       this.hud.chat.push('', `Joined ${this.mapName}`, 0, 0, true);
@@ -426,6 +451,14 @@ export class UiSystem implements Subsystem {
     const net = this.net;
     this.menu.setInfo('aircraft', this.spec?.name ?? '—');
     this.menu.setInfo('team', this.ctx.localTeam === 0 ? 'Allied' : 'Axis');
+    // 'welcome' lands inside NetSystem.init, which has already finished by the
+    // time this subsystem exists — so the event handler above can and does
+    // miss it, and the hangar would sit on its constructor default. This is
+    // the reconciliation path that exists for exactly that reason, so the side
+    // is re-asserted here too. Without it a pilot on the Axis roster is
+    // offered Spitfires, picks one, and is silently handed a Bf 109.
+    this.hangar.setTeam(this.ctx.localTeam);
+    this.hangar.selectById(this.prefs.lastAircraft);
     if (!net) {
       this.menu.setInfo('server', 'Local', 'warn');
       this.menu.setInfo('map', 'Sandbox');
@@ -606,6 +639,11 @@ export class UiSystem implements Subsystem {
   private applyScreen(): void {
     const s = this.screen;
     this.menu.setVisible(s === 'menu');
+    // Re-assert the side every time the hangar opens rather than once at boot:
+    // the team is not known until 'welcome' lands, and it can move between
+    // sorties. An out-of-date roster here is how a Mustang pilot ends up in a
+    // Messerschmitt.
+    if (s === 'hangar') this.hangar.setTeam(this.ctx.localTeam);
     this.hangar.setVisible(s === 'hangar');
     this.hud.setVisible(s === 'flight' && this.prefs.showHud);
     if (s !== 'flight') {
@@ -670,6 +708,12 @@ export class UiSystem implements Subsystem {
       this.spec = AIRCRAFT_BY_ID[m.aircraft];
       this.telemetry.setAircraft(this.spec);
       this.telemetry.refill();
+      // Whatever the authority actually put us in is what the hangar should be
+      // showing next time, and what the menu should be naming. Anything else
+      // leaves the interface describing an aeroplane the player is not in.
+      this.menu.setInfo('aircraft', this.spec.name);
+      this.hangar.setTeam(nationTeam(this.spec.nation));
+      this.hangar.selectById(this.spec.id);
     }
     // Offline, NetSystem announces a spawn without owning an entity id; adopt
     // it so the HUD has something to track. Harmless when another subsystem
@@ -866,21 +910,43 @@ export class UiSystem implements Subsystem {
       case EventKind.HitArmour:
         if (e.a === localId) {
           this.damageFrom(e.x, e.y, e.z);
-        } else if (this.directHitT <= 0 && e.b === localId) {
-          // Gate on "I fired the round", not on "I have this contact locked".
-          // The event already carries the shooter, so the lock was never
-          // needed — and gating on it meant that every hit on anything the
-          // player had not explicitly targeted produced the hit *sound* (which
-          // is not gated) with no marker to go with it. Landing shots on an
-          // untracked bandit is the single most common thing that happens in a
-          // furball, and it was the case with the weakest feedback.
-          this.hud.center.hit(e.kind === EventKind.HitArmour ? 'armour' : 'hit');
-          sfx('hit:marker');
-          this.hud.popups.push('HIT', 10);
+        } else if (e.b === localId) {
+          // Remember whose aeroplane we are putting rounds into, so the
+          // 'Critical' arm below can tell "the engine I just set on fire" from
+          // "somebody else's fight two kilometres away".
+          this.myVictim = e.a;
+          this.myVictimT = MY_VICTIM_MEMORY;
+          if (this.directHitT <= 0) {
+            // Gate on "I fired the round", not on "I have this contact locked".
+            // The event already carries the shooter, so the lock was never
+            // needed — and gating on it meant that every hit on anything the
+            // player had not explicitly targeted produced the hit *sound*
+            // (which is not gated) with no marker to go with it. Landing shots
+            // on an untracked bandit is the single most common thing that
+            // happens in a furball, and it was the case with the weakest
+            // feedback.
+            this.hud.center.hit(e.kind === EventKind.HitArmour ? 'armour' : 'hit');
+            sfx('hit:marker');
+            this.hud.popups.push('HIT', 10);
+          }
         }
         break;
       case EventKind.Critical:
-        if (e.a !== localId) { this.hud.center.hit('crit'); sfx('hit:marker'); this.hud.popups.push('CRITICAL HIT', 40); }
+        // Only a critical the player caused.
+        //
+        // This used to fire for a critical on *any* aeroplane that was not the
+        // player's, which at four a side was a rare and roughly accurate
+        // approximation and at ten a side is a permanent ticker: twenty
+        // aircraft in three simultaneous engagements produce a fire, a seized
+        // engine or a severed control run every few seconds, none of which the
+        // player did or can see. The wire event names the victim and the
+        // module but not the attacker, so the attribution comes from the hit
+        // sparks the player's own rounds produced a moment earlier.
+        if (e.a !== localId && e.a === this.myVictim && this.myVictimT > 0) {
+          this.hud.center.hit('crit');
+          sfx('hit:marker');
+          this.hud.popups.push('CRITICAL HIT', 40);
+        }
         break;
       case EventKind.Kill:
         if (e.a === localId) this.onDeath('', '');
@@ -986,6 +1052,40 @@ export class UiSystem implements Subsystem {
       if (this.briefIn <= 0) this.briefObjective();
     }
     this.directHitT = Math.max(0, this.directHitT - dt);
+    this.myVictimT = Math.max(0, this.myVictimT - dt);
+
+    /*
+     * A death screen must never outlive the death.
+     *
+     * The three things that make one up arrive on three different channels: the
+     * kill feed as JSON, the 'Kill' event in the binary event stream, and the
+     * respawn as another JSON message. Nothing orders them against each other,
+     * so a Kill event that lands *after* the 'spawned' it belongs to reopens
+     * the screen over an aeroplane that is already flying again — and because
+     * the screen is modal, the input subsystem stays suspended. The player is
+     * then airborne, healthy, and unable to move the controls for the rest of
+     * the session, with no further spawn coming to clear it.
+     *
+     * At four a side that was rare enough to have never been seen. At ten it
+     * happens in the ordinary course of a match, so it is closed here on the
+     * only fact that matters: the aeroplane is alive. The hold-off covers the
+     * genuine case, where the Kill event legitimately precedes the snapshot
+     * carrying the 'Destroyed' bit by a frame or two.
+     */
+    if (this.death.isOpen) {
+      const me = this.ctx.localEntityId
+        ? this.ctx.entities.get(this.ctx.localEntityId) : undefined;
+      const flying = !!me && me.health > 0 && !(me.damage & DamageBits.Destroyed);
+      this.deathStale = flying ? this.deathStale + dt : 0;
+      if (this.deathStale > STALE_DEATH_S) {
+        this.deathStale = 0;
+        this.death.hide();
+        this.ctx.bus.emit('ui:modal', this.isModal());
+        console.warn('[ui] closed a death screen that outlived the death');
+      }
+    } else {
+      this.deathStale = 0;
+    }
     this.leadExternalT -= dt;
     if (this.leadExternalT <= 0) this.leadExternal = false;
 

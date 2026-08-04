@@ -2,6 +2,7 @@ import { type Heightfield } from '../src/world/heightfield';
 import {
   groundSiting, type GroundUnitSite, type SiteCentre, type TargetKind,
 } from '../src/world/groundSites';
+import { GroundType } from '../src/shared/ground';
 
 /**
  * Everything on the ground that is not a flak battery: the lorry column and its
@@ -27,18 +28,14 @@ import {
  * (an AA battery): a lorry is a nuisance, a factory is a campaign objective.
  */
 
-/** Wire archetype ids. 0..2 are the AA classes, which 'GroundWar' owns. */
-export enum GroundType {
-  AaLight = 0,
-  AaMedium = 1,
-  AaHeavy = 2,
-  Truck = 3,
-  Armour = 4,
-  Wagon = 5,
-  Factory = 6,
-  Railyard = 7,
-  Bridge = 8,
-}
+/**
+ * Wire archetype ids. 0..2 are the AA classes, which 'GroundWar' owns.
+ *
+ * Re-exported from the shared module rather than declared twice: the HUD has
+ * to name these, and the last time the numbering lived only here the marker
+ * layer fell back to the aircraft table and labelled flak pits "Bf 109 G-6".
+ */
+export { GroundType };
 
 export interface GroundUnit {
   index: number;

@@ -2,7 +2,7 @@ import type { GameContext, Subsystem } from '../engine/context';
 import {
   EntityKind, newEntityState, type EntityState, type InputFrame,
 } from '../shared/protocol';
-import { aircraftByIndex, aircraftIndex, AIRCRAFT_BY_ID, type AircraftSpec } from '../shared/aircraft';
+import { aircraftByIndex, AIRCRAFT_BY_ID, type AircraftSpec } from '../shared/aircraft';
 import { clamp, q, qslerp, qconj, qmul, v3, type Q } from '../shared/math';
 import type { NetSystem } from '../net/NetSystem';
 import { getClientEnv, type ClientEnv } from './env';
@@ -498,8 +498,13 @@ export class FlightSystem implements Subsystem {
     const s = this.localEntity;
     s.id = this.boundEntityId;
     s.kind = EntityKind.Aircraft;
-    s.typeId = Math.max(0, aircraftIndex(this.localSpec.id));
-    s.team = ctx.localTeam;
+    // 'team' and 'typeId' are NOT written here. Both are copied wholesale from
+    // the authoritative record in 'ensureLocalState' and refreshed on every
+    // reconcile, so the aeroplane the player is flying reports the side and the
+    // airframe the *server* put them in. Re-deriving the team from a
+    // client-tracked field is precisely how the HUD came to paint Axis
+    // contacts as friendlies: the server had substituted the airframe and
+    // moved the pilot, and nothing downstream ever heard about it.
     s.ownerId = ctx.localPlayerId;
 
     s.px = _pred.px + this.errX;

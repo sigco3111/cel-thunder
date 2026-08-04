@@ -1,6 +1,6 @@
 import { el, setText, clamp } from '../dom';
 import { COLORS } from '../theme';
-import { EntityKind, type EntityState } from '../../shared/protocol';
+import { DamageBits, EntityKind, type EntityState } from '../../shared/protocol';
 import { hash2 } from '../../shared/math';
 
 export interface WorldMarker {
@@ -389,13 +389,34 @@ export class Minimap {
     }
 
     // Contacts -------------------------------------------------------------
+    // Two glyphs, because there are two kinds of thing here. The aircraft
+    // chevron points where the aeroplane is going; a bunker does not go
+    // anywhere, and drawing a stationary emplacement as an aeroplane pointing
+    // north (which is what 'atan2(0, 0)' yields) makes a defended airfield
+    // look like a formation. Ground gets a small square instead.
+    //
+    // Ally/enemy is decided against the player's own aircraft — the same
+    // 'localTeam' the markers use, derived from the local entity — so the map
+    // and the windscreen can never disagree about who is who.
     for (const e of entities.values()) {
-      if (e.kind !== EntityKind.Aircraft && e.kind !== EntityKind.GroundUnit) continue;
+      const isAir = e.kind === EntityKind.Aircraft;
+      if (!isAir && e.kind !== EntityKind.GroundUnit) continue;
+      if (e.damage & DamageBits.Destroyed) continue;
       const isLocal = e.id === localId;
       const x = X(e.px), z = Z(e.pz);
       if (x < -10 || z < -10 || x > S + 10 || z > S + 10) continue;
-      const hdg = Math.atan2(e.vx, e.vz);
       const col = isLocal ? COLORS.accent : e.team === localTeam ? COLORS.ally : COLORS.enemy;
+      g.strokeStyle = 'rgba(6,10,16,0.9)';
+      g.fillStyle = col;
+      if (!isAir) {
+        const s = 3.2 * this.dpr;
+        g.lineWidth = 1.2 * this.dpr;
+        g.beginPath();
+        g.rect(x - s, z - s, s * 2, s * 2);
+        g.fill(); g.stroke();
+        continue;
+      }
+      const hdg = Math.atan2(e.vx, e.vz);
       const r = (isLocal ? 6.5 : 5) * this.dpr;
       g.save();
       g.translate(x, z);
@@ -406,8 +427,6 @@ export class Minimap {
       g.lineTo(0, r * 0.35);
       g.lineTo(-r * 0.72, r * 0.8);
       g.closePath();
-      g.fillStyle = col;
-      g.strokeStyle = 'rgba(6,10,16,0.9)';
       g.lineWidth = 1.6 * this.dpr;
       g.fill(); g.stroke();
       g.restore();

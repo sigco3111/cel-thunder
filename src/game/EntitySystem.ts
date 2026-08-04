@@ -30,9 +30,20 @@ import type { VfxSystem } from '../vfx/VfxSystem';
  * that can be instanced, is.
  */
 
-/** How many spare airframes of each type to pre-build, by quality tier. */
+/**
+ * How many spare airframes of each type to pre-build, by quality tier.
+ *
+ * Sized from the roster, not from taste. A ten-a-side match deals its bots
+ * across the airframes its nation actually fields, and the Axis fields two —
+ * so five Bf 109s can be airborne at once, plus one more slot for the overlap
+ * between a wreck still falling and the replacement that has already spawned.
+ * At four the pool ran dry the moment the roster went up and every match paid
+ * a build hitch mid-flight, announced by a console warning. Building the sixth
+ * during boot costs a few tens of milliseconds behind a loading screen that is
+ * already up.
+ */
 const POOL_BY_QUALITY: Record<QualityTier, number> = {
-  low: 2, medium: 3, high: 4, ultra: 4,
+  low: 3, medium: 5, high: 6, ultra: 6,
 };
 
 const SMOKE_BY_QUALITY: Record<QualityTier, number> = {

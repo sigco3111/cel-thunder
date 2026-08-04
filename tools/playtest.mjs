@@ -57,6 +57,25 @@ const OFFLINE_URL = `${WEB}/?server=ws://127.0.0.1:8799/ws`;
 const ONLINE_URL = `${WEB}/?server=ws://127.0.0.1:${GAME_PORT}/ws`;
 
 const KMH = 3.6;
+
+/**
+ * Aircraft the match is supposed to have airborne, both paths.
+ *
+ * Ten a side on the server ('DEFAULT_MATCH.rosterPerTeam'), twenty entries in
+ * the offline sandbox's own roster. Asserted rather than merely observed: a
+ * roster that silently collapses is the difference between a game and a
+ * demo, and "there is at least one other aeroplane" cannot tell them apart.
+ */
+const EXPECTED_ROSTER = 20;
+/**
+ * How far below the roster the count may sit at the moment of measurement.
+ *
+ * Not slack for a broken backfill — slack for the respawn queue. A death costs
+ * an aeroplane for 'respawnDelay' seconds, and by the time this runs the AI has
+ * been fighting for a couple of minutes, so two or three of the roster being
+ * mid-respawn is the normal, healthy state.
+ */
+const ROSTER_SLACK = 5;
 const DEG = 180 / Math.PI;
 
 /**
@@ -258,12 +277,36 @@ async function runSuite(browser, mode, url) {
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('framenavigated', (f) => { if (f === page.mainFrame()) navigations.push(f.url()); });
 
-  /** Never returns null: an aircraft that vanished is a failure, not a crash. */
+  /**
+   * Never returns null: an aircraft that vanished is a failure, not a crash.
+   *
+   * "Vanished" has to mean *stayed* vanished, though. Being shot down destroys
+   * the entity and the replacement arrives a respawn delay later, so in a
+   * twenty-ship match there is a routine several-second window in which the
+   * player has no aeroplane in the table at all. Throwing on the first empty
+   * read aborted the whole suite mid-run — 'the player aircraft disappeared
+   * from the world' — for something that is simply what dying looks like. So
+   * it waits out a respawn before giving up.
+   */
   const sample = async () => {
-    const s = await page.evaluate(SAMPLE);
-    if (!s) throw new Error('the player aircraft disappeared from the world');
-    return s;
+    for (let i = 0; i < 60; i++) {
+      const s = await page.evaluate(SAMPLE);
+      if (s) return s;
+      await sleep(250);
+    }
+    throw new Error('the player aircraft disappeared from the world');
   };
+
+  /**
+   * The entity the player is currently flying.
+   *
+   * A respawn issues a *new* id, which is the only reliable signal that the
+   * aeroplane under a measurement was replaced — and with it every held key and
+   * mouse button, because those live in the input subsystem and it resets on
+   * spawn. Several checks below are only meaningful across one aeroplane's
+   * life, so they compare this before and after.
+   */
+  const entityId = () => page.evaluate(() => window.__game.localEntityId);
 
   // --- 1. boot ---------------------------------------------------------------
   console.log('\n1. Boot');
@@ -573,15 +616,32 @@ async function runSuite(browser, mode, url) {
     + ` VS ${dive0.air.vertSpeed.toFixed(0)} -> ${dive1.air.vertSpeed.toFixed(0)} m/s`);
 
   // Keyboard axes, independently of mouse aim.
-  await levelOff();
-  const roll0 = await sample();
-  await page.keyboard.down('KeyA');
-  await sleep(1800);
-  const roll1 = await sample();
-  await page.keyboard.up('KeyA');
+  //
+  // Re-flown if the aeroplane was replaced under us. A held key is state in the
+  // *input subsystem*, and a respawn resets it — so a pilot who is shot down
+  // during the 1.8 s measurement comes back in a fresh aeroplane with the
+  // stick centred, and the measurement reads "no roll authority" about a
+  // controller that is working perfectly. With a full twenty-ship roster that
+  // stopped being a remote possibility, so it is handled rather than hoped
+  // about. Bounded to one retry: a loop that retried until it liked the answer
+  // would not be testing anything.
+  let rollOk = false;
+  let roll0, roll1;
+  for (let attempt = 0; attempt < 2 && !rollOk; attempt++) {
+    await levelOff();
+    const bornBefore = await entityId();
+    roll0 = await sample();
+    await page.keyboard.down('KeyA');
+    await sleep(1800);
+    roll1 = await sample();
+    await page.keyboard.up('KeyA');
+    rollOk = (await entityId()) === bornBefore;
+    if (!rollOk && attempt === 0) console.log('  ..  roll sample lost its aeroplane mid-measurement — re-flying');
+  }
   check('keyboard roll authority is real',
     Math.abs(wrapDeg((roll1.air.rollAngle - roll0.air.rollAngle) * DEG)) > 12,
-    `bank ${(roll0.air.rollAngle * DEG).toFixed(0)}° -> ${(roll1.air.rollAngle * DEG).toFixed(0)}°`);
+    `bank ${(roll0.air.rollAngle * DEG).toFixed(0)}° -> ${(roll1.air.rollAngle * DEG).toFixed(0)}°`
+    + (rollOk ? '' : ' [aeroplane replaced mid-measurement]'));
 
   // Releasing everything must not leave the aeroplane departed: wings come
   // back level, it stays flyable and it does not tumble.
@@ -635,8 +695,19 @@ async function runSuite(browser, mode, url) {
   //   it 26 m — correct behaviour, and nothing to do with what is being tested.
   //   Swallowed events are counted and reported so this can never quietly hide
   //   an input the test did not intend to make.
+  //
+  // The measurement is also *guarded against being shot at*. With a full
+  // twenty-ship roster the aeroplane is usually inside somebody's gunsight by
+  // the time this section runs, and a burst through the wing produces exactly
+  // the trace this check exists to reject — 35° of bank and 63° of roll demand
+  // from a controller that is behaving correctly and is busy recovering from
+  // damage. Blaming the director for that is a false negative that tells you
+  // nothing, and loosening the thresholds to accommodate it would throw away
+  // the only check that catches the real roll limit cycle. So the sample
+  // records whether the airframe took a hit while it was being measured, and a
+  // disturbed sample is re-flown rather than scored.
   await levelOff(3000);
-  const handsOff = await page.evaluate(async () => {
+  const measureHandsOff = () => page.evaluate(async () => {
     const input = window.__game.get('input');
     const m = input.mouse;
     const wasLocked = m.locked;
@@ -659,12 +730,28 @@ async function runSuite(browser, mode, url) {
     const alt0 = a0.altitude;
     const tas0 = a0.tas * 3.6;
     const pitch0 = pitchOf();
+    const me = () => window.__game.entities.get(window.__game.localEntityId);
+    const dmg0 = me() ? me().damage : 0;
+    const hp0 = me() ? me().health : 1;
+    // The entity id, because a death is invisible in damage and health alone:
+    // the replacement aeroplane comes back undamaged at full health, which is
+    // exactly what an untouched one looks like. Only the id changes.
+    const id0 = window.__game.localEntityId;
+    let disturbed = '';
     let peakBank = 0;
     let peakDemand = 0;
     let peakPitchDrift = 0;
     const t0 = performance.now();
     while (performance.now() - t0 < 30000) {
       await wait(100);
+      const e = me();
+      // Anything that hits the aeroplane invalidates the sample: what is being
+      // measured is the director holding a trimmed aeroplane, and a holed one
+      // is not that.
+      if (window.__game.localEntityId !== id0) disturbed = disturbed || 'was shot down and respawned';
+      else if (!e) disturbed = disturbed || 'the aircraft left the world';
+      else if (e.damage !== dmg0) disturbed = disturbed || 'took battle damage';
+      else if (e.health < hp0 - 0.001) disturbed = disturbed || 'was hit';
       peakBank = Math.max(peakBank, Math.abs(bankOf()));
       peakPitchDrift = Math.max(peakPitchDrift, Math.abs(pitchOf() - pitch0));
       // The OUTER loop's output, in degrees of roll asked for. Deliberately not
@@ -682,33 +769,44 @@ async function runSuite(browser, mode, url) {
       theta: input.aim.theta,
       demand: input.aim.rollError * 57.2958,
       roll: input.frame.roll, pitch: input.frame.pitch, yaw: input.frame.yaw,
-      vs: a.vertSpeed, spin: a.spinning, swallowed,
+      vs: a.vertSpeed, spin: a.spinning, swallowed, disturbed,
     };
     m.locked = wasLocked;
     m.drain = realDrain;
     return out;
   });
+
+  // One re-fly if the first sample was shot at. Deliberately bounded: a
+  // measurement that retried until it liked the answer would test nothing, so
+  // a second disturbed sample is scored as-is and says why in the detail.
+  let handsOff = await measureHandsOff();
+  if (handsOff.disturbed) {
+    console.log(`  ..  hands-off sample discarded (${handsOff.disturbed}) — re-flying`);
+    await levelOff(3000);
+    handsOff = await measureHandsOff();
+  }
+  const disturbedNote = handsOff.disturbed ? ` [DISTURBED: ${handsOff.disturbed}]` : '';
   const dAlt = handsOff.alt1 - handsOff.alt0;
   const dTas = handsOff.tas1 - handsOff.tas0;
   const dNose = handsOff.pitch1 - handsOff.pitch0;
   check('hands off for 30 s, the aeroplane flies straight and level',
     Math.abs(handsOff.bank) < 5 && handsOff.peakBank < 10,
     `bank ${handsOff.bank.toFixed(1)}° (peak ${handsOff.peakBank.toFixed(1)}°),`
-    + ` ${handsOff.swallowed} stray pointer event(s) swallowed`);
+    + ` ${handsOff.swallowed} stray pointer event(s) swallowed${disturbedNote}`);
   // Before the fix this sat at ±17° of demand with excursions past 57°, which
   // is what saturated the ailerons and produced the roll limit cycle.
   check('hands off, nothing is asking the aeroplane to roll',
     Math.abs(handsOff.demand) < 4 && handsOff.peakDemand < 8,
     `roll demand ${handsOff.demand.toFixed(2)}°, peak ${handsOff.peakDemand.toFixed(2)}°`
-    + ` (aileron ${handsOff.roll.toFixed(3)})`);
+    + ` (aileron ${handsOff.roll.toFixed(3)})${disturbedNote}`);
   check('hands off for 30 s, the nose stays where it is',
     Math.abs(dNose) < 3 && handsOff.peakPitchDrift < 5,
     `pitch ${handsOff.pitch0.toFixed(1)}° -> ${handsOff.pitch1.toFixed(1)}°`
-    + ` (drift ${dNose >= 0 ? '+' : ''}${dNose.toFixed(1)}°, peak ${handsOff.peakPitchDrift.toFixed(1)}°)`);
+    + ` (drift ${dNose >= 0 ? '+' : ''}${dNose.toFixed(1)}°, peak ${handsOff.peakPitchDrift.toFixed(1)}°)${disturbedNote}`);
   check('hands off for 30 s, the aeroplane holds its altitude',
     Math.abs(dAlt) < 50 && Math.abs(handsOff.vs) < 4,
     `${handsOff.alt0.toFixed(0)} -> ${handsOff.alt1.toFixed(0)} m`
-    + ` (${dAlt >= 0 ? '+' : ''}${dAlt.toFixed(0)} m in 30 s), VS ${handsOff.vs.toFixed(1)} m/s`);
+    + ` (${dAlt >= 0 ? '+' : ''}${dAlt.toFixed(0)} m in 30 s), VS ${handsOff.vs.toFixed(1)} m/s${disturbedNote}`);
   // Asymmetric, and physically so. Losing speed hands-off is how a beginner
   // ends up stalled and is the failure this exists to catch; gaining a little
   // is the aeroplane settling at the speed a wide-open throttle buys it in
@@ -718,7 +816,7 @@ async function runSuite(browser, mode, url) {
   check('hands off for 30 s, the aeroplane does not bleed speed',
     dTas > -12 && dTas < 28,
     `TAS ${handsOff.tas0.toFixed(0)} -> ${handsOff.tas1.toFixed(0)} km/h`
-    + ` (${dTas >= 0 ? '+' : ''}${dTas.toFixed(0)} km/h in 30 s)`);
+    + ` (${dTas >= 0 ? '+' : ''}${dTas.toFixed(0)} km/h in 30 s)${disturbedNote}`);
 
   // --- 6c. zero input means zero command ------------------------------------
   //
@@ -817,11 +915,31 @@ async function runSuite(browser, mode, url) {
   // pitches up into a stall — but an assist that could command more than a
   // nudge would be a worse bug than the one it fixes.
   const pk = director.parked;
+  // Two bounds, both of them the law rather than an observation.
+  //
+  // The absolute ceiling is 'PARK_LEAD' in MouseAimController — 0.035 rad, 2.0°
+  // — which is the hard clamp the assist is written around and therefore the
+  // real guarantee. This used to assert 1.21°, which was not the law but the
+  // reading taken off an aeroplane that happened to be within a fifth of a
+  // degree of level when the sample was taken. With a full twenty-ship roster
+  // the player is far more likely to be jostled during the preceding hands-off
+  // window, the flight path sits a degree or so off, and a legal 1.56° nudge
+  // correcting a 1.64° descent failed a test that was measuring the weather.
+  //
+  // The second bound is what the old number was reaching for and states it
+  // properly: the offset may never exceed the flight-path error it exists to
+  // correct. That is strictly tighter than 2° for a nearly level aeroplane, so
+  // nothing is given away — an assist that manufactured a command out of a
+  // level flight path still fails, which is the regression that matters.
+  const PARK_LEAD_DEG = 0.035 * DEG;
   check('an uncaptured aeroplane is nudged toward level, and only nudged',
-    pk.theta <= 1.21 && Math.abs(pk.bank) < 0.05
+    pk.theta <= PARK_LEAD_DEG + 0.05
+    && pk.theta <= Math.abs(pk.gamma) + 0.05
+    && Math.abs(pk.bank) < 0.05
     && (Math.abs(pk.gamma) < 0.2 || Math.sign(pk.pitch) === -Math.sign(pk.gamma)),
-    `reticle ${pk.theta.toFixed(2)}° off the nose (ceiling 1.15°), elevator`
-    + ` ${pk.pitch.toFixed(3)} against a ${pk.gamma.toFixed(2)}° flight path`);
+    `reticle ${pk.theta.toFixed(2)}° off the nose (ceiling ${PARK_LEAD_DEG.toFixed(2)}°`
+    + ` and never past the ${Math.abs(pk.gamma).toFixed(2)}° flight-path error),`
+    + ` elevator ${pk.pitch.toFixed(3)} against a ${pk.gamma.toFixed(2)}° flight path`);
   check('with the reticle on the nose the only thing asked for is wings level',
     Math.abs(director.pitchAttitude) > 55 || Math.abs(bs.rollErr - wantsLevel) < 0.4,
     `roll demand ${bs.rollErr.toFixed(2)}° vs ${wantsLevel.toFixed(2)}° of leveller`
@@ -881,6 +999,138 @@ async function runSuite(browser, mode, url) {
   // server had no AI while counting seven of them.
   check('there is something to fight', opponents > 0,
     `${opponents} other aircraft ${mode === 'offline' ? 'in the sandbox' : 'on the server'}`);
+  // The sky has to be *full*, not merely non-empty. A roster that quietly
+  // halves itself — a bot backfill that stops topping up, an offline table
+  // that was never raised to match the server — reads as "the game is dead"
+  // long before anything fails, and 'opponents > 0' cannot see it.
+  check('the roster fills the sky', opponents + 1 >= EXPECTED_ROSTER - ROSTER_SLACK,
+    `${opponents + 1} of ${EXPECTED_ROSTER} aircraft airborne`);
+
+  // --- 7b. identification ----------------------------------------------------
+  //
+  // The check this suite did not have.
+  //
+  // All 158 of the assertions before this one passed on a build where the HUD
+  // painted contacts the wrong colour and named flak emplacements after
+  // aeroplanes — because nothing anywhere compared a *rendered marker* against
+  // the *entity it was drawn around*. Everything below reads the marker
+  // elements the player is actually looking at and reconciles them with the
+  // replicated state, which is the only way this class of bug is visible to a
+  // test at all.
+  console.log('\n7b. Identification');
+
+  // Wait for something to actually be on the marker layer before reading it.
+  // The contact list is range- and screen-bounded, so a single sample taken
+  // while the nearest aeroplane happens to be behind the tail reads zero
+  // markers — which would make the colour check pass vacuously if it were
+  // tolerant and fail spuriously if it were not. With twenty aircraft up,
+  // nothing being marked for eight seconds is itself worth failing on.
+  for (let i = 0; i < 40; i++) {
+    const n = await page.evaluate(() => [...document.querySelectorAll('#ct-markers .ct-mk')]
+      .filter((m) => m.style.display !== 'none').length);
+    if (n > 0) break;
+    await sleep(200);
+  }
+
+  const ident = await page.evaluate(() => {
+    const g = window.__game;
+    const me = g.entities.get(g.localEntityId);
+    if (!me) return { fatal: 'the player has no aircraft in the entity table' };
+    // Aircraft archetype -> the side that airframe belongs to. Mirrors
+    // 'nationTeam' in src/shared/aircraft.ts; kept literal on purpose so a
+    // change to that function cannot silently make this check agree with it.
+    const NATION_TEAM = [0, 1, 0, 1, 0];
+    const AC_NAMES = ['Spitfire', 'Bf 109', 'P-51', 'A6M', 'La-5'];
+
+    const rows = [];
+    for (const mk of document.querySelectorAll('#ct-markers .ct-mk')) {
+      if (mk.style.display === 'none') continue;
+      const e = g.entities.get(Number(mk.dataset.eid));
+      if (!e) { rows.push({ why: 'marker bound to a nonexistent entity', ok: false }); continue; }
+      const isGround = e.kind === 5;
+      const lbl = mk.querySelector('.ct-mk-lbl');
+      const showing = lbl && lbl.style.display !== 'none';
+      const text = showing ? (mk.querySelector('.ct-mk-lbl span')?.textContent ?? '') : '';
+      const colourOk = (e.team === me.team) === mk.classList.contains('is-ally')
+        && (e.team !== me.team) === mk.classList.contains('is-enemy');
+      const classOk = isGround === mk.classList.contains('is-ground');
+      const nameOk = !(isGround && AC_NAMES.some((n) => text.includes(n)));
+      rows.push({
+        ok: colourOk && classOk && nameOk,
+        colourOk, classOk, nameOk, isGround, text,
+        team: e.team, myTeam: me.team,
+      });
+    }
+    return {
+      markers: rows.length,
+      badColour: rows.filter((r) => !r.colourOk).length,
+      badClass: rows.filter((r) => !r.classOk).length,
+      badName: rows.filter((r) => !r.nameOk).length,
+      groundNamed: rows.filter((r) => r.isGround && r.text).map((r) => r.text),
+      myTeam: me.team,
+      ctxLocalTeam: g.localTeam,
+      assignedTeam: g.assignedTeam,
+      myTypeId: e_typeId(me),
+      myNationTeam: NATION_TEAM[me.typeId] ?? -1,
+      // Every aircraft on the wire, not just the marked ones.
+      incoherent: (() => {
+        let n = 0;
+        for (const e of g.entities.values()) {
+          if (e.kind !== 1) continue;
+          if ((NATION_TEAM[e.typeId] ?? e.team) !== e.team) n++;
+        }
+        return n;
+      })(),
+    };
+    function e_typeId(e) { return e.typeId; }
+  });
+
+  if (ident.fatal) {
+    check('the player has an aircraft to identify contacts from', false, ident.fatal);
+  } else {
+    check('every marker is coloured from the contact\'s own team',
+      ident.markers > 0 && ident.badColour === 0,
+      `${ident.markers} markers, ${ident.badColour} miscoloured`);
+    check('ground contacts are drawn as ground, not as aircraft',
+      ident.badClass === 0, `${ident.badClass} ground/air class mismatches`);
+    check('no ground contact wears an aircraft name',
+      ident.badName === 0,
+      ident.groundNamed.length
+        ? `ground labels seen: ${[...new Set(ident.groundNamed)].join(', ')}`
+        : 'no ground labels visible this frame');
+    // The drift the whole derivation exists to make impossible.
+    check('the HUD\'s idea of "my team" is the team of my aircraft',
+      ident.ctxLocalTeam === ident.myTeam,
+      `ctx.localTeam ${ident.ctxLocalTeam}, my entity team ${ident.myTeam}, `
+      + `roster said ${ident.assignedTeam}`);
+    check('the player\'s airframe belongs to the side they fly for',
+      ident.myNationTeam === ident.myTeam,
+      `type ${ident.myTypeId} is a team-${ident.myNationTeam} airframe, `
+      + `player is on team ${ident.myTeam}`);
+    check('no aircraft in the match flies for the wrong side',
+      ident.incoherent === 0, `${ident.incoherent} nation/team mismatches`);
+  }
+
+  // The hangar must not offer what the authority would refuse. This is the
+  // other half of the same bug: a pilot picked a Mustang, the server
+  // substituted a Messerschmitt without saying so, and every marker in the
+  // game then disagreed with the aeroplane the player believed they were in.
+  const hangarRoster = await page.evaluate(() => {
+    const g = window.__game;
+    const me = g.entities.get(g.localEntityId);
+    const NATION_TEAM = { Spitfire: 0, 'Bf 109': 1, 'P-51': 0, A6M: 1, 'La-5': 0 };
+    const names = [...document.querySelectorAll('#ct-hangar .ct-plane')]
+      .map((p) => p.querySelector('.nm')?.textContent ?? '');
+    const teams = names.map((n) => {
+      const k = Object.keys(NATION_TEAM).find((x) => n.includes(x));
+      return k === undefined ? -1 : NATION_TEAM[k];
+    });
+    return { names, teams, myTeam: me ? me.team : g.localTeam };
+  });
+  check('the hangar only offers aircraft this side can fly',
+    hangarRoster.names.length > 0
+      && hangarRoster.teams.every((t) => t === hangarRoster.myTeam),
+    `team ${hangarRoster.myTeam} roster: ${hangarRoster.names.join(', ') || '(empty)'}`);
 
   // --- 8. camera -------------------------------------------------------------
   console.log('\n8. Camera');
@@ -1047,6 +1297,9 @@ async function runSuite(browser, mode, url) {
 async function onlineGunnery(page, tag, check) {
   console.log('\n10. Online gunnery and modular damage');
 
+  /** See the identically named helper in 'runSuite'. */
+  const entityId = () => page.evaluate(() => window.__game.localEntityId);
+
   const target = await page.evaluate(() => {
     const g = window.__game;
     const me = g.entities.get(g.localEntityId);
@@ -1135,12 +1388,38 @@ async function onlineGunnery(page, tag, check) {
   // Trigger held throughout, re-slotted every quarter of a second. The bandit is
   // flown by the same 'AiPilot' a human fights and it does not sit still: a
   // single long pass simply watches it fly out of the cone.
-  await page.mouse.down({ button: 'left' });
-  await page.mouse.down({ button: 'right' });
+  //
+  // "Held", however, is a fact about the *input subsystem*, not about the
+  // mouse: a spawn resets the frame, so being shot down and replaced part-way
+  // through leaves the trigger logically up with no further pointer event
+  // coming to put it back. The loop watched forty passes go by with the guns
+  // silent and reported that gunfire produces no damage — a false negative
+  // that only appeared once the sky was full enough to shoot the harness down
+  // mid-test. So the entity id is watched, and the trigger is re-pressed on
+  // the aeroplane that replaced the one that was firing.
+  let flying = await entityId();
+  let rearmed = 0;
+  let inputDiag = null;
+  const holdTrigger = async () => {
+    await page.mouse.down({ button: 'left' });
+    await page.mouse.down({ button: 'right' });
+  };
+  const releaseTrigger = async () => {
+    await page.mouse.up({ button: 'left' });
+    await page.mouse.up({ button: 'right' });
+  };
+  await holdTrigger();
   /** Keep shooting until the damage is unambiguously modular, not just present. */
   const bitCount = () => [...masks].reduce((a, m) => a | m, 0).toString(2).split('1').length - 1;
   for (let pass = 0; pass < 40 && alive && bitCount() < 2; pass++) {
     if (!(await selfAlive())) { skipped++; await sleep(900); continue; }
+    const now = await entityId();
+    if (now !== flying) {
+      flying = now;
+      rearmed++;
+      await releaseTrigger();
+      await holdTrigger();
+    }
     if (!(await saddle())) break;
     passes++;
     await sleep(130);
@@ -1153,19 +1432,35 @@ async function onlineGunnery(page, tag, check) {
     }
     const r = await rangeTo();
     if (r) { closest = Math.min(closest, r.d); bestOff = Math.min(bestOff, r.off); lastBits = r.bits; }
+    if (r && !(r.bits & 1) && !inputDiag) {
+      inputDiag = await page.evaluate(() => {
+        const g = window.__game;
+        const inp = g.get('input');
+        const ui = g.get('ui');
+        return {
+          suspended: inp?.suspended, screen: ui?.screen,
+          modal: typeof ui?.isModal === 'function' ? ui.isModal() : '?',
+          active: document.activeElement?.tagName,
+          locked: !!document.pointerLockElement,
+          mouseButtons: inp?.mouse?.buttons ?? inp?.mouse?.down ?? '?',
+          deathOpen: ui?.death?.isOpen, scoreOpen: ui?.scoreOpen,
+        };
+      });
+    }
     projectiles = Math.max(projectiles, await page.evaluate(COUNT_PROJECTILES));
   }
-  await page.mouse.up({ button: 'left' });
-  await page.mouse.up({ button: 'right' });
+  await releaseTrigger();
   await page.screenshot({ path: `${tag}-08-gunnery.png` });
 
   const bits = [...masks].reduce((a, m) => a | m, 0);
   const nBits = bits.toString(2).split('1').length - 1;
   const DESTROYED = 1 << 13;
   check('gunfire produces damage on the wire', bits !== 0,
-    `mask -> ${bits} after ${passes} pass(es) (${skipped} skipped while dead),`
+    `mask -> ${bits} after ${passes} pass(es) (${skipped} skipped while dead,`
+    + ` ${rearmed} re-armed after a respawn),`
     + ` closest ${closest === Infinity ? '?' : closest} m, best off-nose ${bestOff}°,`
-    + ` input bits 0x${(lastBits >>> 0).toString(16)}, ${projectiles} rounds in the air`);
+    + ` input bits 0x${(lastBits >>> 0).toString(16)}, ${projectiles} rounds in the air`
+    + (inputDiag ? ` | first zero-trigger state: ${JSON.stringify(inputDiag)}` : ''));
   // The whole point: not a single 'Destroyed' bit. Wings, engines, fuel, the
   // pilot and the control runs are all separately replicated, and the client
   // already renders every one of them.
@@ -1425,7 +1720,19 @@ async function groundAttack(page, tag, check, mode) {
   await sleep(3500);
 
   const ORD = () => window.__game?.get?.('flight')?.ordnanceState ?? null;
-  const armed = await page.evaluate(ORD);
+  // Wait for the racks rather than sampling on a fixed delay. Online the
+  // stores are the *server's* — they arrive in a 'stores' message some time
+  // after the spawn — and a respawn in the middle of that (which a twenty-ship
+  // match supplies readily) restarts the whole handshake. Reading once after
+  // three and a half seconds caught the pre-stores state often enough to fail
+  // the entire ground-attack section on a loadout that was in fact delivered:
+  // the same run went on to release two bombs from an aeroplane the check had
+  // just called clean.
+  let armed = await page.evaluate(ORD);
+  for (let i = 0; i < 40 && (!armed || armed.bombs < 1); i++) {
+    await sleep(250);
+    armed = await page.evaluate(ORD);
+  }
   // Online this is the count the *server* sent back in 'stores': the racks are
   // its, and a client that simply believed its own hangar would be inventing
   // ordnance the match knows nothing about.
@@ -1476,72 +1783,115 @@ async function groundAttack(page, tag, check, mode) {
   if (!setup) return;
   await sleep(900);
 
-  // One lateral correction, taken from the game's own impact solution: shift
-  // the whole run-in sideways so the ground track passes over the target. This
-  // is the harness standing in for the fifteen seconds of gentle S-turning a
-  // pilot does on the way in, and it is the only part of the pass that is not
-  // flown — the approach, the release and everything after it are real.
-  const aim = await page.evaluate((tgt) => {
-    const g = window.__game;
-    const o = g.get('flight').ordnanceState;
-    if (!o.solution) return null;
-    // Across-track unit vector, horizontal and perpendicular to the run-in.
-    const ax = Math.cos(tgt.heading), az = -Math.sin(tgt.heading);
-    const across = (tgt.x - o.solution.x) * ax + (tgt.z - o.solution.z) * az;
-    g.bus.emit('debug:place', {
-      x: tgt.x0 + ax * across, y: tgt.y0, z: tgt.z0 + az * across,
-      heading: tgt.heading, pitch: Math.atan2(330, 900), bank: 0, speed: 150,
-      opponent: null,
+  /*
+   * The pass, flown up to twice.
+   *
+   * A dive-bombing run is six seconds of holding a line, and the assertion on
+   * it is tight — the predicted impact has to come within 20 m. That is a fair
+   * test of the bombsight and a hopeless one of the weather: with a full
+   * twenty-ship roster the aeroplane can be hit, or shot down and replaced,
+   * somewhere in those six seconds, and a hundred metres of miss then says
+   * nothing whatever about the ordnance model. So the run watches for the
+   * aeroplane being disturbed and re-flies once if it was — which the loadout
+   * can afford, because it carries two bombs and only one pass is scored.
+   */
+  let aim = null;
+  let best = 1e9;
+  let sightSeen = false;
+  let released = false;
+  let passDisturbed = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      console.log(`  ..  bomb run discarded (${passDisturbed}) — re-flying`);
+      passDisturbed = '';
+      best = 1e9;
+      released = false;
+      await page.evaluate((tgt) => window.__game.bus.emit('debug:place', {
+        x: tgt.x0, y: tgt.y0, z: tgt.z0, heading: tgt.heading,
+        pitch: Math.atan2(330, 900), bank: 0, speed: 150, opponent: null,
+      }), setup);
+      await sleep(1200);
+      armed = await page.evaluate(ORD);
+      if (!armed || armed.bombs < 1) break;
+    }
+    const runId = await page.evaluate(() => window.__game.localEntityId);
+    const runDmg = await page.evaluate(() => {
+      const e = window.__game.entities.get(window.__game.localEntityId);
+      return e ? e.damage : 0;
     });
-    return { across };
-  }, setup);
+    // One lateral correction, taken from the game's own impact solution: shift
+    // the whole run-in sideways so the ground track passes over the target. This
+    // is the harness standing in for the fifteen seconds of gentle S-turning a
+    // pilot does on the way in, and it is the only part of the pass that is not
+    // flown — the approach, the release and everything after it are real.
+    aim = await page.evaluate((tgt) => {
+      const g = window.__game;
+      const o = g.get('flight').ordnanceState;
+      if (!o.solution) return null;
+      // Across-track unit vector, horizontal and perpendicular to the run-in.
+      const ax = Math.cos(tgt.heading), az = -Math.sin(tgt.heading);
+      const across = (tgt.x - o.solution.x) * ax + (tgt.z - o.solution.z) * az;
+      g.bus.emit('debug:place', {
+        x: tgt.x0 + ax * across, y: tgt.y0, z: tgt.z0 + az * across,
+        heading: tgt.heading, pitch: Math.atan2(330, 900), bank: 0, speed: 150,
+        opponent: null,
+      });
+      return { across };
+    }, setup);
+    await sleep(500);
+
+    // --- fly the pass and pickle ---------------------------------------------
+    // The pipper sits a fixed distance ahead of the aeroplane and the target
+    // walks back through it. Release on the crossing.
+    let shotTaken = false;
+    let prevAlong = Infinity;
+    for (let i = 0; i < 160 && !released; i++) {
+      const now = await page.evaluate(() => {
+        const g = window.__game;
+        const e = g.entities.get(g.localEntityId);
+        return { id: g.localEntityId, damage: e ? e.damage : 0 };
+      });
+      if (now.id !== runId) passDisturbed = passDisturbed || 'shot down mid-run';
+      else if (now.damage !== runDmg) passDisturbed = passDisturbed || 'hit mid-run';
+      const s = await page.evaluate((tgt) => {
+        const g = window.__game;
+        const o = g?.get?.('flight')?.ordnanceState;
+        const node = document.getElementById('ct-bombsight');
+        const shown = !!node && getComputedStyle(node).display !== 'none';
+        if (!o || !o.solution) return { shown, d: null };
+        const ex = tgt.x - o.solution.x, ez = tgt.z - o.solution.z;
+        return {
+          shown,
+          d: Math.hypot(ex, ez),
+          // Positive while the target is still beyond the pipper.
+          along: ex * Math.sin(tgt.heading) + ez * Math.cos(tgt.heading),
+        };
+      }, setup);
+      sightSeen = sightSeen || s.shown;
+      if (s.d !== null) {
+        if (s.d < 220 && !shotTaken) {
+          shotTaken = true;
+          await page.screenshot({ path: `${tag}-09-bombrun.png` });
+        }
+        best = Math.min(best, s.d);
+        if (prevAlong > 0 && s.along <= 0) {
+          await page.keyboard.press('KeyV');
+          released = true;
+        }
+        prevAlong = s.along;
+      }
+      // 20 ms, not 40: the pipper crossing is detected on a poll, and at 150 m/s
+      // every 20 ms of latency in noticing it is 3 m of along-track release
+      // error. Online that error stacks on top of the input round trip.
+      await sleep(20);
+    }
+    if (!passDisturbed || attempt > 0) break;
+  }
   check('the bombsight produces a usable solution on the run-in', !!aim,
     aim ? `across-track correction ${aim.across.toFixed(0)} m` : 'no solution');
-  await sleep(500);
-
-  // --- fly the pass and pickle ---------------------------------------------
-  // The pipper sits a fixed distance ahead of the aeroplane and the target
-  // walks back through it. Release on the crossing.
-  let best = 1e9;
-  let released = false;
-  let sightSeen = false;
-  let shotTaken = false;
-  let prevAlong = Infinity;
-  for (let i = 0; i < 160 && !released; i++) {
-    const s = await page.evaluate((tgt) => {
-      const g = window.__game;
-      const o = g?.get?.('flight')?.ordnanceState;
-      const node = document.getElementById('ct-bombsight');
-      const shown = !!node && getComputedStyle(node).display !== 'none';
-      if (!o || !o.solution) return { shown, d: null };
-      const ex = tgt.x - o.solution.x, ez = tgt.z - o.solution.z;
-      return {
-        shown,
-        d: Math.hypot(ex, ez),
-        // Positive while the target is still beyond the pipper.
-        along: ex * Math.sin(tgt.heading) + ez * Math.cos(tgt.heading),
-      };
-    }, setup);
-    sightSeen = sightSeen || s.shown;
-    if (s.d !== null) {
-      if (s.d < 220 && !shotTaken) {
-        shotTaken = true;
-        await page.screenshot({ path: `${tag}-09-bombrun.png` });
-      }
-      best = Math.min(best, s.d);
-      if (prevAlong > 0 && s.along <= 0) {
-        await page.keyboard.press('KeyV');
-        released = true;
-      }
-      prevAlong = s.along;
-    }
-    // 20 ms, not 40: the pipper crossing is detected on a poll, and at 150 m/s
-    // every 20 ms of latency in noticing it is 3 m of along-track release
-    // error. Online that error stacks on top of the input round trip.
-    await sleep(20);
-  }
   check('the bombsight is flown onto the target', best < 20,
-    `closest predicted impact ${best.toFixed(0)} m from the target`);
+    `closest predicted impact ${best.toFixed(0)} m from the target`
+    + (passDisturbed ? ` [DISTURBED: ${passDisturbed}]` : ''));
   check('the impact indicator is drawn on the way in', sightSeen,
     sightSeen ? 'pipper visible during the run' : 'pipper never shown');
   // Pull off the target rather than following the bomb into the ground.

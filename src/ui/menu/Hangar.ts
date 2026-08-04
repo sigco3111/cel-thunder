@@ -1,6 +1,6 @@
 import { el, setText, setClass, setStyle, clamp, fixed, int } from '../dom';
 import {
-  AIRCRAFT, AIRCRAFT_BY_ID, CLEAN_LOADOUT, loadoutMass, loadoutsFor,
+  AIRCRAFT, AIRCRAFT_BY_ID, CLEAN_LOADOUT, loadoutMass, loadoutsFor, nationTeam,
   type AircraftSpec, type Loadout, type Nation,
 } from '../../shared/aircraft';
 import { NATION_LABEL, ROLE_LABEL } from '../theme';
@@ -10,6 +10,14 @@ import { performanceOf, statFraction } from './perf';
 
 const NATIONS: (Nation | 'all')[] = ['all', 'britain', 'usa', 'ussr', 'germany', 'japan'];
 const CLEAN = CLEAN_LOADOUT;
+
+/** Aircraft a side may actually field. Never empty. */
+export function airframesForTeam(team: number): AircraftSpec[] {
+  const list = AIRCRAFT.filter((a) => nationTeam(a.nation) === team);
+  return list.length ? list : AIRCRAFT.slice(0, 1);
+}
+
+const TEAM_NAME = ['ALLIED', 'AXIS'];
 
 interface StatRow {
   key: string;
@@ -35,6 +43,19 @@ export class Hangar {
   private filter: Nation | 'all' = 'all';
   private selected: AircraftSpec = AIRCRAFT[0];
   private livery = 0;
+  /**
+   * The side this player flies for. The roster is restricted to it.
+   *
+   * The hangar used to offer all five airframes to everyone, and the server
+   * quietly substituted a valid one when the choice did not match the side it
+   * had put you on — so a pilot could select a P-51D, be given a Bf 109, and
+   * spend the sortie unable to work out why the Messerschmitts were friendly.
+   * A choice that the authority silently overrules is not a choice; the fix is
+   * to only ever offer what can actually be flown, and to say which side that
+   * is.
+   */
+  private team = 0;
+  private sideEl: HTMLElement;
 
   private nameEl: HTMLElement;
   private subEl: HTMLElement;
@@ -76,6 +97,11 @@ export class Hangar {
     const lh = el('div', 'ct-head', left);
     el('span', '', lh, 'Roster');
     el('span', 'ct-head-rule', lh);
+    // Which side the player is on, stated where the aircraft are chosen. A
+    // pilot who does not know whether they are Allied or Axis cannot read a
+    // marker colour, and this is the only screen that can tell them before
+    // they are in the air.
+    this.sideEl = el('span', 'ct-head-aux ct-side', lh, '—');
     const nations = el('div', 'ct-nations', left);
     for (const n of NATIONS) {
       const b = el('button', 'ct-nation', nations);
@@ -166,16 +192,46 @@ export class Hangar {
     this.deployBtn = el('button', 'ct-btn is-primary', deploy, 'Deploy') as HTMLButtonElement;
     this.deployBtn.onclick = () => this.onDeploy(this.selected, this.livery, this.loadout.id);
 
-    this.buildList();
-    this.setFilter('all');
+    // Seeds the roster; 'setTeam' is called again for real as soon as the
+    // server (or the sandbox) says which side this pilot is on.
+    this.team = -1;
+    this.setTeam(0);
   }
 
   // -------------------------------------------------------------------------
 
+  /**
+   * Puts the player on a side and rebuilds the roster around it.
+   *
+   * Idempotent and safe to call every time the hangar is shown — the team can
+   * change between sorties (a rebalance, a reconnect onto the other side), and
+   * a hangar still offering the old side's aircraft is exactly the state this
+   * whole mechanism exists to prevent.
+   */
+  setTeam(team: number): void {
+    const t = team === 1 ? 1 : 0;
+    if (t === this.team && this.rows.length) return;
+    this.team = t;
+    setText(this.sideEl, `${TEAM_NAME[t]} FORCES`);
+    // A nation tab for a side you are not on filters the list down to nothing.
+    for (const [n, b] of this.nationBtns) {
+      setStyle(b, 'display',
+        n === 'all' || nationTeam(n as Nation) === t ? '' : 'none');
+    }
+    this.buildList();
+    // Whatever was selected may belong to the other side now.
+    const allowed = airframesForTeam(t);
+    if (!allowed.includes(this.selected)) this.selected = allowed[0];
+    this.setFilter(allowed.some((a) => a.nation === this.filter) ? this.filter : 'all');
+  }
+
+  /** The side the player is flying for, as the hangar understands it. */
+  get currentTeam(): number { return this.team; }
+
   private buildList(): void {
     while (this.list.firstChild) this.list.removeChild(this.list.firstChild);
     this.rows = [];
-    for (const spec of AIRCRAFT) {
+    for (const spec of airframesForTeam(this.team)) {
       const node = el('button', 'ct-plane', this.list);
       const col = el('div', '', node);
       el('div', 'nm', col, spec.name);
@@ -359,7 +415,10 @@ export class Hangar {
 
   selectById(id: string): void {
     const s = AIRCRAFT_BY_ID[id];
-    if (s) this.select(s);
+    // An id from the other side cannot be honoured — it is not in the list and
+    // the server would substitute it anyway. Ignoring it leaves the hangar
+    // showing something the player can actually take off in.
+    if (s && nationTeam(s.nation) === this.team) this.select(s);
   }
 
   get current(): AircraftSpec { return this.selected; }

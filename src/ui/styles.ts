@@ -200,6 +200,13 @@ export const UI_CSS = /* css */ `
 }
 .ct-head > .ct-head-rule { flex: 1; height: 1px; background: var(--line); }
 .ct-head > .ct-head-aux { color: rgba(220, 236, 251, .40); letter-spacing: .12em; }
+/* The side the player flies for, in the hangar.
+ *
+ * Always the *ally* colour, whichever side that is, because that is exactly
+ * what it is telling them: this is your side, and this is the colour your side
+ * will be drawn in once you are airborne. Painting the Axis label red would
+ * teach the opposite of the thing the marker layer is about to rely on. */
+.ct-head > .ct-side { color: var(--ally); opacity: .9; }
 
 .ct-title {
   font-family: var(--font-cond); font-size: var(--f-lg);
@@ -935,6 +942,22 @@ export const UI_CSS = /* css */ `
 .ct-mk-box i:nth-child(2) { right: 0; top: 0; border-left: 0; border-bottom: 0; }
 .ct-mk-box i:nth-child(3) { right: 0; bottom: 0; border-left: 0; border-top: 0; }
 .ct-mk-box i:nth-child(4) { left: 0; bottom: 0; border-right: 0; border-top: 0; }
+/* A ground contact is not an aeroplane and must not read as one.
+ *
+ * Colour alone cannot carry that: the four-corner air bracket around a flak
+ * pit next to the airfield is the same glyph the game uses for a fighter, so
+ * a row of emplacements reads as a row of contacts. Ground gets a smaller,
+ * dashed, half-opacity diamond — same team colour, unmistakably a different
+ * class of thing. */
+.ct-mk.is-ground .ct-mk-box {
+  width: calc(var(--px) * 26); height: calc(var(--px) * 26);
+  transform: translate(-50%, -50%) rotate(45deg);
+  opacity: .72;
+}
+.ct-mk.is-ground .ct-mk-box i {
+  width: calc(var(--px) * 7); height: calc(var(--px) * 7);
+  border-width: calc(var(--px) * 1.2);
+}
 /* The block sits on its own plate.
  *
  * A text halo is not contrast control — it is a fixed dark spread that a bright

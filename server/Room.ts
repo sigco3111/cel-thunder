@@ -213,14 +213,27 @@ const GUN_ROUND_LIFE = 1.8;
  * Ceilings on live rounds, so a mass engagement cannot flood the wire.
  *
  * Two of them, and the split matters: a single global cap means a furball
- * between eight AI and a couple of flak batteries can silently take a human
+ * between the AI and a couple of flak batteries can silently take a human
  * player's guns away — they pull the trigger, the server refuses the round,
  * and nothing at all happens. AI and AA therefore stop firing well below the
  * hard limit, which permanently reserves headroom for whoever is actually
  * holding a mouse.
+ *
+ * Both scale with the roster, because a fixed cap is a *fraction* of the
+ * demand and the demand is per-shooter. 360/200 was sized for eight
+ * combatants; leaving it there while putting twenty in the air would have cut
+ * the AI's share of it by two and a half times, and an AI whose rounds are
+ * being refused mid-burst does not convert its gun passes — which is the
+ * regression this file's own history is about. Forty-five live rounds per
+ * combatant reproduces the old ratio exactly at eight, and the floor keeps a
+ * one-versus-one sandbox from being tighter than the old constant was.
  */
-const MAX_PROJECTILES = 360;
-const AI_PROJECTILE_BUDGET = 200;
+const projectileCaps = (combatants: number): { hard: number; ai: number } => {
+  const hard = Math.max(360, Math.min(1000, Math.round(combatants * 45)));
+  // The same 5:9 split the fixed pair had, so a human always has headroom the
+  // AI and the flak cannot reach.
+  return { hard, ai: Math.round(hard * 0.5556) };
+};
 
 /**
  * Harmonisation range, metres.
@@ -266,6 +279,9 @@ export class Room {
 
   // --- match state ---------------------------------------------------------
   readonly config: MatchConfig;
+  /** Live-round ceilings, sized from the roster. See 'projectileCaps'. */
+  private maxProjectiles = 360;
+  private aiProjectiles = 200;
   private phase: MatchPhase = 'active';
   private matchStart = 0;
   private endedAt = 0;
@@ -354,6 +370,9 @@ export class Room {
     this.units = opts.units ?? null;
     this.pilotEnv = asPilotEnv(env);
     this.ticketsA = this.ticketsB = this.config.tickets;
+    const caps = projectileCaps(this.config.rosterPerTeam * 2);
+    this.maxProjectiles = caps.hard;
+    this.aiProjectiles = caps.ai;
 
     // Seeded from the map, not the clock: two servers on the same map running
     // the same inputs must reach the same verdict about every ricochet.
@@ -514,8 +533,8 @@ export class Room {
     // without anyone having to navigate.
     const heading = Math.atan2(foe.x - base.x, foe.z - base.z);
     const slot = this.spawnSlot[c.team]++;
-    const lateral = ((slot % 6) - 2.5) * 90;
-    const back = Math.floor((slot % 24) / 6) * 220;
+    const separation = Math.hypot(foe.x - base.x, foe.z - base.z);
+
     /**
      * AI enters on a standing patrol part-way to the front, higher than a
      * player does. Two flights launched 33 km apart spend the first two
@@ -524,14 +543,77 @@ export class Room {
      * one a late-joining player can find. Humans still start over their own
      * runway, because that is where the hangar, the field and the way home
      * are.
+     *
+     * ## Why the AI is broken into flights
+     *
+     * Ten aeroplanes a side put into one 450 m box is not "more action", it is
+     * one furball with a queue: the pilots spend the round in each other's
+     * way, half the roster never gets a shot, and the rest of the map is as
+     * empty as it was with four. So the side's slots are dealt into flights,
+     * and each flight gets its own lane across the frontage, its own altitude
+     * block and its own push toward the enemy. Two or three separate
+     * engagements run at once, and a pilot who breaks off one of them falls
+     * into another instead of into a ten-minute transit.
+     *
+     * The lane and the push key off the *slot*, which keeps counting across
+     * respawns, so replacements are dealt into the next lane rather than
+     * piling back into the one that just emptied.
+     *
+     * The flight index is taken **modulo the number of flights this roster
+     * actually fields**, and that wrap is load-bearing rather than defensive.
+     * Without it 'slot' keeps growing all match, so the third replacement
+     * aeroplane is dealt into a fourth flight that does not exist, at a lane
+     * and a push nobody is opposing — and at four a side, where there is only
+     * ever one flight, every respawn after the first four was launched on a
+     * different push from the flight it was rejoining. Measured over four
+     * simulated minutes of 4v4 that took the AI from 47 % of its rounds on
+     * target and five kills to 4 % and two: the pilots were fine, they were
+     * just never in the same piece of sky again after their first death.
      */
-    const separation = Math.hypot(foe.x - base.x, foe.z - base.z);
-    const forward = c.isBot ? separation * BOT_PUSH : 0;
+    const flights = Math.max(1, Math.ceil(this.config.rosterPerTeam / FLIGHT_SIZE));
+    const flightIdx = Math.floor(slot / FLIGHT_SIZE) % flights;
+    /** Position within the flight. Drives the formation, never the lane. */
+    const wing = slot % FLIGHT_SIZE;
+    // Lanes across the frontage, one per flight, centred on the line between
+    // the two fields. Centring on a fixed lane count instead would put every
+    // flight on the same side of the axis whenever the roster fields fewer
+    // flights than there are lanes, and add kilometres of pointless offset to
+    // a merge that is supposed to be head-on.
+    const laneOffset = c.isBot ? (flightIdx - (flights - 1) / 2) * BOT_LANE_SPACING : 0;
+    // Vertical block, so two flights that would otherwise meet co-altitude —
+    // merge head-on, pass, and have nothing left to fight with — arrive with a
+    // height difference one of them can trade.
+    const stackOffset = c.isBot ? flightIdx * FLIGHT_STACK : 0;
+    // One flight in three is a deep sweep. That is what puts a fight over the
+    // player's own airfield inside the first half-minute of a sortie.
+    const push = c.isBot ? BOT_PUSH[flightIdx % BOT_PUSH.length] : 0;
+
+    /*
+     * Placement *within* a flight is the formation this file already had,
+     * unchanged: a line abreast at 90 m, stepped back 220 m each time the line
+     * fills and up 60 m per position. It is not arbitrary — it is the geometry
+     * the AI's measured lethality was tuned against, and substituting a
+     * tidier-looking tight spacing for it cost half the hit rate at four a
+     * side across five seeds (16.6 % and 17 gun kills down to 7.3 % and 11).
+     *
+     * It is indexed by 'wing' rather than by the raw slot, which is why
+     * 'FLIGHT_SIZE' is six and not four: the formation is six wide, and dealing
+     * six-wide positions into four-aircraft flights tore every second flight in
+     * half — its members came out in two clumps 450 m apart with two other
+     * flights' worth of sky between them. Six-wide flights of a six-wide
+     * formation are contiguous by construction, and a roster small enough to
+     * field one flight collapses 'laneOffset', 'stackOffset' and 'push' to the
+     * previous constants, leaving the spawn identical to what it always was.
+     */
+    const lateral = laneOffset + (wing - (FLIGHT_SIZE - 1) / 2) * 90;
+    const back = (Math.floor(slot / FLIGHT_SIZE) % 4) * 220;
+    const forward = separation * push;
     // Offset across the flight path, i.e. 90° from the heading.
     const px = base.x + Math.sin(heading) * (forward - back) + Math.cos(heading) * lateral;
     const pz = base.z + Math.cos(heading) * (forward - back) - Math.sin(heading) * lateral;
     const agl = c.isBot ? BOT_SPAWN_AGL : SPAWN_AGL;
-    const alt = Math.max(this.env.terrainHeight(px, pz), base.elevation) + agl + (slot % 6) * 60;
+    const alt = Math.max(this.env.terrainHeight(px, pz), base.elevation)
+      + agl + stackOffset + wing * 60;
     const speed = cruiseSpeed(chosen);
 
     const flight = createFlightState(chosen, v3(px, alt, pz), q());
@@ -1017,7 +1099,7 @@ export class Room {
     const rewind = shooter
       ? clamp(shooter.rttMs * 0.0005 + CLIENT_INTERP_DELAY, 0, LAGCOMP_HISTORY)
       : 0;
-    const budget = shooter ? MAX_PROJECTILES : AI_PROJECTILE_BUDGET;
+    const budget = shooter ? this.maxProjectiles : this.aiProjectiles;
 
     for (let gi = 0; gi < spec.guns.length; gi++) {
       const gun = spec.guns[gi];
@@ -1265,7 +1347,7 @@ export class Room {
       // the room's list, which releases it into the room's pool when it dies.
       // Both pools are free-lists of the same plain object, so the transfer is
       // free and it keeps flak on the one integrator everything else uses.
-      if (this.rounds.length < AI_PROJECTILE_BUDGET) {
+      if (this.rounds.length < this.aiProjectiles) {
         this.adoptRound(r, EntityKind.Projectile, Math.min(15, Math.round(r.calibre)));
         const sp = Math.hypot(r.v.x, r.v.y, r.v.z) || 1;
         this.pushEvent(EventKind.Gunfire, r.p.x, r.p.y, r.p.z,
@@ -1956,16 +2038,61 @@ const SPAWN_AGL = 1800;
 /** AI enters higher: altitude is the only energy a patrol has to spend. */
 const BOT_SPAWN_AGL = 2900;
 /**
- * Fraction of the way to the enemy field that an AI flight starts from.
+ * Fraction of the way to the enemy field that an AI flight starts from, by
+ * flight index.
  *
- * 0.42 puts the two flights about 5 km apart on a converging heading, inside
- * the pilot's 7 km acquisition radius, so a merge happens within twenty seconds
- * of every spawn instead of after a two-minute transit. Measured over six
- * minutes of 4v4, moving it out from 0.30 took the AI from 329 to 1845 ticks
- * with the trigger down — the single largest reason a match of bots produced no
- * kills was that they were rarely in the same piece of sky.
+ * 0.42 puts two opposing flights about 5 km apart on a converging heading,
+ * inside the pilot's 7 km acquisition radius, so a merge happens within twenty
+ * seconds of every spawn instead of after a two-minute transit. Measured over
+ * six minutes of 4v4, moving it out from 0.30 took the AI from 329 to 1845
+ * ticks with the trigger down — the single largest reason a match of bots
+ * produced no kills was that they were rarely in the same piece of sky.
+ *
+ * It is deliberately **first**. The order is not cosmetic: a roster small
+ * enough to field one flight a side gets index 0 and nothing else, so it must
+ * be the entry that guarantees a merge. Putting the sweep first cost exactly
+ * that — at four a side both flights entered deep over the *other* side's
+ * field, ended up 24 km apart with the whole map between them, and four
+ * minutes of simulated match produced 432 rounds, two hits and one kill.
+ *
+ * The 0.80 entry is the addition. It is a *sweep*: a flight that enters deep
+ * over the other side's half, about 6.5 km off their field on a 33 km map. It
+ * exists for the human, not for the AI — a player taking off from their own
+ * runway had a 14 km transit before there was anything to shoot at, which is a
+ * minute and a half of holding a heading. Measured from a fresh match with a
+ * player sitting over their own field: the nearest enemy went from never
+ * closing inside 6.5 km in ninety seconds to first contact at 16.8 s and gun
+ * range by forty.
+ *
+ * The depth is a *tuned* number and both directions cost something real.
+ * Deeper is better for the human and worse for the match, because a swept
+ * flight spends its sortie in transit and in the flak instead of in the merge:
+ * over five seeds of four-minute 10v10, 0.86 gave 14 gun kills, 0.80 gave 20
+ * and no sweep at all gave 23. Shallower stops solving the problem it exists
+ * for. 0.80 keeps essentially all of the AI's lethality (20 kills against the
+ * 17 the same measurement gives an unmodified 4v4) and still hands the player
+ * a fight before the gear is up. It also stays outside the light and medium
+ * flak rings, which sit 2-3 km from a field — a sweep that spawned inside
+ * those would be shot down before it found anybody.
+ *
+ * 0.24 is the reserve — high and back, with energy to spend on whatever is
+ * left of the first two merges. It only appears from three flights a side up.
  */
-const BOT_PUSH = 0.42;
+const BOT_PUSH = [0.42, 0.80, 0.24] as const;
+
+/**
+ * Aeroplanes per AI flight.
+ *
+ * Six, because the line-abreast formation below is six wide. The two numbers
+ * have to be the same one: deal a six-wide formation into four-ship flights
+ * and every second flight comes out split into two clumps with another
+ * flight's lane between them.
+ */
+const FLIGHT_SIZE = 6;
+/** Metres between lane centres. Three lanes at this spacing is 5 km of front. */
+const BOT_LANE_SPACING = 2500;
+/** Metres of altitude between one flight's block and the next. */
+const FLIGHT_STACK = 900;
 
 const EMPLACEMENT_NAME: Record<number, string> = {
   0: '20 mm flak pit', 1: '40 mm flak pit', 2: '88 mm flak battery',

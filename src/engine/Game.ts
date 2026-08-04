@@ -83,7 +83,19 @@ export class Game implements GameContext {
   readonly entities = new Map<number, EntityState>();
   localEntityId = 0;
   localPlayerId = 0;
-  localTeam = 0;
+  assignedTeam = 0;
+
+  /**
+   * The side the player is flying for, read off their own aeroplane.
+   *
+   * See 'GameContext.localTeam'. The getter is the whole fix: there is no
+   * setter, so no subsystem can leave this disagreeing with the entity table
+   * the markers, the minimap and the killfeed are all reading from.
+   */
+  get localTeam(): number {
+    const me = this.localEntityId ? this.entities.get(this.localEntityId) : undefined;
+    return me ? me.team : this.assignedTeam;
+  }
 
   readonly bus = new EventBus();
   quality: QualityTier = 'high';

@@ -37,7 +37,28 @@ export interface GameContext {
   localEntityId: number;
   /** Local player id assigned by the server. */
   localPlayerId: number;
-  localTeam: number;
+  /**
+   * The side the server put this player on, as stated in 'welcome'.
+   *
+   * This is the *roster* fact, and it is only ever used while the player has
+   * no aeroplane. Never compare a contact against it — see 'localTeam'.
+   */
+  assignedTeam: number;
+  /**
+   * The side the player is actually flying for, **derived from their own
+   * replicated aircraft**.
+   *
+   * Deliberately read-only and deliberately derived. Friend-or-foe used to be
+   * decided against a separately tracked field written once from 'welcome',
+   * which meant every ally/enemy colour in the game depended on two facts
+   * agreeing that nothing kept in step: a rebalance, a substituted airframe or
+   * a respawn onto the other side would leave the HUD painting enemies as
+   * friends. Taking the team off the local entity makes the comparison
+   * 'contact.team === myEntity.team' between two records out of the *same*
+   * snapshot, so they cannot disagree. Falls back to 'assignedTeam' only while
+   * spectating, when there is no aeroplane to read.
+   */
+  readonly localTeam: number;
 
   /** Registry so subsystems can find each other by name when they must. */
   get<T extends Subsystem>(name: string): T | undefined;

@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { el, setText, setStyle, setClass, clamp, distStr } from '../dom';
 // setClass drives both the ally/enemy/lock colouring and the label offset.
-import { EntityKind, type EntityState } from '../../shared/protocol';
+import { DamageBits, EntityKind, type EntityState } from '../../shared/protocol';
+import { groundLabel } from '../../shared/ground';
 
 export interface TargetInfo {
   id: number;
@@ -22,9 +23,42 @@ interface Marker {
   sub: HTMLElement;
   edge: HTMLElement;
   used: boolean;
+  /**
+   * Entity currently occupying this slot, mirrored onto the element as
+   * 'data-eid'.
+   *
+   * It is here so that "the thing this bracket is drawn around" is a *fact a
+   * test can read* rather than something a harness has to re-derive by
+   * reimplementing the ordering below — which it will get wrong, and which
+   * will then quietly stop testing anything. The regression this guards is
+   * worth the one attribute write per contact per change: 158 checks passed on
+   * a build that painted every enemy as a friend, because nothing anywhere
+   * compared a rendered marker against the entity it belonged to.
+   */
+  eid: number;
 }
 
 const MAX_MARKERS = 28;
+/**
+ * Sort penalty applied to ground contacts, in metres.
+ *
+ * The contact list is a fixed 28 slots filled nearest-first, and the map has 76
+ * ground targets on it — a rail yard alone is a dozen goods wagons standing
+ * within ten metres of each other. Sorting purely by range therefore handed
+ * every slot to rolling stock the moment the player flew within sight of a
+ * marshalling yard, and the aeroplanes trying to kill him went unmarked. The
+ * bias is larger than the marker range, so every aircraft is ordered ahead of
+ * every ground target and ground can only ever occupy slots the air contacts
+ * did not want.
+ */
+const GROUND_BIAS = 1e6;
+/** Ground contacts are only useful inside strike range. */
+const GROUND_RANGE = 9000;
+/**
+ * Ground contacts allowed on screen at once. Enough to read a defended field
+ * or a convoy; not enough to turn a rail yard into a wall of brackets.
+ */
+const MAX_GROUND_MARKERS = 8;
 /**
  * Radius, in design px, of the keep-out disc around the gunsight.
  *
@@ -103,6 +137,8 @@ export class Markers {
      findIndex at the end — every frame, for up to MAX_MARKERS contacts. */
   private readonly orderE: EntityState[] = [];
   private readonly orderD: number[] = [];
+  /* Sort key, which is NOT the distance — see GROUND_BIAS. */
+  private readonly orderK: number[] = [];
   private orderN = 0;
   /* Anchors of the ID blocks already placed this frame, for the declutter pass.
      Preallocated: this runs every frame over every visible contact. */
@@ -116,6 +152,7 @@ export class Markers {
   private protN = 0;
 
   nameOf: (ownerId: number) => string = () => '';
+  /** Aircraft archetype name. Only ever called for Aircraft contacts. */
   labelOf: (typeId: number) => string = () => '';
 
   constructor(parent: HTMLElement) {
@@ -135,7 +172,7 @@ export class Markers {
       const name = el('span', '', lbl);
       const sub = el('b', '', lbl);
       root.style.display = 'none';
-      this.pool.push({ root, box, arrow, lbl, name, sub, edge, used: false });
+      this.pool.push({ root, box, arrow, lbl, name, sub, edge, used: false, eid: 0 });
     }
   }
 
@@ -173,6 +210,11 @@ export class Markers {
     camera: THREE.PerspectiveCamera,
     entities: Map<number, EntityState>,
     localId: number,
+    /**
+     * The side the player is flying for, taken from their own replicated
+     * aircraft (see GameContext.localTeam) so it is guaranteed to be the same
+     * fact, from the same snapshot, as the 'e.team' it is compared against.
+     */
     localTeam: number,
     localPos: THREE.Vector3,
     enabled: boolean,
@@ -187,22 +229,41 @@ export class Markers {
     this.lblN = 0;
     for (const e of entities.values()) {
       if (e.id === localId) continue;
-      if (e.kind !== EntityKind.Aircraft && e.kind !== EntityKind.GroundUnit) continue;
+      const isGround = e.kind === EntityKind.GroundUnit;
+      if (e.kind !== EntityKind.Aircraft && !isGround) continue;
+      // A wreck is not a contact. Leaving destroyed aircraft in the list keeps
+      // a bracket and an ID block on a burning airframe all the way to the
+      // ground, and — because a dead contact is still on a team — it keeps
+      // competing with live ones for the primary-target slot.
+      if (e.damage & DamageBits.Destroyed) continue;
       const d = Math.hypot(e.px - localPos.x, e.py - localPos.y, e.pz - localPos.z);
-      if (d > 14000) continue;
-      // Nearest-first insertion into a bounded list. Anything further than the
-      // current worst of a full list cannot make the cut, so it is dropped
-      // without moving anything.
-      if (this.orderN >= MAX_MARKERS && d >= this.orderD[MAX_MARKERS - 1]) continue;
+      if (d > (isGround ? GROUND_RANGE : 14000)) continue;
+      // Nearest-first insertion into a bounded list, aircraft ahead of ground.
+      // Anything sorting worse than the current worst of a full list cannot
+      // make the cut, so it is dropped without moving anything.
+      const key = isGround ? d + GROUND_BIAS : d;
+      if (this.orderN >= MAX_MARKERS && key >= this.orderK[MAX_MARKERS - 1]) continue;
       let i = Math.min(this.orderN, MAX_MARKERS - 1);
-      while (i > 0 && this.orderD[i - 1] > d) {
+      while (i > 0 && this.orderK[i - 1] > key) {
+        this.orderK[i] = this.orderK[i - 1];
         this.orderD[i] = this.orderD[i - 1];
         this.orderE[i] = this.orderE[i - 1];
         i--;
       }
+      this.orderK[i] = key;
       this.orderD[i] = d;
       this.orderE[i] = e;
       if (this.orderN < MAX_MARKERS) this.orderN++;
+    }
+
+    // Trim the ground tail. The bias above already sorted every aircraft ahead
+    // of every ground target, so the ground entries are exactly the tail of the
+    // list and the nearest of them come first — which is what makes this a
+    // truncation rather than an arbitrary pick.
+    for (let i = 0; i < this.orderN; i++) {
+      if (this.orderK[i] < GROUND_BIAS) continue;
+      this.orderN = Math.min(this.orderN, i + MAX_GROUND_MARKERS);
+      break;
     }
 
     camera.getWorldDirection(_fwd);
@@ -215,6 +276,9 @@ export class Markers {
       const d = this.orderD[i];
       const m = this.pool[i];
       m.used = true;
+      // Only on change: this is a DOM write, and a contact holds its slot for
+      // many frames at a time.
+      if (m.eid !== e.id) { m.eid = e.id; m.root.dataset.eid = String(e.id); }
 
       _p.set(e.px, e.py, e.pz);
       _v.copy(_p).sub(camera.position);
@@ -252,7 +316,11 @@ export class Markers {
         px = clamp(px, EDGE_SIDE * this.u, this.w - EDGE_SIDE * this.u);
       }
 
+      // Friend-or-foe, decided against the player's OWN aeroplane. Both sides
+      // of this comparison come out of the same entity table, so there is no
+      // second copy of "my team" that can drift out of step with it.
       const friendly = e.team === localTeam;
+      const ground = e.kind === EntityKind.GroundUnit;
       // Scale: readable at 300 m, small but present at 8 km.
       const s = clamp(1.25 - d / 9000, 0.5, 1.25);
       // Floor raised from 0.22 and the fade pushed out from 4 km. At 0.22 a
@@ -267,6 +335,7 @@ export class Markers {
       setStyle(m.root, 'opacity', a.toFixed(3));
       setClass(m.root, 'is-ally', friendly);
       setClass(m.root, 'is-enemy', !friendly);
+      setClass(m.root, 'is-ground', ground);
       // A contact box is suppressed once the contact is inside the gunsight.
       //
       // Its job is "there is an aeroplane there and you might not have seen
@@ -373,14 +442,26 @@ export class Markers {
 
       setStyle(m.lbl, 'display', clear ? 'block' : 'none');
       if (clear) {
-        setText(m.name, this.nameOf(e.ownerId) || this.labelOf(e.typeId));
+        // A ground contact is named out of the ground table. Running its
+        // typeId through the aircraft table is what put "Bf 109 G-6" and
+        // "Spitfire Mk IX" on the flak pits around the player's own airfield,
+        // in his own team's colour — which is a game with no enemies in it as
+        // far as the player can tell. Ground units also carry no ownerId, so
+        // 'nameOf' must not be consulted for them either.
+        setText(m.name, ground
+          ? groundLabel(e.typeId)
+          : (this.nameOf(e.ownerId) || this.labelOf(e.typeId)));
         setText(m.sub, distStr(d));
         setClass(m.lbl, 'is-offset', side !== 0);
         setClass(m.lbl, 'is-left', side < 0);
         setClass(m.lbl, 'is-up', side !== 0 && ay < py);
       }
 
-      if (!friendly && onScreen && depth > 0) {
+      if (!friendly && !ground && onScreen && depth > 0) {
+        // Primary target is an *aeroplane*: it drives the lead pip and the
+        // bearing caret, both of which are air-to-air gunnery furniture. A
+        // stationary flak pit under the nose used to win this and take the
+        // lead solution off the aircraft that was shooting at you.
         // Primary target: smallest screen offset from the gunsight, weighted so
         // a close contact wins over a distant one on a similar bearing.
         const off = Math.hypot(px - this.w * 0.5, py - this.h * 0.5);

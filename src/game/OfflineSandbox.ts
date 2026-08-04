@@ -28,13 +28,35 @@ import { flightSpecFor } from './loadout';
 
 const FWD: V3 = { x: 0, y: 0, z: 1 };
 
-/** Sandbox roster: a balanced six-ship, one of which is the player. */
+/**
+ * Sandbox roster: a balanced twenty-ship, one of which is the player.
+ *
+ * Ten a side, matching the authoritative server's default so the two paths
+ * present the same match. The list is ordered player-first and then
+ * alternating, because 'start()' deals slots by counting how many of that team
+ * are already placed — an ordering that clumped one side would build its
+ * formation before the other's and stagger the merge.
+ */
 const ROSTER: Array<{ id: string; ai: boolean }> = [
   { id: 'spitfire_mk9', ai: false },
+  { id: 'bf109_g6', ai: true },
   { id: 'p51d', ai: true },
+  { id: 'a6m5', ai: true },
   { id: 'la5fn', ai: true },
   { id: 'bf109_g6', ai: true },
+  { id: 'spitfire_mk9', ai: true },
+  { id: 'a6m5', ai: true },
+  { id: 'p51d', ai: true },
   { id: 'bf109_g6', ai: true },
+  { id: 'la5fn', ai: true },
+  { id: 'a6m5', ai: true },
+  { id: 'spitfire_mk9', ai: true },
+  { id: 'bf109_g6', ai: true },
+  { id: 'p51d', ai: true },
+  { id: 'a6m5', ai: true },
+  { id: 'la5fn', ai: true },
+  { id: 'bf109_g6', ai: true },
+  { id: 'p51d', ai: true },
   { id: 'a6m5', ai: true },
 ];
 
@@ -44,6 +66,16 @@ const ROSTER: Array<{ id: string; ai: boolean }> = [
  * second before the aeroplane did.
  */
 const RESPAWN_DELAY = 5;
+/**
+ * Aeroplanes per flight in the sandbox's own formation.
+ *
+ * Four, not the server's six: the two lay their flights out differently. The
+ * server deals a six-wide line abreast from an airfield and its flight size has
+ * to match that line's width; the sandbox has no airfields and builds its own
+ * lanes around the map centre, where four-ship flights fit ten a side into
+ * three lanes instead of two.
+ */
+const FLIGHT_SIZE = 4;
 /** Trimmed cruise for a spawn, m/s TAS — about 460 km/h. */
 const CRUISE = 128;
 const PROJECTILE_LIFE = 4.0;
@@ -125,13 +157,28 @@ export class OfflineSandbox {
       const spec = AIRCRAFT_BY_ID[entry.id];
       const team = nationTeam(spec.nation);
 
-      // Two loose four-ship-style lines converging head-on, offset laterally
-      // and vertically so the merge immediately produces a real fight.
+      /*
+       * Flights of four, converging head-on along ±X.
+       *
+       * Ten a side in one line abreast is a single furball with a queue: most
+       * of the roster never gets a shot and the rest of the sky is empty. So
+       * each side's slots are dealt into flights, each flight gets its own
+       * lane in Z and its own altitude block, and the flights are staggered in
+       * X so they do not all merge on the same second. Three or four separate
+       * engagements run at once, which is what "more action" actually means.
+       *
+       * The player is slot 0 of team 0 and the enemy's lead flight is directly
+       * opposite at 3 km, closing at about 260 m/s — first contact roughly ten
+       * seconds after the match starts, with no navigation required.
+       */
       const side = team === 0 ? -1 : 1;
       const slot = this.actors.filter((a) => a.team === team).length;
-      const px = cx + side * 1500 + slot * 120 * side;
-      const pz = cz + side * -900 + slot * 260;
-      const py = alt + (team === 0 ? 0 : 260) + slot * 90;
+      const fl = Math.floor(slot / FLIGHT_SIZE);
+      const wing = slot % FLIGHT_SIZE;
+
+      const px = cx + side * (1500 + fl * 700 + wing * 110);
+      const pz = cz + (fl - 1) * 2600 + (wing - 1.5) * 160;
+      const py = alt + (fl % 3) * 700 + wing * 70 + (team === 0 ? 0 : 240);
 
       // Nose the two formations at each other along ±X.
       const heading = team === 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
@@ -142,7 +189,10 @@ export class OfflineSandbox {
     }
 
     this.ctx.localEntityId = this.playerActor.entityId;
-    this.ctx.localTeam = this.playerActor.team;
+    this.ctx.assignedTeam = this.playerActor.team;
+    // Publish immediately. 'ctx.localTeam' reads the player's own entity, and
+    // the first HUD frame can land before the first 'step()'.
+    for (const a of this.actors) this.ctx.entities.set(a.entityId, a.state);
     this.ctx.bus.emit('net:spawned', {
       t: 'spawned', entityId: this.playerActor.entityId, aircraft: this.playerActor.spec.id,
     });
@@ -222,7 +272,12 @@ export class OfflineSandbox {
     }
 
     this.ctx.localEntityId = actor.entityId;
-    this.ctx.localTeam = actor.team;
+    // Offline there is no roster authority, so the side simply follows the
+    // airframe's nation — which keeps aeroplane and team coherent by
+    // construction. The hangar only ever offers this side's aircraft anyway,
+    // so in practice the team does not move.
+    this.ctx.assignedTeam = actor.team;
+    this.ctx.entities.set(actor.entityId, actor.state);
     this.ctx.bus.emit('net:spawned', {
       t: 'spawned', entityId: actor.entityId, aircraft: actor.spec.id,
     });
@@ -677,8 +732,12 @@ export class OfflineSandbox {
       // enough that dying costs you a fight rather than a coffee break.
       const side = a.team === 0 ? -1 : 1;
       const px = side * (1900 + Math.random() * 800);
-      const pz = (Math.random() - 0.5) * 2200;
-      const py = 2300 + Math.random() * 700;
+      // Widened with the roster. At ±1100 m, twenty aeroplanes coming back
+      // into a 2.2 km band re-formed the single furball the flight lanes above
+      // exist to break up; ±3.5 km puts a replacement back into whichever
+      // fight is nearest rather than into the middle of all of them.
+      const pz = (Math.random() - 0.5) * 7000;
+      const py = 2300 + Math.random() * 1400;
       const heading = a.team === 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
 
       const fresh = this.spawnActor(a.spec, a.team, a.ai !== null, px, py, pz, heading, CRUISE + 12);

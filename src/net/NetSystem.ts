@@ -244,7 +244,9 @@ export class NetSystem implements Subsystem {
         this.mapName = msg.mapName;
         this.players = msg.players ?? [];
         this.ctx.localPlayerId = msg.playerId;
-        this.ctx.localTeam = msg.team;
+        // The roster fact only. What the HUD colours against is the team on
+        // the player's own replicated aircraft — see GameContext.localTeam.
+        this.ctx.assignedTeam = msg.team;
         this.ctx.mapSeed = msg.mapSeed;
         // Before 'net:welcome': every consumer of that event is entitled to see
         // the match sky already in force, and the sky/flight subsystems have not
