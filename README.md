@@ -7,6 +7,13 @@ There are no binary art assets in this repository.
 
 The whole thing was built from a single prompt — see [ORIGIN.md](ORIGIN.md).
 
+**Play it: <https://cel-thunder.vercel.app>**
+
+The hosted build is the offline sandbox — you fly against AI. Vercel serves
+static files only and cannot host the authoritative WebSocket server, so
+realtime multiplayer needs `npm run dev` locally, or the server deployed
+somewhere that keeps a socket open.
+
 ## Running it
 
 ```bash

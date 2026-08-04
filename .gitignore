@@ -9,3 +9,4 @@ tools/_scratch/
 
 # stray agent scratch files
 .onlineprobe.mjs
+.vercel
