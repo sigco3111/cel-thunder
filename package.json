@@ -1,7 +1,11 @@
 {
   "name": "cel-thunder",
   "version": "1.0.0",
-  "description": "",
+  "description": "Cel-shaded WWII air combat in the browser: Three.js client, authoritative Node server, realtime multiplayer, all assets procedural.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PauliusOS/cel-thunder.git"
+  },
   "main": "index.js",
   "directories": {
     "doc": "docs"
@@ -17,7 +21,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "three": "^0.185.1",
     "ws": "^8.21.1"

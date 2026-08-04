@@ -5,14 +5,16 @@ authoritative Node simulation on the server, realtime multiplayer, and every
 single asset — meshes, textures, sounds — generated procedurally at load time.
 There are no binary art assets in this repository.
 
+The whole thing was built from a single prompt — see [ORIGIN.md](ORIGIN.md).
+
 ## Running it
 
 ```bash
 npm install
-npm run dev      # vite on :5173 + game server on :8791
+npm run dev      # vite on :5233 + game server on :8791
 ```
 
-Open <http://localhost:5173>. If the game server is not running the client
+Open <http://localhost:5233>. If the game server is not running the client
 falls back to an offline sandbox against local AI, so it is always playable.
 
 | script | what it does |
@@ -81,3 +83,16 @@ The short version: lighting is quantised, detail is not. Shadows are coloured,
 never grey. Ink outlines come from a depth+normal edge detect plus inverted
 hulls on hero objects. Panel lines, rivets and weathering are mandatory — a
 clean untextured surface is a bug.
+
+## Contributing
+
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+setup, the checks a pull request has to pass (`npm run check`,
+`npm run selftest`, `npm run build`) and the architecture rules that keep the
+client and server in step — chiefly that `src/shared/` stays free of three.js,
+that subsystems talk only through the event bus, and that the flight model
+stays deterministic.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
