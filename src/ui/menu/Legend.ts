@@ -202,7 +202,7 @@ export class FirstFlight {
 // action IDs). Translation happens here at the call site, mapping each known
 // title or label string to its dictionary key.
 
-function localizeBindingGroup(title: string): string {
+export function localizeBindingGroup(title: string): string {
   switch (title) {
     case 'Flight': return t('bindGroupFlight');
     case 'Engine': return t('bindGroupEngine');
@@ -215,7 +215,7 @@ function localizeBindingGroup(title: string): string {
   }
 }
 
-function localizeBindingLabel(label: string): string {
+export function localizeBindingLabel(label: string): string {
   switch (label) {
     case 'Pull up / nose up': return t('bindPullUp');
     case 'Push / nose down': return t('bindPushDown');

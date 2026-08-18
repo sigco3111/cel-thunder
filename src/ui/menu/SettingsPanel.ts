@@ -8,6 +8,7 @@ import {
   BINDING_GROUPS, labelFor, type Action, type BindingSet,
 } from '../../engine/input/bindings';
 import { segmented, settingRow, slider, toggle, textField, groupTitle } from './controls';
+import { localizeBindingGroup, localizeBindingLabel } from './Legend';
 import type { QualityTier } from '../../engine/context';
 import { isWeatherId, type WeatherId } from '../../shared/environment';
 
@@ -314,10 +315,10 @@ export class SettingsPanel {
       return;
     }
     for (const grp of BINDING_GROUPS) {
-      groupTitle(host, grp.title);
+      groupTitle(host, localizeBindingGroup(grp.title));
       for (const [action, label] of grp.items) {
         const row = el('div', 'ct-bind', host);
-        el('span', 'k', row, label);
+        el('span', 'k', row, localizeBindingLabel(label));
         const codes = b.codesFor(action).filter((c) => !c.startsWith('Pad'));
         // The alternates are shown but not editable: the second and third
         // entries are the arrow-key and gamepad mirrors, and letting a rebind
