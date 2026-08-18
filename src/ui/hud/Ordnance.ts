@@ -1,4 +1,5 @@
 import { el, svg, setText, setStyle, setAttr, fixed, distStr } from '../dom';
+import { t } from '../../i18n';
 
 /**
  * The two things a pilot needs to use air-to-ground ordnance: a readout of what
@@ -71,7 +72,7 @@ export class OrdnancePanel {
     this.root = el('div', 'ct-panel ct-hatch', parent);
     setStyle(this.root, 'display', 'none');
     const h = el('div', 'ct-head', this.root);
-    el('span', '', h, 'STORES');
+    el('span', '', h, t('hudStores'));
     el('span', 'ct-head-rule', h);
     this.aux = el('span', 'ct-head-aux', h, '—');
 
@@ -214,7 +215,7 @@ export class BombSight {
       'letter-spacing': 1.4,
       'paint-order': 'stroke', stroke: 'rgba(4,8,13,.85)', 'stroke-width': 3,
     }, this.pip);
-    this.warn.textContent = 'TOO LOW';
+    this.warn.textContent = t('hudTooLow');
   }
 
   resize(w: number, h: number, u: number): void {

@@ -1,4 +1,5 @@
 import { el, setClass, setText, setStyle } from '../dom';
+import { t } from '../../i18n';
 import { sfx } from '../sfx';
 import { axisLabel, primaryLabel, type BindingSet } from '../../engine/input/bindings';
 
@@ -178,17 +179,17 @@ export class Tutorial {
     this.stepBox = el('div', 'ct-tut-card ct-panel is-glass is-deep', this.root);
 
     const head = el('div', 'ct-tut-head', this.stepBox);
-    el('div', 'ct-tut-kicker', head, 'Flight school');
+    el('div', 'ct-tut-kicker', head, t('tutKicker'));
     this.pipsNode = el('div', 'ct-tut-pips', head);
 
     this.titleNode = el('div', 'ct-tut-title', this.stepBox, '');
     this.keysNode = el('div', 'ct-tut-keys', this.stepBox);
     this.whyNode = el('div', 'ct-tut-why', this.stepBox, '');
     this.nudgeNode = el('div', 'ct-tut-nudge', this.stepBox, '');
-    this.tickNode = el('div', 'ct-tut-tick', this.stepBox, 'Good');
+    this.tickNode = el('div', 'ct-tut-tick', this.stepBox, t('tutGood'));
 
     const foot = el('div', 'ct-tut-foot', this.stepBox);
-    this.skipBtn = el('button', 'ct-btn is-ghost is-sm ct-tut-skip', foot, 'Skip') as HTMLButtonElement;
+    this.skipBtn = el('button', 'ct-btn is-ghost is-sm ct-tut-skip', foot, t('tutSkip')) as HTMLButtonElement;
     this.skipBtn.addEventListener('click', (e) => {
       // The click must not also reach the canvas and take pointer lock — the
       // player asked to leave, not to start flying.
@@ -287,7 +288,7 @@ export class Tutorial {
     setStyle(this.nudgeNode, 'display', nudge ? '' : 'none');
     if (nudge) {
       setText(this.nudgeNode,
-        `Moving on in ${Math.max(1, Math.ceil(AUTO_MS - this.elapsed))}s — no need to get it now`);
+        t('tutMovingOn', { n: Math.max(1, Math.ceil(AUTO_MS - this.elapsed)) }));
     }
     // Progress ring on the current pip.
     const pip = this.pipsNode.children[this.index] as HTMLElement | undefined;
@@ -309,8 +310,10 @@ export class Tutorial {
     const step = STEPS[this.index];
     if (!b || !step) return;
 
-    setText(this.titleNode, step.title);
-    setText(this.whyNode, step.why);
+    // Translate at the call site: the STEPS table keeps raw English, but what
+    // lands on screen is the KO version per step id.
+    setText(this.titleNode, this.titleForStep(step.id));
+    setText(this.whyNode, this.whyForStep(step.id));
     setStyle(this.nudgeNode, 'display', 'none');
 
     this.keysNode.textContent = '';
@@ -320,7 +323,7 @@ export class Tutorial {
 
     // Skip affordance depends on whether the player can reach a button: once
     // the pointer is captured there is no cursor to click with, so say so.
-    setText(this.skipBtn, this.index === 0 ? 'Skip' : 'Skip  ·  Esc');
+    setText(this.skipBtn, this.index === 0 ? t('tutSkip') : t('tutSkipEsc'));
 
     if (this.pipsNode.children.length !== STEPS.length) {
       this.pipsNode.textContent = '';
@@ -331,6 +334,32 @@ export class Tutorial {
       setClass(pip, 'is-done', i < this.index);
       setClass(pip, 'is-now', i === this.index);
       if (i !== this.index) setStyle(pip, '--p', '0%');
+    }
+  }
+
+  private titleForStep(id: string): string {
+    switch (id) {
+      case 'capture': return t('tutCaptureTitle');
+      case 'throttle': return t('tutThrottleTitle');
+      case 'pitch': return t('tutPitchTitle');
+      case 'roll': return t('tutRollTitle');
+      case 'recover': return t('tutRecoverTitle');
+      case 'fire': return t('tutFireTitle');
+      case 'camera': return t('tutCameraTitle');
+      default: return '';
+    }
+  }
+
+  private whyForStep(id: string): string {
+    switch (id) {
+      case 'capture': return t('tutCaptureWhy');
+      case 'throttle': return t('tutThrottleWhy');
+      case 'pitch': return t('tutPitchWhy');
+      case 'roll': return t('tutRollWhy');
+      case 'recover': return t('tutRecoverWhy');
+      case 'fire': return t('tutFireWhy');
+      case 'camera': return t('tutCameraWhy');
+      default: return '';
     }
   }
 }

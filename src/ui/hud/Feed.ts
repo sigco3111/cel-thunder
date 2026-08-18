@@ -1,4 +1,5 @@
 import { el, setText, setClass, setStyle, clamp, mmss } from '../dom';
+import { t } from '../../i18n';
 
 /** Rolling kill log, newest at the bottom, auto-expiring. */
 export class Killfeed {
@@ -125,7 +126,7 @@ export class ConnPill {
       bar.style.height = `${30 + i * 23}%`;
       this.bars.push(bar);
     }
-    this.lbl = el('span', 'lbl', this.root, 'LINK');
+    this.lbl = el('span', 'lbl', this.root, t('connLink'));
     this.ms = el('span', 'ms', this.root, '—');
   }
 
@@ -136,8 +137,8 @@ export class ConnPill {
     for (let i = 0; i < this.bars.length; i++) setClass(this.bars[i], 'is-on', i < level);
     setClass(this.root, 'is-warn', level === 2);
     setClass(this.root, 'is-danger', connected && level <= 1);
-    setText(this.lbl, offline ? 'OFFLINE' : connected ? 'LINK' : 'NO LINK');
-    setText(this.ms, offline ? 'SOLO' : connected ? `${Math.round(rttMs)}ms` : '--');
+    setText(this.lbl, offline ? t('connOffline') : connected ? t('connLink') : t('connNoLink'));
+    setText(this.ms, offline ? t('connSolo') : connected ? `${Math.round(rttMs)}ms` : '--');
   }
 }
 
@@ -190,10 +191,10 @@ export class ChatBox {
     this.log = el('div', 'ct-chat-log', this.root);
     const entry = el('div', '', this.root);
     entry.id = 'ct-chat-entry';
-    el('span', 'tag', entry, 'ALL');
+    el('span', 'tag', entry, t('chatTagAll'));
     this.input = el('input', 'ct-input', entry) as HTMLInputElement;
     this.input.maxLength = 140;
-    this.input.placeholder = 'Message…';
+    this.input.placeholder = t('chatPlaceholder');
     this.input.addEventListener('keydown', (e) => {
       e.stopPropagation();
       if (e.key === 'Enter') {

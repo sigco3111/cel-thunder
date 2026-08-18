@@ -27,6 +27,7 @@ import { ControlLegend, FirstFlight } from './menu/Legend';
 import { Tutorial, type TutorialProbe } from './menu/Tutorial';
 import type { BindingSet } from '../engine/input/bindings';
 import type { AircraftBuilder } from './menu/HangarViewer';
+import { t } from '../i18n';
 
 export type UiScreen = 'menu' | 'hangar' | 'flight';
 
@@ -148,19 +149,19 @@ export class UiSystem implements Subsystem {
     this.matchEnd = new MatchEnd(this.root);
 
     this.menu = new MainMenu(this.root, [
-      { id: 'play', label: 'Play', hint: 'ENTER' },
-      { id: 'tutorial', label: 'Flight school', hint: '' },
-      { id: 'hangar', label: 'Hangar', hint: 'H' },
-      { id: 'settings', label: 'Settings', hint: 'O' },
-      { id: 'controls', label: 'Controls', hint: 'K' },
+      { id: 'play', label: t('menuPlay'), hint: t('hintEnter') },
+      { id: 'tutorial', label: t('menuTutorial'), hint: '' },
+      { id: 'hangar', label: t('menuHangar'), hint: t('hintH') },
+      { id: 'settings', label: t('menuSettings'), hint: t('hintO') },
+      { id: 'controls', label: t('menuControls'), hint: t('hintK') },
     ]);
     this.hangar = new Hangar(this.root);
     this.pause = new PauseMenu(this.root, [
-      { id: 'resume', label: 'Resume', hint: 'ESC' },
-      { id: 'controls', label: 'Controls', hint: 'F1' },
-      { id: 'hangar', label: 'Change aircraft', hint: '' },
-      { id: 'settings', label: 'Settings', hint: '' },
-      { id: 'menu', label: 'Leave battle', hint: '' },
+      { id: 'resume', label: t('pauseResume'), hint: t('hintEsc') },
+      { id: 'controls', label: t('menuControls'), hint: t('hintF1') },
+      { id: 'hangar', label: t('pauseChangeAircraft'), hint: '' },
+      { id: 'settings', label: t('menuSettings'), hint: '' },
+      { id: 'menu', label: t('pauseLeaveBattle'), hint: '' },
     ]);
     this.settings = new SettingsPanel(this.root, this.prefs);
     this.legend = new ControlLegend(this.root);
@@ -317,9 +318,9 @@ export class UiSystem implements Subsystem {
     on('net:welcome', (m) => {
       this.players = m.players ?? [];
       this.mapName = m.mapName ?? 'Unknown';
-      this.menu.setInfo('server', 'Connected', 'ok');
+      this.menu.setInfo('server', t('serverConnected'), 'ok');
       this.menu.setInfo('map', this.mapName);
-      this.menu.setInfo('team', m.team === 0 ? 'Allied' : 'Axis');
+      this.menu.setInfo('team', m.team === 0 ? t('teamAllied') : t('teamAxis'));
       // The hangar's roster is the side's roster. Told here so the very first
       // visit already offers the right aircraft, before any screen change.
       this.hangar.setTeam(m.team === 1 ? 1 : 0);
@@ -328,12 +329,12 @@ export class UiSystem implements Subsystem {
       this.hud.chat.push('', `Joined ${this.mapName}`, 0, 0, true);
     });
     on('net:offline', () => {
-      this.menu.setInfo('server', 'Offline sandbox', 'warn');
-      this.announceLink('Server unavailable — flying offline', 'warn');
+      this.menu.setInfo('server', t('serverOfflineSandbox'), 'warn');
+      this.announceLink(t('linkServerUnavailable'), 'warn');
     });
     on('net:disconnected', () => {
-      this.announceLink('Connection lost — flying offline', 'danger');
-      this.menu.setInfo('server', 'Disconnected', 'warn');
+      this.announceLink(t('linkConnectionLost'), 'danger');
+      this.menu.setInfo('server', t('serverDisconnected'), 'warn');
     });
     on('net:match', (m) => {
       this.players = m.players ?? this.players;
@@ -343,7 +344,7 @@ export class UiSystem implements Subsystem {
       this.hud.killLine(m.killer, m.victim, m.weapon, m.killerTeam, m.victimTeam,
         this.ctx.localTeam, this.prefs.playerName);
       if (isLocalName(m.killer, this.prefs.playerName)) {
-        this.hud.popups.push('AIRCRAFT DESTROYED', 100, true);
+        this.hud.popups.push(t('popupAircraftDestroyed'), 100, true);
         this.hud.center.hit('kill');
         sfx('kill:confirm');
       }
@@ -360,7 +361,7 @@ export class UiSystem implements Subsystem {
       // they are still watching the world stream in, is noise — and it is noise
       // that lands in the middle of a screenshot. Only changes after the ramp
       // has finished are worth a word.
-      if (this.age > 12) this.hud.notices.show('quality', `Quality: ${String(q).toUpperCase()}`, '', 2);
+      if (this.age > 12) this.hud.notices.show('quality', t('noticeQuality', { q: String(q).toUpperCase() }), '', 2);
     });
 
     // --- optional producer channels --------------------------------------
@@ -450,7 +451,7 @@ export class UiSystem implements Subsystem {
   private syncNetState(): void {
     const net = this.net;
     this.menu.setInfo('aircraft', this.spec?.name ?? '—');
-    this.menu.setInfo('team', this.ctx.localTeam === 0 ? 'Allied' : 'Axis');
+    this.menu.setInfo('team', this.ctx.localTeam === 0 ? t('teamAllied') : t('teamAxis'));
     // 'welcome' lands inside NetSystem.init, which has already finished by the
     // time this subsystem exists — so the event handler above can and does
     // miss it, and the hangar would sit on its constructor default. This is
@@ -460,20 +461,20 @@ export class UiSystem implements Subsystem {
     this.hangar.setTeam(this.ctx.localTeam);
     this.hangar.selectById(this.prefs.lastAircraft);
     if (!net) {
-      this.menu.setInfo('server', 'Local', 'warn');
-      this.menu.setInfo('map', 'Sandbox');
+      this.menu.setInfo('server', t('serverLocal'), 'warn');
+      this.menu.setInfo('map', t('theatreSandbox'));
       return;
     }
     this.mapName = net.mapName || this.mapName;
     this.players = net.players ?? [];
     this.menu.setInfo('map', this.mapName);
     if (net.offline) {
-      this.menu.setInfo('server', 'Offline sandbox', 'warn');
-      this.announceLink('Server unavailable — flying offline', 'warn');
+      this.menu.setInfo('server', t('serverOfflineSandbox'), 'warn');
+      this.announceLink(t('linkServerUnavailable'), 'warn');
     } else if (net.connected) {
-      this.menu.setInfo('server', 'Connected', 'ok');
+      this.menu.setInfo('server', t('serverConnected'), 'ok');
     } else {
-      this.menu.setInfo('server', 'Connecting…');
+      this.menu.setInfo('server', t('serverConnecting'));
     }
   }
 
@@ -1091,28 +1092,28 @@ export class UiSystem implements Subsystem {
 
     const local = this.localState();
     this.telemetry.update(local, dt, this.inputBits);
-    const t = this.telemetry.data;
+    const telem = this.telemetry.data;
     // Be visibly honest when the instruments have nothing behind them.
     this.hud.setNoData(this.synthActive);
 
     // Death detection from replicated state, as a backstop for the kill event.
     if (local && this.screen === 'flight') {
-      const destroyed = (t.damage & DamageBits.Destroyed) !== 0 || (t.health <= 0 && this.wasAlive);
+      const destroyed = (telem.damage & DamageBits.Destroyed) !== 0 || (telem.health <= 0 && this.wasAlive);
       if (destroyed && !this.death.isOpen) this.onDeath('', '');
       // New damage this frame: warn, and point at whoever is behind us.
-      if (t.damage !== this.lastDamage) {
-        const added = t.damage & ~this.lastDamage;
-        this.lastDamage = t.damage;
+      if (telem.damage !== this.lastDamage) {
+        const added = telem.damage & ~this.lastDamage;
+        this.lastDamage = telem.damage;
         if (added) this.announceDamage(added);
       }
-      this.wasAlive = t.health > 0;
+      this.wasAlive = telem.health > 0;
     }
 
     if (this.screen === 'flight') {
       this.target = this.hud.updateContacts(ctx, this.prefs);
       this.hud.updateFpm(ctx);
-      if (!this.leadExternal) this.computeLead(local, t);
-      this.hud.update(ctx, t, this.lead, this.prefs, dt);
+      if (!this.leadExternal) this.computeLead(local, telem);
+      this.hud.update(ctx, telem, this.lead, this.prefs, dt);
     } else {
       // Menus still need the feeds to tick so notices expire.
       this.hud.notices.update(dt);
@@ -1129,7 +1130,7 @@ export class UiSystem implements Subsystem {
       this.hud.match.update(net.scoreA, net.scoreB, net.timeLeft);
       if (net.players.length) this.players = net.players;
       this.menu.setInfo('players', String(this.players.length || 1));
-      this.menu.setInfo('ping', net.offline ? 'n/a' : `${Math.round(net.rttMs)} ms`);
+      this.menu.setInfo('ping', net.offline ? t('pingNa') : `${Math.round(net.rttMs)} ms`);
     }
 
     if (this.scoreOpen || !this.matchEnd.root.classList.contains('ct-hidden')) {

@@ -9,7 +9,11 @@ import { defineConfig } from 'vite';
  */
 const noHmr = process.env.CT_NO_HMR === '1';
 
+/** Repo-relative base for GitHub Pages. */
+const BASE = process.env.CT_BASE ?? '/cel-thunder/';
+
 export default defineConfig({
+  base: BASE,
   server: {
     port: 5233,
     host: true,

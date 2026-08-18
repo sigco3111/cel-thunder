@@ -1,4 +1,5 @@
 import { el, setClass, setText } from '../dom';
+import { t } from '../../i18n';
 import {
   BINDING_GROUPS, ESSENTIALS, axisLabel, labelFor, primaryLabel,
   type BindingSet,
@@ -47,7 +48,7 @@ export class ControlLegend {
     const panel = el('div', 'ct-legend-panel ct-panel is-glass is-deep', this.root);
 
     const head = el('div', 'ct-legend-head', panel);
-    el('div', 'ct-title', head, 'Controls');
+    el('div', 'ct-title', head, t('legendControls'));
     el('div', 'ct-legend-hint', head, '');
     this.grid = el('div', 'ct-legend-grid', panel);
   }
@@ -64,15 +65,15 @@ export class ControlLegend {
     const hint = this.root.querySelector('.ct-legend-hint');
     if (hint) {
       setText(hint as HTMLElement,
-        b ? `${primaryLabel(b, 'toggleControls')} closes this` : '');
+        b ? t('legendClosesThis', { key: primaryLabel(b, 'toggleControls') }) : '');
     }
     if (!b) {
-      el('div', 'ct-legend-empty', this.grid, 'Controls unavailable.');
+      el('div', 'ct-legend-empty', this.grid, t('legendUnavailable'));
       return;
     }
     for (const grp of BINDING_GROUPS) {
       const col = el('div', 'ct-legend-col', this.grid);
-      el('div', 'ct-legend-title', col, grp.title);
+      el('div', 'ct-legend-title', col, localizeBindingGroup(grp.title));
       for (const lead of grp.lead ?? []) {
         const row = el('div', 'ct-legend-row', col);
         el('kbd', 'ct-kbd', el('div', 'ct-legend-keys', row), lead.keys);
@@ -87,7 +88,7 @@ export class ControlLegend {
         const keys = el('div', 'ct-legend-keys', row);
         if (!codes.length) el('kbd', 'ct-kbd is-none', keys, '—');
         else for (const c of codes) el('kbd', 'ct-kbd', keys, labelFor(c));
-        el('div', 'ct-legend-name', row, label);
+        el('div', 'ct-legend-name', row, localizeBindingLabel(label));
       }
     }
   }
@@ -128,8 +129,8 @@ export class FirstFlight {
   constructor(parent: HTMLElement) {
     this.root = el('div', 'ct-firstflight ct-hidden', parent);
     const panel = el('div', 'ct-ff-panel ct-panel is-glass is-deep', this.root);
-    el('div', 'ct-ff-kicker', panel, 'First sortie');
-    el('div', 'ct-ff-title', panel, 'Flying the aeroplane');
+    el('div', 'ct-ff-kicker', panel, t('ffKicker'));
+    el('div', 'ct-ff-title', panel, t('ffTitle'));
     this.list = el('div', 'ct-ff-list', panel);
     el('div', 'ct-ff-foot', panel, '');
   }
@@ -162,12 +163,12 @@ export class FirstFlight {
       else for (const part of axisLabel(b, e.actions).split(' / ')) {
         el('kbd', 'ct-kbd', keys, part);
       }
-      el('div', 'ct-ff-note', row, e.note);
+      el('div', 'ct-ff-note', row, localizeEssentialNote(e.note));
     }
     const foot = this.root.querySelector('.ct-ff-foot');
     if (foot) {
       setText(foot as HTMLElement,
-        `Press ${primaryLabel(b, 'toggleControls')} at any time for the full list · any key dismisses this`);
+        t('ffFullList', { key: primaryLabel(b, 'toggleControls') }));
     }
 
     this.life = seconds;
@@ -193,4 +194,95 @@ export class FirstFlight {
   }
 
   get isOpen(): boolean { return this.visible; }
+}
+
+// ---------------------------------------------------------------------------
+// Translation helpers — the binding table is *owned* by the engine, so by
+// design it still carries English titles and labels (they are paired with the
+// action IDs). Translation happens here at the call site, mapping each known
+// title or label string to its dictionary key.
+
+function localizeBindingGroup(title: string): string {
+  switch (title) {
+    case 'Flight': return t('bindGroupFlight');
+    case 'Engine': return t('bindGroupEngine');
+    case 'Weapons': return t('bindGroupWeapons');
+    case 'Airframe': return t('bindGroupAirframe');
+    case 'View': return t('bindGroupView');
+    case 'Trim': return t('bindGroupTrim');
+    case 'Interface': return t('bindGroupInterface');
+    default: return title;
+  }
+}
+
+function localizeBindingLabel(label: string): string {
+  switch (label) {
+    case 'Pull up / nose up': return t('bindPullUp');
+    case 'Push / nose down': return t('bindPushDown');
+    case 'Roll left': return t('bindRollLeft');
+    case 'Roll right': return t('bindRollRight');
+    case 'Rudder left': return t('bindRudderLeft');
+    case 'Rudder right': return t('bindRudderRight');
+    case 'Throttle up': return t('bindThrottleUp');
+    case 'Throttle down': return t('bindThrottleDown');
+    case 'Throttle 100 %': return t('bindThrottleMax');
+    case 'Throttle idle': return t('bindThrottleIdle');
+    case 'War emergency power': return t('bindWep');
+    case 'Radiator': return t('bindRadiator');
+    case 'Machine guns': return t('bindMachineGuns');
+    case 'Cannons': return t('bindCannons');
+    case 'Release bombs': return t('bindBombs');
+    case 'Launch rockets': return t('bindRockets');
+    case 'Cycle target': return t('bindCycleTarget');
+    case 'Clear target': return t('bindClearTarget');
+    case 'Landing gear': return t('bindGear');
+    case 'Flaps down a stage': return t('bindFlapsDown');
+    case 'Flaps up a stage': return t('bindFlapsUp');
+    case 'Air brake': return t('bindAirBrake');
+    case 'Wheel brake': return t('bindWheelBrake');
+    case 'Bail out (hold)': return t('bindBail');
+    case 'Cycle camera': return t('bindCycleCamera');
+    case 'Free look (hold)': return t('bindFreeLook');
+    case 'Look back': return t('bindLookBack');
+    case 'Gunsight zoom (hold)': return t('bindZoom');
+    case 'Hide the HUD': return t('bindHideHud');
+    case 'This control list': return t('bindThisControlList');
+    case 'Trim nose up': return t('bindTrimNoseUp');
+    case 'Trim nose down': return t('bindTrimNoseDown');
+    case 'Trim left': return t('bindTrimLeft');
+    case 'Trim right': return t('bindTrimRight');
+    case 'Trim rudder left': return t('bindTrimRudderLeft');
+    case 'Trim rudder right': return t('bindTrimRudderRight');
+    case 'Reset trim': return t('bindTrimReset');
+    case 'Map': return t('bindMap');
+    case 'Chat': return t('bindChat');
+    case 'Mouse aim / simulator': return t('bindMouseAimSimulator');
+    default: return label;
+  }
+}
+
+function localizeEssentialNote(note: string): string {
+  switch (note) {
+    case 'Steers — the aeroplane flies to the reticle. Right turns right, back pulls up':
+      return t('essMouse');
+    case 'Stop moving the mouse and it levels off by itself':
+      return t('essLetGo');
+    case 'Machine guns / cannons':
+      return t('essMachineCannons');
+    case 'Pitch — an alternative to the mouse, never a requirement':
+      return t('essPitch');
+    case 'Roll — likewise':
+      return t('essRoll');
+    case 'Throttle':
+      return t('essThrottle');
+    case 'War emergency power':
+      return t('essWep');
+    case 'Landing gear / flaps':
+      return t('essGearFlaps');
+    case 'Change camera':
+      return t('essCamera');
+    case 'Show every control':
+      return t('essShowAll');
+    default: return note;
+  }
 }

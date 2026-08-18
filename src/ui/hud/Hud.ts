@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { el, setText, setClass, setStyle, clamp, int, fixed, mmss, distStr } from '../dom';
+import { t } from '../../i18n';
 import type { GameContext } from '../../engine/context';
 import type { HudTelemetry } from '../Telemetry';
 import { manifoldUnit } from '../Telemetry';
@@ -98,21 +99,30 @@ export class Hud {
 
     const power = el('div', 'ct-panel ct-hatch', sys);
     const ph = el('div', 'ct-head', power);
-    el('span', '', ph, 'POWERPLANT');
+    el('span', '', ph, t('hudPowerplant'));
     el('span', 'ct-head-rule', ph);
     this.sysHeadAux = el('span', 'ct-head-aux', ph, '—');
     this.throttle = new ThrottleBar(power);
     const grid = el('div', 'ct-sys-grid', power);
-    this.gRpm = new Gauge(grid, 'RPM', 0.92);
-    this.gMap = new Gauge(grid, 'MAP', 0.9);
-    this.gOil = new Gauge(grid, 'OIL', 0.86);
-    this.gWater = new Gauge(grid, 'H2O', 0.86);
-    this.gFuel = new Gauge(grid, 'FUEL', 1);
+    this.gRpm = new Gauge(grid, t('hudGaugeRpm'), 0.92);
+    this.gMap = new Gauge(grid, t('hudGaugeMap'), 0.9);
+    this.gOil = new Gauge(grid, t('hudGaugeOil'), 0.86);
+    this.gWater = new Gauge(grid, t('hudGaugeH2o'), 0.86);
+    this.gFuel = new Gauge(grid, t('hudGaugeFuel'), 1);
+    // FlagRow keys are looked up by an internal map, so they must stay as the
+    // English internal identifiers (matching the abbreviations used elsewhere).
+    // The display text is rewritten to the localised label via setLabel() below.
     this.flags = new FlagRow(power, ['GEAR', 'FLAPS', 'BRAKE', 'RAD', 'WEP', 'WHL']);
+    this.flags.setLabel('GEAR', t('hudFlagGear'));
+    this.flags.setLabel('FLAPS', t('hudFlagFlaps'));
+    this.flags.setLabel('BRAKE', t('hudFlagBrake'));
+    this.flags.setLabel('RAD', t('hudFlagRad'));
+    this.flags.setLabel('WEP', t('hudFlagWep'));
+    this.flags.setLabel('WHL', t('hudFlagWhl'));
 
     const frame = el('div', 'ct-panel ct-hatch', sys);
     const fh = el('div', 'ct-head', frame);
-    el('span', '', fh, 'AIRFRAME');
+    el('span', '', fh, t('hudAirframe'));
     el('span', 'ct-head-rule', fh);
     this.damage = new DamagePanel(frame);
     this.ammo = new AmmoPanel(frame);
@@ -124,7 +134,7 @@ export class Hud {
 
     this.gmeter = new GMeter(this.root);
 
-    this.fireWarn = el('div', '', this.root, 'ENGINE FIRE');
+    this.fireWarn = el('div', '', this.root, t('hudEngineFire'));
     this.fireWarn.id = 'ct-firewarn';
     setStyle(this.fireWarn, 'display', 'none');
 
@@ -233,59 +243,59 @@ export class Hud {
     if (this.noData === on) return;
     this.noData = on;
     setClass(this.root, 'is-nodata', on);
-    if (on) this.notices.sticky('nodata', 'NO TELEMETRY — awaiting aircraft', 'warn');
+    if (on) this.notices.sticky('nodata', t('hudNoTelemetry'), 'warn');
     else this.notices.clear('nodata');
   }
   private noData = false;
 
   // -------------------------------------------------------------------------
 
-  update(ctx: GameContext, t: HudTelemetry, lead: LeadState, prefs: UiPrefs, dt: number): void {
+  update(ctx: GameContext, telem: HudTelemetry, lead: LeadState, prefs: UiPrefs, dt: number): void {
     const imperial = this.units === 'imperial';
 
     // --- energy state -----------------------------------------------------
-    const spd = imperial ? t.ias * 2.236936 : t.ias * 3.6;
-    const tas = imperial ? t.tas * 2.236936 : t.tas * 3.6;
+    const spd = imperial ? telem.ias * 2.236936 : telem.ias * 3.6;
+    const tas = imperial ? telem.tas * 2.236936 : telem.tas * 3.6;
     this.speedTape.update(spd);
     this.speedTape.setSub(
       int(tas),
-      fixed(t.mach, 2),
-      t.overspeed ? 'danger' : '',
-      t.mach > 0.72 ? 'warn' : '',
+      fixed(telem.mach, 2),
+      telem.overspeed ? 'danger' : '',
+      telem.mach > 0.72 ? 'warn' : '',
     );
 
-    const alt = imperial ? t.altBaro * 3.28084 : t.altBaro;
-    const rad = imperial ? t.altRadar * 3.28084 : t.altRadar;
+    const alt = imperial ? telem.altBaro * 3.28084 : telem.altBaro;
+    const rad = imperial ? telem.altRadar * 3.28084 : telem.altRadar;
     this.altTape.update(alt);
-    const vs = imperial ? t.vspeed * 196.85 : t.vspeed;
+    const vs = imperial ? telem.vspeed * 196.85 : telem.vspeed;
     this.altTape.setSub(
       rad < 9999 ? int(rad) : '----',
       (vs >= 0 ? '+' : '') + int(vs),
-      t.altRadar < 150 && t.vspeed < -8 ? 'danger' : '',
+      telem.altRadar < 150 && telem.vspeed < -8 ? 'danger' : '',
       '',
     );
-    this.vsi.update(t.vspeed);
+    this.vsi.update(telem.vspeed);
 
     // --- attitude / gunsight ---------------------------------------------
     // Track the live camera FOV, not the setting: the camera rig may zoom or
     // widen with speed, and a ladder that ignores that stops being conformal.
     this.center.setFov(ctx.camera.fov);
-    this.center.update(t, lead, dt);
-    this.compass.update(t.heading, this.bearingCache);
+    this.center.update(telem, lead, dt);
+    this.compass.update(telem.heading, this.bearingCache);
 
     // --- powerplant -------------------------------------------------------
-    this.throttle.update(t.throttle, t.wep);
-    const spec = t.spec;
+    this.throttle.update(telem.throttle, telem.wep);
+    const spec = telem.spec;
     if (spec) {
       const mu = manifoldUnit(spec.nation);
-      this.gRpm.update(t.rpmFrac, int(t.rpm), t.rpmFrac > 1.02 ? 1 : t.rpmFrac * 0.82);
-      const mp = t.manifold * mu.scale;
-      this.gMap.update(clamp(t.manifold / 1.7, 0, 1), `${mp.toFixed(mu.digits)}`, clamp(t.manifold / 1.62, 0, 1));
-      this.gOil.update(clamp(t.oilTemp / 140, 0, 1), `${Math.round(t.oilTemp)}°`, t.oilFrac);
-      this.gWater.update(clamp(t.coolantTemp / 150, 0, 1), `${Math.round(t.coolantTemp)}°`, t.coolantFrac);
-      const ff = t.fuelMax > 0 ? t.fuel / t.fuelMax : 0;
-      this.gFuel.update(ff, t.fuelTime > 0 ? mmss(t.fuelTime) : '—', 1 - ff);
-      setText(this.sysHeadAux, `${spec.engine.kind === 'radial' ? 'RADIAL' : 'INLINE'} · ${mu.unit.toUpperCase()}`);
+      this.gRpm.update(telem.rpmFrac, int(telem.rpm), telem.rpmFrac > 1.02 ? 1 : telem.rpmFrac * 0.82);
+      const mp = telem.manifold * mu.scale;
+      this.gMap.update(clamp(telem.manifold / 1.7, 0, 1), `${mp.toFixed(mu.digits)}`, clamp(telem.manifold / 1.62, 0, 1));
+      this.gOil.update(clamp(telem.oilTemp / 140, 0, 1), `${Math.round(telem.oilTemp)}°`, telem.oilFrac);
+      this.gWater.update(clamp(telem.coolantTemp / 150, 0, 1), `${Math.round(telem.coolantTemp)}°`, telem.coolantFrac);
+      const ff = telem.fuelMax > 0 ? telem.fuel / telem.fuelMax : 0;
+      this.gFuel.update(ff, telem.fuelTime > 0 ? mmss(telem.fuelTime) : '—', 1 - ff);
+      setText(this.sysHeadAux, `${spec.engine.kind === 'radial' ? t('hudRadial') : t('hudInline')} · ${mu.unit.toUpperCase()}`);
       // The red arc only moves when the airframe does. Rebuilding it every
       // frame allocated two closures and two arrays for an identical path.
       if (spec.aero.gLimit !== this.lastGLimit) {
@@ -294,36 +304,36 @@ export class Hud {
       }
     }
 
-    this.flags.set('GEAR', t.gear > 0.98 ? 'on' : t.gear > 0.02 ? 'warn' : '');
-    this.flags.set('FLAPS', t.flaps > 0.66 ? 'on' : t.flaps > 0.02 ? 'warn' : '');
-    this.flags.set('BRAKE', t.airbrake > 0.5 ? 'on' : '');
-    this.flags.set('RAD', t.radiator > 0.8 ? 'on' : '');
-    this.flags.set('WEP', t.wep ? 'danger' : '');
-    this.flags.set('WHL', t.altRadar < 5 && t.gear > 0.9 ? 'on' : '');
+    this.flags.set('GEAR', telem.gear > 0.98 ? 'on' : telem.gear > 0.02 ? 'warn' : '');
+    this.flags.set('FLAPS', telem.flaps > 0.66 ? 'on' : telem.flaps > 0.02 ? 'warn' : '');
+    this.flags.set('BRAKE', telem.airbrake > 0.5 ? 'on' : '');
+    this.flags.set('RAD', telem.radiator > 0.8 ? 'on' : '');
+    this.flags.set('WEP', telem.wep ? 'danger' : '');
+    this.flags.set('WHL', telem.altRadar < 5 && telem.gear > 0.9 ? 'on' : '');
 
     // --- airframe ---------------------------------------------------------
     const specId = spec?.id ?? '';
     if (specId !== this.lastSpecId) {
       this.lastSpecId = specId;
       this.damage.build(spec);
-      this.ammo.build(t.ammo, specId);
+      this.ammo.build(telem.ammo, specId);
     }
-    this.damage.update(t.damage, t.health);
+    this.damage.update(telem.damage, telem.health);
     this.stores.update(this.ordnance);
-    this.updateBombSight(ctx, t);
-    this.ammo.update(t.ammo);
-    this.gmeter.update(t.gLoad, t.gPeak, t.gMin, spec?.aero.gLimit ?? 9);
+    this.updateBombSight(ctx, telem);
+    this.ammo.update(telem.ammo);
+    this.gmeter.update(telem.gLoad, telem.gPeak, telem.gMin, spec?.aero.gLimit ?? 9);
 
-    const fire = (t.damage & 128) !== 0; // DamageBits.EngineFire
+    const fire = (telem.damage & 128) !== 0; // DamageBits.EngineFire
     setStyle(this.fireWarn, 'display', fire ? 'block' : 'none');
 
     // --- envelope warnings ------------------------------------------------
-    if (t.alive) {
-      if (t.stall) this.notices.show('stall', 'STALL', 'danger', 0.6);
-      if (t.overspeed) this.notices.show('vne', 'OVERSPEED — REDUCE THROTTLE', 'danger', 0.6);
-      if (t.gWarn) this.notices.show('g', 'G LIMIT', 'warn', 0.5);
-      if (t.fuelMax > 0 && t.fuel / t.fuelMax < 0.12) this.notices.show('fuel', 'LOW FUEL', 'warn', 1.2);
-      if (t.altRadar < 120 && t.vspeed < -12) this.notices.show('gpws', 'PULL UP', 'danger', 0.5);
+    if (telem.alive) {
+      if (telem.stall) this.notices.show('stall', t('hudStall'), 'danger', 0.6);
+      if (telem.overspeed) this.notices.show('vne', t('hudOverspeed'), 'danger', 0.6);
+      if (telem.gWarn) this.notices.show('g', t('hudGLimit'), 'warn', 0.5);
+      if (telem.fuelMax > 0 && telem.fuel / telem.fuelMax < 0.12) this.notices.show('fuel', t('hudLowFuel'), 'warn', 1.2);
+      if (telem.altRadar < 120 && telem.vspeed < -12) this.notices.show('gpws', t('hudPullUp'), 'danger', 0.5);
     }
 
     // --- surroundings -----------------------------------------------------

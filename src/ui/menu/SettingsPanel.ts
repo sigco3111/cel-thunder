@@ -1,4 +1,5 @@
 import { el, setText, setClass, clamp } from '../dom';
+import { t } from '../../i18n';
 import {
   DEFAULT_BINDINGS, DEFAULT_PREFS,
   type AssistLevel, type ControlMode, type UiPrefs, type Units,
@@ -87,17 +88,17 @@ export class SettingsPanel {
     const modal = el('div', 'ct-modal ct-panel is-glass is-deep ct-hatch', this.root);
 
     const head = el('div', 'ct-modal-head', modal);
-    el('div', 'ct-title', head, 'Settings');
+    el('div', 'ct-title', head, t('settingsTitle'));
     const tabBox = el('div', 'ct-seg', head);
     el('div', 'sp', head);
-    const close = el('button', 'ct-btn is-ghost is-sm', head, 'Close');
+    const close = el('button', 'ct-btn is-ghost is-sm', head, t('settingsClose'));
     close.onclick = () => this.onClose();
 
     const body = el('div', 'ct-modal-body', modal);
 
     const defs: [Tab, string][] = [
-      ['graphics', 'Graphics'], ['controls', 'Controls'],
-      ['audio', 'Audio'], ['interface', 'Interface'],
+      ['graphics', t('tabGraphics')], ['controls', t('tabControls')],
+      ['audio', t('tabAudio')], ['interface', t('tabInterface')],
     ];
     for (const [id, label] of defs) {
       const b = el('button', '', tabBox, label);
@@ -113,10 +114,10 @@ export class SettingsPanel {
     this.buildInterface(this.panels.get('interface')!);
 
     const foot = el('div', 'ct-modal-foot', modal);
-    const reset = el('button', 'ct-btn is-ghost is-sm', foot, 'Restore defaults');
+    const reset = el('button', 'ct-btn is-ghost is-sm', foot, t('settingsRestoreDefaults'));
     reset.onclick = () => this.restoreDefaults();
     el('div', 'sp', foot);
-    const done = el('button', 'ct-btn is-primary is-sm', foot, 'Done');
+    const done = el('button', 'ct-btn is-primary is-sm', foot, t('settingsDone'));
     done.onclick = () => this.onClose();
 
     this.setTab('graphics');
@@ -134,59 +135,59 @@ export class SettingsPanel {
   // -------------------------------------------------------------------------
 
   private buildGraphics(p: HTMLElement): void {
-    groupTitle(p, 'Presets');
-    let r = settingRow(p, 'Quality tier', { desc: 'Auto lets the frame-time governor pick.' });
+    groupTitle(p, t('presetGroup'));
+    let r = settingRow(p, t('presetQualityTier'), { desc: t('presetQualityDesc') });
     const qual = segmented<QualityTier | 'auto'>(r, [
-      ['low', 'Low'], ['medium', 'Med'], ['high', 'High'], ['ultra', 'Ultra'], ['auto', 'Auto'],
+      ['low', t('presetLow')], ['medium', t('presetMed')], ['high', t('presetHigh')], ['ultra', t('presetUltra')], ['auto', t('presetAuto')],
     ], this.prefs.quality, (v) => { this.prefs.quality = v; this.applyTierDefaults(v); this.commit(); });
     this.rebuild.push(() => qual.set(this.prefs.quality));
 
-    r = settingRow(p, 'Render scale', { desc: 'Internal resolution multiplier.' });
+    r = settingRow(p, t('presetRenderScale'), { desc: t('presetRenderScaleDesc') });
     const rs = slider(r, 0.5, 2, 0.05, this.prefs.renderScale, (v) => `${Math.round(v * 100)}%`,
       (v) => { this.prefs.renderScale = v; this.commit(); }, [1]);
     this.rebuild.push(() => rs.set(this.prefs.renderScale));
 
-    r = settingRow(p, 'Field of view');
+    r = settingRow(p, t('presetFov'));
     const fov = slider(r, 45, 110, 1, this.prefs.fov, (v) => `${Math.round(v)}°`,
       (v) => { this.prefs.fov = v; this.commit(); }, [68]);
     this.rebuild.push(() => fov.set(this.prefs.fov));
 
-    groupTitle(p, 'Lighting & shadows');
-    r = settingRow(p, 'Shadows');
+    groupTitle(p, t('groupLighting'));
+    r = settingRow(p, t('rowShadows'));
     const sh = toggle(r, this.prefs.shadows, (v) => { this.prefs.shadows = v; this.commit(); });
     this.rebuild.push(() => sh.set(this.prefs.shadows));
 
-    r = settingRow(p, 'Shadow resolution');
-    const sm = segmented<string>(r, [['1024', '1K'], ['2048', '2K'], ['4096', '4K']],
+    r = settingRow(p, t('rowShadowRes'));
+    const sm = segmented<string>(r, [['1024', t('optShadow1k')], ['2048', t('optShadow2k')], ['4096', t('optShadow4k')]],
       String(this.prefs.shadowMapSize), (v) => { this.prefs.shadowMapSize = Number(v); this.commit(); });
     this.rebuild.push(() => sm.set(String(this.prefs.shadowMapSize)));
 
-    r = settingRow(p, 'Ambient occlusion');
+    r = settingRow(p, t('rowAmbientOcclusion'));
     const ao = toggle(r, this.prefs.ssao, (v) => { this.prefs.ssao = v; this.commit(); });
     this.rebuild.push(() => ao.set(this.prefs.ssao));
 
-    groupTitle(p, 'Atmosphere');
-    r = settingRow(p, 'Volumetric clouds', { desc: 'Ray-marched cloud layer. Expensive.' });
+    groupTitle(p, t('groupAtmosphere'));
+    r = settingRow(p, t('rowVolumetricClouds'), { desc: t('rowVolumetricCloudsDesc') });
     const cl = toggle(r, this.prefs.volumetricClouds, (v) => { this.prefs.volumetricClouds = v; this.commit(); });
     this.rebuild.push(() => cl.set(this.prefs.volumetricClouds));
 
     this.buildWeatherOverride(p);
 
-    groupTitle(p, 'Post-processing');
-    r = settingRow(p, 'Bloom');
+    groupTitle(p, t('groupPost'));
+    r = settingRow(p, t('rowBloom'));
     const bl = slider(r, 0, 1.5, 0.05, this.prefs.bloom, (v) => v.toFixed(2),
       (v) => { this.prefs.bloom = v; this.commit(); });
     this.rebuild.push(() => bl.set(this.prefs.bloom));
 
-    r = settingRow(p, 'Depth of field');
+    r = settingRow(p, t('rowDof'));
     const dof = toggle(r, this.prefs.dof, (v) => { this.prefs.dof = v; this.commit(); });
     this.rebuild.push(() => dof.set(this.prefs.dof));
 
-    r = settingRow(p, 'Motion blur');
+    r = settingRow(p, t('rowMotionBlur'));
     const mb = toggle(r, this.prefs.motionBlur, (v) => { this.prefs.motionBlur = v; this.commit(); });
     this.rebuild.push(() => mb.set(this.prefs.motionBlur));
 
-    r = settingRow(p, 'Ink outline weight', { desc: 'Thickness of the cel silhouette pass.' });
+    r = settingRow(p, t('rowInkOutline'), { desc: t('rowInkOutlineDesc') });
     const ow = slider(r, 0, 2, 0.05, this.prefs.outlineWidth, (v) => v.toFixed(2),
       (v) => { this.prefs.outlineWidth = v; this.commit(); }, [1]);
     this.rebuild.push(() => ow.set(this.prefs.outlineWidth));
@@ -207,12 +208,12 @@ export class SettingsPanel {
    * debug knob in every player's saved settings forever.
    */
   private buildWeatherOverride(p: HTMLElement): void {
-    const r = settingRow(p, 'Weather', {
-      desc: 'Local preview only — the server picks the weather for a match.',
+    const r = settingRow(p, t('rowWeather'), {
+      desc: t('rowWeatherDesc'),
     });
     const wx = segmented<WeatherChoice>(r, [
-      ['match', 'Match'], ['clear', 'Clear'], ['scattered', 'Cumulus'],
-      ['overcast', 'Overcast'], ['storm', 'Storm'], ['fog', 'Fog'],
+      ['match', t('optWeatherMatch')], ['clear', t('optWeatherClear')], ['scattered', t('optWeatherCumulus')],
+      ['overcast', t('optWeatherOvercast')], ['storm', t('optWeatherStorm')], ['fog', t('optWeatherFog')],
     ], this.weatherChoice, (v) => {
       this.weatherChoice = v;
       const bus = gameBus();
@@ -222,15 +223,15 @@ export class SettingsPanel {
     });
     this.rebuild.push(() => wx.set(this.weatherChoice));
 
-    const rt = settingRow(p, 'Time of day', {
-      desc: 'Local preview only. Drag to move the sun; Match restores the server clock.',
+    const rt = settingRow(p, t('rowTimeOfDay'), {
+      desc: t('rowTimeOfDayDesc'),
     });
     const tod = slider(rt, 0, 24, 0.25, this.todOverride ?? matchTimeOfDay(), formatClock, (v) => {
       this.todOverride = v;
       gameBus()?.emit('sky:timeOfDay', v);
     });
     this.rebuild.push(() => tod.set(this.todOverride ?? matchTimeOfDay()));
-    const reset = el('button', 'ct-btn is-ghost is-sm', rt, 'Match');
+    const reset = el('button', 'ct-btn is-ghost is-sm', rt, t('optWeatherMatch'));
     reset.onclick = () => {
       this.todOverride = null;
       const h = matchTimeOfDay();
@@ -256,35 +257,34 @@ export class SettingsPanel {
   }
 
   private buildControls(p: HTMLElement): void {
-    groupTitle(p, 'Flight model assistance');
-    let r = settingRow(p, 'Assists', {
-      desc: 'Arcade keeps the g limiter, stall guard, auto-rudder and wing leveller '
-        + 'in the loop — letting go of the controls always recovers.',
+    groupTitle(p, t('groupFlightModel'));
+    let r = settingRow(p, t('rowAssists'), {
+      desc: t('rowAssistsDesc'),
     });
-    const asst = segmented<AssistLevel>(r, [['arcade', 'Arcade'], ['realistic', 'Realistic']],
+    const asst = segmented<AssistLevel>(r, [['arcade', t('optArcade')], ['realistic', t('optRealistic')]],
       this.prefs.assists, (v) => { this.prefs.assists = v; this.commit(); });
     this.rebuild.push(() => asst.set(this.prefs.assists));
 
-    r = settingRow(p, 'Control mode', {
-      desc: 'Mouse aim flies for you; simulator gives raw surface control.',
+    r = settingRow(p, t('rowControlMode'), {
+      desc: t('rowControlModeDesc'),
     });
     const cm = segmented<ControlMode>(r, [
-      ['mouse-aim', 'Mouse aim'], ['instructor', 'Assisted'],
-      ['realistic', 'Realistic'], ['simulator', 'Sim'],
+      ['mouse-aim', t('optMouseAim')], ['instructor', t('optAssisted')],
+      ['realistic', t('optRealistic')], ['simulator', t('optSimulator')],
     ], this.prefs.controlMode, (v) => { this.prefs.controlMode = v; this.commit(); });
     this.rebuild.push(() => cm.set(this.prefs.controlMode));
     this.controlsRebuilt = () => cm.set(this.prefs.controlMode);
 
-    r = settingRow(p, 'Mouse sensitivity');
+    r = settingRow(p, t('rowMouseSensitivity'));
     const ms = slider(r, 0.2, 3, 0.05, this.prefs.mouseSensitivity, (v) => v.toFixed(2),
       (v) => { this.prefs.mouseSensitivity = v; this.commit(); }, [1]);
     this.rebuild.push(() => ms.set(this.prefs.mouseSensitivity));
 
-    r = settingRow(p, 'Invert vertical axis');
+    r = settingRow(p, t('rowInvertY'));
     const iv = toggle(r, this.prefs.invertY, (v) => { this.prefs.invertY = v; this.commit(); });
     this.rebuild.push(() => iv.set(this.prefs.invertY));
 
-    r = settingRow(p, 'Lead indicator assist', { desc: 'How strongly the lead pip is smoothed.' });
+    r = settingRow(p, t('rowLeadAssist'), { desc: t('rowLeadAssistDesc') });
     const aa = slider(r, 0, 1, 0.05, this.prefs.aimAssist, (v) => `${Math.round(v * 100)}%`,
       (v) => { this.prefs.aimAssist = v; this.commit(); });
     this.rebuild.push(() => aa.set(this.prefs.aimAssist));
@@ -309,8 +309,8 @@ export class SettingsPanel {
     host.textContent = '';
     const b = this.bindings;
     if (!b) {
-      groupTitle(host, 'Key bindings');
-      el('div', 'ct-row-desc', host, 'Unavailable — the input subsystem is not running.');
+      groupTitle(host, t('rowKeyBindings'));
+      el('div', 'ct-row-desc', host, t('rowKeyBindingsDesc'));
       return;
     }
     for (const grp of BINDING_GROUPS) {
@@ -330,43 +330,43 @@ export class SettingsPanel {
   }
 
   private buildAudio(p: HTMLElement): void {
-    groupTitle(p, 'Mix');
+    groupTitle(p, t('groupMix'));
     const mk = (label: string, get: () => number, set: (v: number) => void) => {
       const r = settingRow(p, label);
       const s = slider(r, 0, 1, 0.01, get(), (v) => `${Math.round(v * 100)}`, (v) => { set(v); this.commit(); });
       this.rebuild.push(() => s.set(get()));
     };
-    mk('Master', () => this.prefs.masterVolume, (v) => { this.prefs.masterVolume = v; });
-    mk('Effects', () => this.prefs.effectsVolume, (v) => { this.prefs.effectsVolume = v; });
-    mk('Engine', () => this.prefs.engineVolume, (v) => { this.prefs.engineVolume = v; });
-    mk('Interface', () => this.prefs.uiVolume, (v) => { this.prefs.uiVolume = v; });
+    mk(t('rowMaster'), () => this.prefs.masterVolume, (v) => { this.prefs.masterVolume = v; });
+    mk(t('rowEffects'), () => this.prefs.effectsVolume, (v) => { this.prefs.effectsVolume = v; });
+    mk(t('rowEngine'), () => this.prefs.engineVolume, (v) => { this.prefs.engineVolume = v; });
+    mk(t('rowInterface'), () => this.prefs.uiVolume, (v) => { this.prefs.uiVolume = v; });
   }
 
   private buildInterface(p: HTMLElement): void {
-    groupTitle(p, 'Pilot');
-    let r = settingRow(p, 'Callsign', { desc: 'Shown in the killfeed and scoreboard.' });
-    textField(r, this.prefs.playerName, 'Pilot', (v) => { this.prefs.playerName = v.slice(0, 20); this.commit(); });
+    groupTitle(p, t('groupPilot'));
+    let r = settingRow(p, t('rowCallsign'), { desc: t('rowCallsignDesc') });
+    textField(r, this.prefs.playerName, t('callsignPlaceholder'), (v) => { this.prefs.playerName = v.slice(0, 20); this.commit(); });
 
-    groupTitle(p, 'Head-up display');
-    r = settingRow(p, 'Show HUD');
+    groupTitle(p, t('groupHud'));
+    r = settingRow(p, t('rowShowHud'));
     const sh = toggle(r, this.prefs.showHud, (v) => { this.prefs.showHud = v; this.commit(); });
     this.rebuild.push(() => sh.set(this.prefs.showHud));
 
-    r = settingRow(p, 'HUD scale');
+    r = settingRow(p, t('rowHudScale'));
     const hs = slider(r, 0.75, 1.5, 0.05, this.prefs.hudScale, (v) => `${Math.round(v * 100)}%`,
       (v) => { this.prefs.hudScale = v; this.commit(); }, [1]);
     this.rebuild.push(() => hs.set(this.prefs.hudScale));
 
-    r = settingRow(p, 'Units');
-    const un = segmented<Units>(r, [['metric', 'Metric'], ['imperial', 'Imperial']],
+    r = settingRow(p, t('rowUnits'));
+    const un = segmented<Units>(r, [['metric', t('optMetric')], ['imperial', t('optImperial')]],
       this.prefs.units, (v) => { this.prefs.units = v; this.commit(); });
     this.rebuild.push(() => un.set(this.prefs.units));
 
-    r = settingRow(p, 'Contact markers');
+    r = settingRow(p, t('rowContactMarkers'));
     const cm = toggle(r, this.prefs.showMarkers, (v) => { this.prefs.showMarkers = v; this.commit(); });
     this.rebuild.push(() => cm.set(this.prefs.showMarkers));
 
-    r = settingRow(p, 'Minimap');
+    r = settingRow(p, t('rowMinimap'));
     const mm = toggle(r, this.prefs.showMinimap, (v) => { this.prefs.showMinimap = v; this.commit(); });
     this.rebuild.push(() => mm.set(this.prefs.showMinimap));
   }
@@ -377,7 +377,7 @@ export class SettingsPanel {
     this.cancelListen();
     this.listening = { action, node };
     setClass(node, 'is-listen', true);
-    setText(node, 'PRESS…');
+    setText(node, t('rowPress'));
   }
 
   private captureKey = (e: KeyboardEvent): void => {

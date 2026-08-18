@@ -1,4 +1,5 @@
 import { el, svg, setText, setClass, setAttr, clamp } from '../dom';
+import { t } from '../../i18n';
 
 /**
  * Death, respawn and match end.
@@ -32,9 +33,9 @@ export class DeathScreen {
     this.root.id = 'ct-death';
 
     const card = el('div', 'ct-death-card ct-panel is-glass is-deep ct-hatch', this.root);
-    this.title = el('div', 'ct-death-title', card, 'Shot down');
+    this.title = el('div', 'ct-death-title', card, t('deathShotDown'));
     this.sub = el('div', 'ct-death-sub', card);
-    el('span', '', this.sub, 'Destroyed by ');
+    el('span', '', this.sub, t('deathDestroyedBy'));
     this.killerEl = el('span', 'who', this.sub, '—');
     el('span', '', this.sub, ' · ');
     this.weaponEl = el('span', 'wpn', this.sub, '—');
@@ -50,14 +51,14 @@ export class DeathScreen {
 
     const col = el('div', '', foot);
     (col as HTMLElement).style.flex = '1';
-    el('div', 'ct-label', col, 'Reinforcements inbound');
+    el('div', 'ct-label', col, t('deathReinforcements'));
     const btns = el('div', '', col);
     (btns as HTMLElement).style.display = 'flex';
     (btns as HTMLElement).style.gap = 'var(--s3)';
     (btns as HTMLElement).style.marginTop = 'var(--s2)';
-    this.respawnBtn = el('button', 'ct-btn is-primary', btns, 'Respawn') as HTMLButtonElement;
+    this.respawnBtn = el('button', 'ct-btn is-primary', btns, t('deathRespawn')) as HTMLButtonElement;
     this.respawnBtn.onclick = () => this.onRespawn();
-    const hangar = el('button', 'ct-btn is-ghost', btns, 'Change aircraft');
+    const hangar = el('button', 'ct-btn is-ghost', btns, t('deathChangeAircraft'));
     hangar.onclick = () => this.onHangar();
 
     setClass(this.root, 'ct-hidden', true);
@@ -68,9 +69,9 @@ export class DeathScreen {
     this.timer = respawnSeconds;
     this.total = Math.max(0.001, respawnSeconds);
     this.ramp = 0;
-    setText(this.title, killer ? 'Shot down' : 'Destroyed');
-    setText(this.killerEl, killer || 'the ground');
-    setText(this.weaponEl, weapon || 'impact');
+    setText(this.title, killer ? t('deathShotDown') : t('deathDestroyed'));
+    setText(this.killerEl, killer || t('deathTheGround'));
+    setText(this.weaponEl, weapon || t('deathImpact'));
     setClass(this.root, 'ct-hidden', false);
     this.respawnBtn.disabled = respawnSeconds > 0;
   }
@@ -111,17 +112,17 @@ export class MatchEnd {
     this.root.id = 'ct-matchend';
     const box = el('div', '', this.root);
     (box as HTMLElement).style.textAlign = 'center';
-    this.result = el('div', 'ct-result is-win', box, 'Victory');
+    this.result = el('div', 'ct-result is-win', box, t('matchVictory'));
     this.detail = el('div', 'ct-sub', box, '');
     (this.detail as HTMLElement).style.marginTop = 'var(--s4)';
-    const btn = el('button', 'ct-btn is-primary', box, 'Continue');
+    const btn = el('button', 'ct-btn is-primary', box, t('matchContinue'));
     (btn as HTMLElement).style.marginTop = 'var(--s5)';
     btn.onclick = () => this.onContinue();
     setClass(this.root, 'ct-hidden', true);
   }
 
   show(win: boolean, detail: string): void {
-    setText(this.result, win ? 'Victory' : 'Defeat');
+    setText(this.result, win ? t('matchVictory') : t('matchDefeat'));
     setClass(this.result, 'is-win', win);
     setClass(this.result, 'is-lose', !win);
     setText(this.detail, detail);

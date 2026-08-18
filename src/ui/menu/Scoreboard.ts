@@ -1,4 +1,5 @@
 import { el, setText, setClass, setStyle, mmss } from '../dom';
+import { t } from '../../i18n';
 import type { PlayerInfo, EntityState } from '../../shared/protocol';
 import { aircraftByIndex } from '../../shared/aircraft';
 
@@ -45,7 +46,7 @@ export class Scoreboard {
     const sb = el('div', 'ct-sb ct-panel is-glass is-deep ct-hatch', this.root);
     const head = el('div', 'ct-sb-head', sb);
     const title = el('div', '', head);
-    el('div', 'ct-title', title, 'Scoreboard');
+    el('div', 'ct-title', title, t('scoreTitle'));
     this.mapName = el('div', 'ct-sub', title, '—');
     el('div', 'sp', head).style.flex = '1';
     const score = el('div', 'ct-sb-score', head);
@@ -55,15 +56,15 @@ export class Scoreboard {
     this.timer = el('div', 'ct-sub', head, '--:--');
 
     const teams = el('div', 'ct-sb-teams', sb);
-    for (const t of [0, 1]) {
-      const box = el('div', `ct-sb-team ${t === 0 ? 'is-ally' : 'is-enemy'}`, teams);
+    for (const teamIdx of [0, 1]) {
+      const box = el('div', `ct-sb-team ${teamIdx === 0 ? 'is-ally' : 'is-enemy'}`, teams);
       const hd = el('div', 'hd', box);
-      el('span', '', hd, t === 0 ? 'Allies' : 'Axis');
-      el('span', '', hd, 'Aircraft');
-      el('span', '', hd, 'K');
-      el('span', '', hd, 'D');
-      el('span', '', hd, 'Score');
-      el('span', '', hd, 'Ping');
+      el('span', '', hd, teamIdx === 0 ? t('scoreAllies') : t('scoreAxis'));
+      el('span', '', hd, t('colAircraft'));
+      el('span', '', hd, t('colKills'));
+      el('span', '', hd, t('colDeaths'));
+      el('span', '', hd, t('colScore'));
+      el('span', '', hd, t('colPing'));
       this.teamBoxes.push(box);
     }
     setClass(this.root, 'ct-hidden', true);

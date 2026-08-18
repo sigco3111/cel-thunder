@@ -1,4 +1,5 @@
 import { el, setText, setClass, setStyle, clamp } from '../dom';
+import { t } from '../../i18n';
 
 /**
  * Form controls, rebuilt from scratch.
@@ -62,10 +63,10 @@ export function toggle(
 ): { set: (v: boolean) => void } {
   const box = el('button', 'ct-toggle', parent);
   el('span', 'kn', box);
-  const lbl = el('span', 'lbl', box, value ? 'ON' : 'OFF');
+  const lbl = el('span', 'lbl', box, value ? t('toggleOn') : t('toggleOff'));
   const paint = (v: boolean) => {
     setClass(box, 'is-on', v);
-    setText(lbl, v ? 'ON' : 'OFF');
+    setText(lbl, v ? t('toggleOn') : t('toggleOff'));
   };
   paint(value);
   let v = value;

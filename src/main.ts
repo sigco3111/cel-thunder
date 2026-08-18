@@ -1,5 +1,7 @@
 import { Game } from './engine/Game';
 import type { Subsystem } from './engine/context';
+import { t } from './i18n';
+import { applyLocalizationToTheme } from './ui/theme';
 import { RenderSystem } from './render/RenderSystem';
 import { SkySystem } from './render/sky/SkySystem';
 import { WorldSystem } from './world/WorldSystem';
@@ -68,6 +70,10 @@ function faultInject<T extends Subsystem>(sys: T): T {
 
 async function main() {
   const container = document.getElementById('app')!;
+  // Activate the Korean theme labels BEFORE UiSystem or any UI module reads
+  // NATION_LABEL / ROLE_LABEL; theme.ts mutates those records in place and
+  // has already had its i18n dict installed by import time.
+  applyLocalizationToTheme();
   const game = new Game(container);
 
   // Published before init so the harness (and a human with devtools) can see a
@@ -114,7 +120,7 @@ async function main() {
   if (game.failedSubsystems.length) {
     const names = game.failedSubsystems.map((f) => f.name).join(', ');
     console.error(`[boot] running DEGRADED — skipped subsystem(s): ${names}`);
-    setProgress(1, `ready — skipped: ${names}`);
+    setProgress(1, t('bootReadySkipped', { names }));
     if (bootMsg) bootMsg.style.color = '#ffc247';
   }
 
@@ -130,7 +136,7 @@ main().catch((err) => {
   // canvas behind is not going to render anything useful.
   console.error('[boot] fatal', err);
   if (bootMsg) {
-    bootMsg.textContent = `failed: ${err?.message ?? err}`;
+    bootMsg.textContent = t('bootFailed', { msg: err?.message ?? err });
     bootMsg.style.color = '#ff6b6b';
   }
   // Still flip the flag: a harness blocked forever on '__ready' produces no

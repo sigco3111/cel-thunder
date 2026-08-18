@@ -1,4 +1,5 @@
 import { el, svg, setText, setStyle, setState, setClass, setAttr, setSvgTransform, clamp, fixed } from '../dom';
+import { t } from '../../i18n';
 import { gaugeState } from '../theme';
 import type { AmmoState } from '../Telemetry';
 
@@ -34,7 +35,7 @@ export class ThrottleBar {
 
   constructor(parent: HTMLElement) {
     this.root = el('div', 'ct-thr', parent);
-    el('span', 'k', this.root, 'THR');
+    el('span', 'k', this.root, t('hudThr'));
     const trk = el('div', 'trk', this.root);
     this.fil = el('i', 'fil', trk);
     el('i', 'wep', trk);
@@ -43,7 +44,7 @@ export class ThrottleBar {
 
   update(throttle: number, wep: boolean): void {
     setStyle(this.fil, 'transform', `scaleX(${clamp(throttle, 0, 1).toFixed(3)})`);
-    setText(this.val, wep ? 'WEP' : `${Math.round(throttle * 100)}%`);
+    setText(this.val, wep ? t('hudFlagWep') : `${Math.round(throttle * 100)}%`);
     setClass(this.root, 'is-wep', wep);
   }
 }
@@ -227,7 +228,7 @@ export class GMeter {
     svg('rect', { x: 26, y: 80, width: 48, height: 18, class: 'ct-gm-plate' }, s);
     this.val = svg('text', { x: 58, y: 94, 'text-anchor': 'end', class: 'ct-gm-val' }, s);
     const lbl = svg('text', { x: 61, y: 94, 'text-anchor': 'start', class: 'ct-gm-unit' }, s);
-    lbl.textContent = 'G';
+    lbl.textContent = t('hudGmUnit');
   }
 
   /** 'gLimit' paints the structural red arc from the spec. */
@@ -243,7 +244,7 @@ export class GMeter {
     // of the scale it reads as an over-range chevron, which is unambiguous and
     // cannot be mistaken for a live number.
     const over = g > GMeter.G1 ? 1 : g < GMeter.G0 ? -1 : 0;
-    setText(this.val, over > 0 ? '›12' : over < 0 ? '‹−5' : fixed(g, 1));
+    setText(this.val, over > 0 ? t('hudOverPositive') : over < 0 ? t('hudOverNegative') : fixed(g, 1));
 
     // One threshold for the figure and the arc: amber from 85 % of the
     // structural limit, red at the limit — the point where the arc turns red.

@@ -76,6 +76,21 @@ export const NATION_LABEL: Record<string, string> = {
   japan: 'Japan',
 };
 
+/**
+ * Mirror of NATION_LABEL in Korean. Both tables are exported so other modules
+ * can pick the right label by language without having to thread t() through
+ * every render site. The Hungarian-physics-style update below mutates
+ * NATION_LABEL / ROLE_LABEL in place once Korean is active, which lets the
+ * existing call sites — NATION_LABEL[spec.nation] — Just Work.
+ */
+const NATION_LABEL_KO: Record<string, string> = {
+  britain: '영국',
+  usa: '미국',
+  ussr: '소련',
+  germany: '독일',
+  japan: '일본',
+};
+
 export const ROLE_LABEL: Record<string, string> = {
   fighter: 'Fighter',
   interceptor: 'Interceptor',
@@ -83,6 +98,22 @@ export const ROLE_LABEL: Record<string, string> = {
   'boom-and-zoom': 'Energy Fighter',
   turnfighter: 'Turn Fighter',
 };
+
+const ROLE_LABEL_KO: Record<string, string> = {
+  fighter: '전투기',
+  interceptor: '요격기',
+  attacker: '공격기',
+  'boom-and-zoom': '에너지 전투기',
+  turnfighter: '선회 전투기',
+};
+
+/** Apply localisation to the live NATION_LABEL / ROLE_LABEL dictionaries. */
+export function applyLocalizationToTheme(): void {
+  const lang = (globalThis as unknown as { __currentLang?: string }).__currentLang;
+  if (lang !== 'ko') return;
+  for (const key of Object.keys(NATION_LABEL)) NATION_LABEL[key] = NATION_LABEL_KO[key];
+  for (const key of Object.keys(ROLE_LABEL)) ROLE_LABEL[key] = ROLE_LABEL_KO[key];
+}
 
 /**
  * Maps a 0..1 "badness" value to the ok → warn → danger ramp used by every

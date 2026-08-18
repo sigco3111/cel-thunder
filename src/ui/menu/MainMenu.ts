@@ -1,4 +1,5 @@
 import { el, setText, setClass, clamp } from '../dom';
+import { t } from '../../i18n';
 import { makeEmblem } from './Emblem';
 
 export interface MenuItem {
@@ -32,11 +33,11 @@ export class MainMenu {
     const row = el('div', 'ct-brand-row', brand);
     makeEmblem(row);
     const word = el('div', 'ct-word', row);
-    el('span', 'l1', word, 'Cel');
-    el('span', 'l2', word, 'Thunder');
+    el('span', 'l1', word, t('brandCel'));
+    el('span', 'l2', word, t('brandThunder'));
     const tag = el('div', 'ct-tagline', brand);
     el('i', 'dash', tag);
-    el('span', '', tag, 'Aerial combat · 1939–1945');
+    el('span', '', tag, t('brandTagline'));
 
     const nav = el('nav', 'ct-nav', this.root);
     defs.forEach((def, i) => {
@@ -51,11 +52,11 @@ export class MainMenu {
 
     const side = el('aside', 'ct-menu-side ct-panel is-glass ct-hatch', this.root);
     const head = el('div', 'ct-head', side);
-    el('span', '', head, 'Situation');
+    el('span', '', head, t('sideSituation'));
     el('span', 'ct-head-rule', head);
     for (const [k, label] of [
-      ['server', 'Server'], ['map', 'Theatre'], ['players', 'Pilots'],
-      ['team', 'Assignment'], ['aircraft', 'Selected'], ['ping', 'Latency'],
+      ['server', t('sideServer')], ['map', t('sideTheatre')], ['players', t('sidePilots')],
+      ['team', t('sideAssignment')], ['aircraft', t('sideSelected')], ['ping', t('sideLatency')],
     ] as [string, string][]) {
       const row2 = el('div', 'ct-kv', side);
       el('span', 'k', row2, label);
@@ -63,9 +64,9 @@ export class MainMenu {
     }
 
     const foot = el('div', 'ct-foot', this.root);
-    el('span', '', foot, 'CEL THUNDER · BUILD 1.0');
+    el('span', '', foot, t('menuBuild'));
     el('span', 'sp', foot);
-    el('span', '', foot, '↑↓ NAVIGATE · ENTER SELECT');
+    el('span', '', foot, t('menuNavHint'));
 
     this.select(0);
   }
@@ -115,7 +116,7 @@ export class PauseMenu {
     this.root.id = 'ct-pause';
     const card = el('div', 'ct-pause-card ct-panel is-glass is-deep ct-hatch', this.root);
     const head = el('div', 'ct-head', card);
-    el('span', '', head, 'Paused');
+    el('span', '', head, t('pausePaused'));
     el('span', 'ct-head-rule', head);
 
     defs.forEach((def, i) => {

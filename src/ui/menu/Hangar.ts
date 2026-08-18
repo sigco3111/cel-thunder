@@ -1,4 +1,5 @@
 import { el, setText, setClass, setStyle, clamp, fixed, int } from '../dom';
+import { t } from '../../i18n';
 import {
   AIRCRAFT, AIRCRAFT_BY_ID, CLEAN_LOADOUT, loadoutMass, loadoutsFor, nationTeam,
   type AircraftSpec, type Loadout, type Nation,
@@ -16,8 +17,6 @@ export function airframesForTeam(team: number): AircraftSpec[] {
   const list = AIRCRAFT.filter((a) => nationTeam(a.nation) === team);
   return list.length ? list : AIRCRAFT.slice(0, 1);
 }
-
-const TEAM_NAME = ['ALLIED', 'AXIS'];
 
 interface StatRow {
   key: string;
@@ -81,10 +80,10 @@ export class Hangar {
 
     // --- top bar ----------------------------------------------------------
     const top = el('div', 'ct-topbar', this.root);
-    el('div', 'ct-title', top, 'Hangar');
-    el('div', 'ct-sub', top, '// SELECT AIRCRAFT');
+    el('div', 'ct-title', top, t('hangarTitle'));
+    el('div', 'ct-sub', top, t('hangarSelect'));
     el('div', 'sp', top);
-    const back = el('button', 'ct-btn is-ghost is-sm', top, 'Back');
+    const back = el('button', 'ct-btn is-ghost is-sm', top, t('hangarBack'));
     back.onclick = () => this.onBack();
     el('div', 'ct-rule', this.root);
 
@@ -95,7 +94,7 @@ export class Hangar {
     (left as HTMLElement).style.display = 'flex';
     (left as HTMLElement).style.flexDirection = 'column';
     const lh = el('div', 'ct-head', left);
-    el('span', '', lh, 'Roster');
+    el('span', '', lh, t('hangarRoster'));
     el('span', 'ct-head-rule', lh);
     // Which side the player is on, stated where the aircraft are chosen. A
     // pilot who does not know whether they are Allied or Axis cannot read a
@@ -106,7 +105,7 @@ export class Hangar {
     for (const n of NATIONS) {
       const b = el('button', 'ct-nation', nations);
       if (n !== 'all') makeRoundel(b, n);
-      el('span', '', b, n === 'all' ? 'ALL' : n.slice(0, 3).toUpperCase());
+      el('span', '', b, n === 'all' ? t('hangarAll') : n.slice(0, 3).toUpperCase());
       b.onclick = () => this.setFilter(n);
       this.nationBtns.set(n, b);
     }
@@ -125,18 +124,18 @@ export class Hangar {
     // --- right: stat card -------------------------------------------------
     const card = el('div', 'ct-statcard ct-panel is-glass ct-hatch', body);
     const ch = el('div', 'ct-head', card);
-    el('span', '', ch, 'Performance');
+    el('span', '', ch, t('hangarPerformance'));
     el('span', 'ct-head-rule', ch);
-    el('span', 'ct-head-aux', ch, 'VS ROSTER');
+    el('span', 'ct-head-aux', ch, t('hangarVsRoster'));
 
     const statsBox = el('div', 'ct-stats ct-scroll', card);
     const defs: [string, string][] = [
-      ['topSpeed', 'Max speed'],
-      ['climb', 'Rate of climb'],
-      ['turnTime', 'Turn time'],
-      ['rollRate', 'Roll rate'],
-      ['firepower', 'Firepower'],
-      ['survivability', 'Survivability'],
+      ['topSpeed', t('statMaxSpeed')],
+      ['climb', t('statClimb')],
+      ['turnTime', t('statTurnTime')],
+      ['rollRate', t('statRollRate')],
+      ['firepower', t('statFirepower')],
+      ['survivability', t('statSurvivability')],
     ];
     for (const [key, label] of defs) {
       const s = el('div', 'ct-stat', statsBox);
@@ -150,8 +149,8 @@ export class Hangar {
     const grid = el('div', '', statsBox);
     (grid as HTMLElement).style.marginTop = 'var(--s2)';
     for (const [k, label] of [
-      ['wingLoading', 'Wing loading'], ['powerToWeight', 'Power / weight'],
-      ['stallSpeed', 'Stall speed'], ['ceiling', 'Service ceiling'],
+      ['wingLoading', t('statWingLoading')], ['powerToWeight', t('statPowerWeight')],
+      ['stallSpeed', t('statStallSpeed')], ['ceiling', t('statCeiling')],
     ] as [string, string][]) {
       const row = el('div', 'ct-kv', grid);
       el('span', 'k', row, label);
@@ -159,7 +158,7 @@ export class Hangar {
     }
 
     const ah = el('div', 'ct-head', card);
-    el('span', '', ah, 'Armament');
+    el('span', '', ah, t('hangarArmament'));
     el('span', 'ct-head-rule', ah);
     this.arms = el('div', 'ct-arms', card);
 
@@ -168,7 +167,7 @@ export class Hangar {
     // two 250 lb bombs is thirty km/h slower and cannot fight until it has
     // dropped them, so the trade has to be made here rather than assumed.
     const loh = el('div', 'ct-head', card);
-    el('span', '', loh, 'Loadout');
+    el('span', '', loh, t('hangarLoadout'));
     el('span', 'ct-head-rule', loh);
     this.loadoutRow = el('div', 'ct-liveries ct-panel is-flat', card);
     (this.loadoutRow as HTMLElement).style.flexWrap = 'wrap';
@@ -180,16 +179,16 @@ export class Hangar {
     (this.loadoutNote as HTMLElement).style.letterSpacing = '.02em';
 
     const nh = el('div', 'ct-head', card);
-    el('span', '', nh, 'Doctrine');
+    el('span', '', nh, t('hangarDoctrine'));
     el('span', 'ct-head-rule', nh);
     this.notes = el('div', 'ct-notes', card);
 
     const br = el('div', 'ct-brbadge', card);
-    el('span', 'k', br, 'Battle rating');
+    el('span', 'k', br, t('hangarBattleRating'));
     this.brEl = el('span', 'v', br, '—');
 
     const deploy = el('div', 'ct-deploy', card);
-    this.deployBtn = el('button', 'ct-btn is-primary', deploy, 'Deploy') as HTMLButtonElement;
+    this.deployBtn = el('button', 'ct-btn is-primary', deploy, t('hangarDeploy')) as HTMLButtonElement;
     this.deployBtn.onclick = () => this.onDeploy(this.selected, this.livery, this.loadout.id);
 
     // Seeds the roster; 'setTeam' is called again for real as soon as the
@@ -209,18 +208,18 @@ export class Hangar {
    * whole mechanism exists to prevent.
    */
   setTeam(team: number): void {
-    const t = team === 1 ? 1 : 0;
-    if (t === this.team && this.rows.length) return;
-    this.team = t;
-    setText(this.sideEl, `${TEAM_NAME[t]} FORCES`);
+    const teamIdx = team === 1 ? 1 : 0;
+    if (teamIdx === this.team && this.rows.length) return;
+    this.team = teamIdx;
+    setText(this.sideEl, t(teamIdx === 0 ? 'hangarAlliedForces' : 'hangarAxisForces'));
     // A nation tab for a side you are not on filters the list down to nothing.
     for (const [n, b] of this.nationBtns) {
       setStyle(b, 'display',
-        n === 'all' || nationTeam(n as Nation) === t ? '' : 'none');
+        n === 'all' || nationTeam(n as Nation) === teamIdx ? '' : 'none');
     }
     this.buildList();
     // Whatever was selected may belong to the other side now.
-    const allowed = airframesForTeam(t);
+    const allowed = airframesForTeam(teamIdx);
     if (!allowed.includes(this.selected)) this.selected = allowed[0];
     this.setFilter(allowed.some((a) => a.nation === this.filter) ? this.filter : 'all');
   }
@@ -292,21 +291,21 @@ export class Hangar {
     while (this.arms.firstChild) this.arms.removeChild(this.arms.firstChild);
     for (const g of spec.guns) {
       const row = el('div', 'ct-arm', this.arms);
-      el('span', 'cal', row, `${g.count}×${fixed(g.calibre, g.calibre % 1 ? 1 : 0)}mm`);
+      el('span', 'cal', row, t('ammoPrefix', { count: g.count, cal: fixed(g.calibre, g.calibre % 1 ? 1 : 0) }));
       el('span', 'nm', row, g.name.replace(/^[\d.]+\s*mm\s*/i, ''));
-      el('span', 'am', row, `${g.ammo * g.count} rds · ${g.rpm} rpm`);
+      el('span', 'am', row, t('ammoRdsRpm', { rds: g.ammo * g.count, rpm: g.rpm }));
     }
     if (spec.bombs) {
       const row = el('div', 'ct-arm', this.arms);
-      el('span', 'cal', row, `${spec.bombs.count}×`);
+      el('span', 'cal', row, t('ammoPrefixSimple', { count: spec.bombs.count }));
       el('span', 'nm', row, spec.bombs.name);
-      el('span', 'am', row, `${spec.bombs.kg} kg`);
+      el('span', 'am', row, t('bombKg', { kg: spec.bombs.kg }));
     }
     if (spec.rockets) {
       const row = el('div', 'ct-arm', this.arms);
-      el('span', 'cal', row, `${spec.rockets.count}×`);
+      el('span', 'cal', row, t('ammoPrefixSimple', { count: spec.rockets.count }));
       el('span', 'nm', row, spec.rockets.name);
-      el('span', 'am', row, `${spec.rockets.kg} kg`);
+      el('span', 'am', row, t('bombKg', { kg: spec.rockets.kg }));
     }
 
     this.buildLoadouts(spec);
@@ -327,27 +326,27 @@ export class Hangar {
     const lines: [string, string][] = [];
 
     const critKm = (spec.engine.critAlt / 1000).toFixed(1);
-    lines.push(['Best altitude', `Peak power at ${critKm} km; power falls away above it.`]);
+    lines.push([t('noteBestAltitudeTitle'), t('noteBestAltitudeBody', { alt: critKm })]);
 
     if (p.turnTime < 15.5) {
-      lines.push(['Turn fight', 'Out-turns most of the roster — force the merge and stay in the horizontal.']);
+      lines.push([t('noteTurnFightTitle'), t('noteTurnFightBody')]);
     } else if (p.topSpeed * 3.6 > 700) {
-      lines.push(['Energy fight', 'Dive, fire, climb away. Do not follow a turn fighter into the horizontal.']);
+      lines.push([t('noteEnergyFightTitle'), t('noteEnergyFightBody')]);
     } else {
-      lines.push(['Mixed', 'Comfortable in both planes of manoeuvre; fight whichever the enemy is worse at.']);
+      lines.push([t('noteMixedTitle'), t('noteMixedBody')]);
     }
 
     const cannon = spec.guns.some((g) => g.calibre >= 20);
-    lines.push(['Guns', cannon
-      ? 'Cannon armament — short bursts inside 400 m are decisive.'
-      : 'Rifle- and heavy-calibre MGs — sustained fire, aim for the engine and pilot.']);
+    lines.push([t('noteGunsTitle'), cannon
+      ? t('noteGunsCannon')
+      : t('noteGunsRifle')]);
 
     if (spec.aero.vne < 200) {
-      lines.push(['Limits', `Airframe is fragile in the dive — ${Math.round(spec.aero.vne * 3.6)} km/h never-exceed.`]);
+      lines.push([t('noteLimitsTitle'), t('noteLimitsDive', { vne: Math.round(spec.aero.vne * 3.6) })]);
     } else if (spec.damage.armour.pilotBack < 6) {
-      lines.push(['Limits', 'Light armour and no self-sealing margin — avoid head-ons.']);
+      lines.push([t('noteLimitsTitle'), t('noteLimitsLight')]);
     } else {
-      lines.push(['Limits', `Structural limit ${spec.aero.gLimit.toFixed(1)} g; strong airframe.`]);
+      lines.push([t('noteLimitsTitle'), t('noteLimitsStructure', { gLim: spec.aero.gLimit.toFixed(1) })]);
     }
 
     for (const [k, v] of lines) {
@@ -381,18 +380,18 @@ export class Hangar {
       };
     }
     if (options.length <= 1) {
-      setText(this.loadoutNote, 'No external hardpoints — guns only.');
+      setText(this.loadoutNote, t('hangarNoHardpoints'));
       return;
     }
     const kg = loadoutMass(this.loadout);
     setText(this.loadoutNote, kg > 0
-      ? `+${int(kg)} kg of stores — slower, heavier and less manoeuvrable until they are gone.`
-      : 'Clean — full fighter performance.');
+      ? t('hangarStoresLoaded', { kg: int(kg) })
+      : t('hangarClean'));
   }
 
   private buildLiveries(spec: AircraftSpec): void {
     while (this.liveryRow.firstChild) this.liveryRow.removeChild(this.liveryRow.firstChild);
-    el('span', 'ct-label', this.liveryRow, 'Livery');
+    el('span', 'ct-label', this.liveryRow, t('hangarLivery'));
     const hexes = (v: number) => `#${(v >>> 0).toString(16).padStart(6, '0')}`;
     for (let i = 0; i < 3; i++) {
       const sw = el('button', 'ct-livery', this.liveryRow);
@@ -409,7 +408,7 @@ export class Hangar {
       };
     }
     el('span', 'sp', this.liveryRow).style.flex = '1';
-    const hint = el('span', 'ct-label', this.liveryRow, 'DRAG TO ORBIT · SCROLL TO ZOOM');
+    const hint = el('span', 'ct-label', this.liveryRow, t('hangarOrbitHint'));
     hint.style.opacity = '0.6';
   }
 

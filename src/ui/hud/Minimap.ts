@@ -1,4 +1,5 @@
 import { el, setText, clamp } from '../dom';
+import { t } from '../../i18n';
 import { COLORS } from '../theme';
 import { DamageBits, EntityKind, type EntityState } from '../../shared/protocol';
 import { hash2 } from '../../shared/math';
@@ -83,7 +84,7 @@ export class Minimap {
     this.root.id = 'ct-minimap';
 
     const head = el('div', 'ct-head', this.root);
-    el('span', '', head, 'TACTICAL');
+    el('span', '', head, t('hudTactical'));
     el('span', 'ct-head-rule', head);
     const zoomBox = el('div', 'ct-mm-zoom', head);
     const zOut = el('button', '', zoomBox, '−');
