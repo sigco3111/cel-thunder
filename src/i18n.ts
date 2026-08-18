@@ -378,6 +378,27 @@ export const EN: Record<string, string> = {
   roleAttacker: 'Attacker',
   roleBoomZoom: 'Energy Fighter',
   roleTurnFighter: 'Turn Fighter',
+
+  // --- pointer lock prompts (Mouse.ts) -----------------------------------
+  lockInviteTitle: 'Click anywhere to take the controls',
+  lockInviteBody: 'The mouse aims the aeroplane · Esc releases it',
+  lockFocusTitle: 'Click the game window, then click again',
+  lockFocusBody: 'The browser will only capture the mouse for a focused window',
+  lockDeniedTitle: 'This browser will not capture the mouse',
+  lockDeniedBody: 'Aim with the cursor — the edge of the window is full deflection',
+
+  // --- post-spawn objective brief (UiSystem.ts) ---------------------------
+  briefNoContacts: 'No contacts — steer for the marked airfields',
+  briefHostiles: 'Hostiles bearing {deg}° · {km} km — marked in red',
+
+  // --- damage notices (UiSystem.ts) --------------------------------------
+  dmgEngine: 'Engine damaged',
+  dmgWing: 'Wing failure',
+  dmgControls: 'Controls severed',
+  dmgPilot: 'Pilot wounded',
+  dmgFuel: 'Fuel leak',
+  dmgOil: 'Oil leak',
+  dmgAirframe: 'Airframe damaged',
 };
 
 export const KO: Record<string, string> = {
@@ -739,6 +760,27 @@ export const KO: Record<string, string> = {
   roleAttacker: '공격기',
   roleBoomZoom: '에너지 전투기',
   roleTurnFighter: '선회 전투기',
+
+  // --- pointer lock prompts (Mouse.ts) -----------------------------------
+  lockInviteTitle: '어디든 클릭해서 조종을 시작하세요',
+  lockInviteBody: '마우스로 기체를 조준합니다 · Esc로 마우스를 놓습니다',
+  lockFocusTitle: '게임 창을 한 번 클릭한 뒤 다시 클릭하세요',
+  lockFocusBody: '브라우저는 포커스를 받은 창에서만 마우스를 잡습니다',
+  lockDeniedTitle: '이 브라우저는 마우스를 잡을 수 없습니다',
+  lockDeniedBody: '커서로 조준합니다 — 창 가장자리가 최대 조준 범위입니다',
+
+  // --- post-spawn objective brief (UiSystem.ts) ---------------------------
+  briefNoContacts: '적 없음 — 표시된 비행장으로 이동하세요',
+  briefHostiles: '적 {deg}° 방향 · {km} km 거리 — 빨간색으로 표시',
+
+  // --- damage notices (UiSystem.ts) --------------------------------------
+  dmgEngine: '엔진 손상',
+  dmgWing: '날개 파손',
+  dmgControls: '조종 장치 손상',
+  dmgPilot: '조종사 부상',
+  dmgFuel: '연료 누출',
+  dmgOil: '오일 누출',
+  dmgAirframe: '기체 손상',
 };
 
 /**

@@ -762,17 +762,16 @@ export class UiSystem implements Subsystem {
       if (d < bestD) { bestD = d; best = e; }
     }
     if (!best) {
-      this.notice('No contacts — steer for the marked airfields', '', 6, 'brief');
+      this.notice(t('briefNoContacts'), '', 6, 'brief');
       return;
     }
     // Compass bearing to the contact: +Z is north in this world, and 'atan2(x, z)'
     // is what the HUD's own compass uses, so the number the player is told
     // matches the number on the tape.
     const brg = ((Math.atan2(best.px - me.px, best.pz - me.pz) * 180) / Math.PI + 360) % 360;
-    this.notice(
-      `Hostiles bearing ${Math.round(brg).toString().padStart(3, '0')}° · ${(bestD / 1000).toFixed(1)} km — marked in red`,
-      '', 7, 'brief',
-    );
+    const deg = Math.round(brg).toString().padStart(3, '0');
+    const km = (bestD / 1000).toFixed(1);
+    this.notice(t('briefHostiles', { deg, km }), '', 7, 'brief');
   }
 
   private onDeath(killer: string, weapon: string): void {
@@ -1187,14 +1186,14 @@ export class UiSystem implements Subsystem {
     // different words is the kind of duplicated chrome that makes a HUD read as
     // assembled rather than designed.
     if (added & DamageBits.EngineFire) { /* covered by #ct-firewarn */ }
-    else if (added & DamageBits.Engine) this.notice('Engine damaged', 'danger', 3, 'dmg-eng');
-    else if (added & DamageBits.WingRipped) this.notice('Wing failure', 'danger', 3, 'dmg-wing');
-    else if (added & DamageBits.ControlsSevered) this.notice('Controls severed', 'danger', 3, 'dmg-ctl');
-    else if (added & DamageBits.PilotHit) this.notice('Pilot wounded', 'danger', 3, 'dmg-pilot');
-    else if (added & DamageBits.FuelLeak) this.notice('Fuel leak', 'warn', 3, 'dmg-fuel');
-    else if (added & DamageBits.OilLeak) this.notice('Oil leak', 'warn', 3, 'dmg-oil');
+    else if (added & DamageBits.Engine) this.notice(t('dmgEngine'), 'danger', 3, 'dmg-eng');
+    else if (added & DamageBits.WingRipped) this.notice(t('dmgWing'), 'danger', 3, 'dmg-wing');
+    else if (added & DamageBits.ControlsSevered) this.notice(t('dmgControls'), 'danger', 3, 'dmg-ctl');
+    else if (added & DamageBits.PilotHit) this.notice(t('dmgPilot'), 'danger', 3, 'dmg-pilot');
+    else if (added & DamageBits.FuelLeak) this.notice(t('dmgFuel'), 'warn', 3, 'dmg-fuel');
+    else if (added & DamageBits.OilLeak) this.notice(t('dmgOil'), 'warn', 3, 'dmg-oil');
     else if (added & (DamageBits.LeftWing | DamageBits.RightWing | DamageBits.Tail)) {
-      this.notice('Airframe damaged', 'warn', 2, 'dmg-frame');
+      this.notice(t('dmgAirframe'), 'warn', 2, 'dmg-frame');
     }
   }
 

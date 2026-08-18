@@ -1,3 +1,5 @@
+import { t } from '../../i18n';
+
 /**
  * Mouse device + pointer-lock flow.
  *
@@ -438,7 +440,7 @@ export class Mouse {
       'backdrop-filter:blur(4px)',
       'white-space:nowrap',
     ].join(';');
-    el.innerHTML = PROMPT_INVITE;
+    el.innerHTML = PROMPT_INVITE();
     document.body.appendChild(el);
     this.prompt = el;
     this.syncPrompt();
@@ -470,9 +472,9 @@ export class Mouse {
     if (mode !== this.promptMode) {
       this.promptMode = mode;
       if (mode) {
-        this.prompt.innerHTML = mode === 'denied' ? PROMPT_DENIED
-          : mode === 'focus' ? PROMPT_FOCUS
-            : PROMPT_INVITE;
+        this.prompt.innerHTML = mode === 'denied' ? PROMPT_DENIED()
+          : mode === 'focus' ? PROMPT_FOCUS()
+            : PROMPT_INVITE();
       }
     }
     const useful = mode !== '';
@@ -506,29 +508,34 @@ const DENY_AFTER = 2;
 
 const PROMPT_SUB = 'style="opacity:.62;font-weight:500;font-size:12.5px;letter-spacing:.02em"';
 
+/** Helper: build the lock prompt HTML, with the title and body translated via i18n. */
+function buildPrompt(titleKey: string, bodyKey: string, titleColor: string): string {
+  return (
+    `<i class="ct-lp-ring"></i>`
+    + `<i class="ct-lp-mouse"></i>`
+    + `<span><b style="color:${titleColor};font-weight:700">${t(titleKey)}</b>`
+    + `<br><span ${PROMPT_SUB}>${t(bodyKey)}</span></span>`
+  );
+}
+
 /** The normal case: capture is available and the player has not taken it. */
-const PROMPT_INVITE =
-  '<i class="ct-lp-ring"></i>'
-  + '<i class="ct-lp-mouse"></i>'
-  + '<span><b style="color:#ffcf6b;font-weight:700">Click anywhere to take the controls</b>'
-  + `<br><span ${PROMPT_SUB}>The mouse aims the aeroplane · Esc releases it</span></span>`;
+function PROMPT_INVITE(): string {
+  return buildPrompt('lockInviteTitle', 'lockInviteBody', '#ffcf6b');
+}
 
 /**
  * The browser refused, and the window did not have focus when it did. Keeps the
  * ring: there IS something to click and clicking it will very probably work.
  */
-const PROMPT_FOCUS =
-  '<i class="ct-lp-ring"></i>'
-  + '<i class="ct-lp-mouse"></i>'
-  + '<span><b style="color:#ffcf6b;font-weight:700">Click the game window, then click again</b>'
-  + `<br><span ${PROMPT_SUB}>The browser will only capture the mouse for a focused window</span></span>`;
+function PROMPT_FOCUS(): string {
+  return buildPrompt('lockFocusTitle', 'lockFocusBody', '#ffcf6b');
+}
 
 /**
  * The browser has refused pointer lock. No ring — there is nothing to click,
  * and an animated call to action that cannot be satisfied is just a nag.
  */
-const PROMPT_DENIED =
-  '<i class="ct-lp-mouse"></i>'
-  + '<span><b style="color:#eef4fb;font-weight:700">This browser will not capture the mouse</b>'
-  + `<br><span ${PROMPT_SUB}>Aim with the cursor — the edge of the window is full deflection</span></span>`;
+function PROMPT_DENIED(): string {
+  return buildPrompt('lockDeniedTitle', 'lockDeniedBody', '#eef4fb');
+}
 
