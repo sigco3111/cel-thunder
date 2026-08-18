@@ -1,0 +1,2 @@
+import{t as e}from"./rolldown-runtime-DK3Fl9T5.js";var t=e({DG_BODY:()=>5,DG_FIN:()=>4,DG_NONE:()=>0,DG_TAIL:()=>3,DG_WING_L:()=>1,DG_WING_R:()=>2,G0:()=>n,GAMMA:()=>s,MAX_SUBSTEP:()=>c,P0:()=>i,RHO0:()=>r,R_AIR:()=>o,SURFACE_PAVED:()=>0,SURFACE_SOFT:()=>1,SURFACE_WATER:()=>2,T0:()=>a}),n=9.80665,r=1.225,i=101325,a=288.15,o=287.05287,s=1.4,c=1/180,l=0,u=1,d=2,f=0,p=1,m=2,h=3,g=4,_=5;export{t as _,p as a,s as c,r as d,o as f,a as g,d as h,h as i,c as l,u as m,g as n,m as o,l as p,f as r,n as s,_ as t,i as u};
+//# sourceMappingURL=types-dXrlOY-M.js.map

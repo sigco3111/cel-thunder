@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>셀 썬더</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0d12; }
+      body { font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif; }
+      #app { position: fixed; inset: 0; }
+      canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+      #ui { position: fixed; inset: 0; pointer-events: none; }
+      #boot {
+        position: fixed; inset: 0; display: grid; place-items: center;
+        background: radial-gradient(120% 90% at 50% 20%, #1b2b3f 0%, #0a0d12 70%);
+        color: #e8eef5; z-index: 100; transition: opacity .6s ease;
+      }
+      #boot .title {
+        font-size: clamp(38px, 9vw, 104px); font-weight: 900; letter-spacing: .12em;
+        text-shadow: 0 0 30px rgba(120,190,255,.35); margin-bottom: 18px;
+      }
+      #boot .bar { width: min(420px, 70vw); height: 4px; background: #1e2a38; border-radius: 2px; overflow: hidden; }
+      #boot .bar > i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg,#4fa8ff,#8ee6ff); transition: width .25s ease; }
+      #boot .msg { margin-top: 12px; font-size: 13px; opacity: .65; letter-spacing: .08em; }
+    </style>
+    <script type="module" crossorigin src="/cel-thunder/assets/index-D8kL7gzu.js"></script>
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/rolldown-runtime-DK3Fl9T5.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/three-DX5A0S2e.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/CelMaterial-CVwppb4H.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/math-CPw-iUmK.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/heightfield-Bq8ZrAGy.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/terrainMaterial-BVXvnx3L.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/prepassMaterial-tyYm_pPR.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/TerrainTextures-K2zdKyc_.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/TerrainRenderer-C2rz1pAJ.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/Water-BSAIvkLe.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/buildUtils-CRVqQINS.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/Vegetation-DfQZyiSw.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/Airfield-Bzsa9MO2.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/groundSites-CbXoqaCs.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/GroundTargets-CuhcGB6X.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/protocol-DoJ3XSzW.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/aircraft-lpcnR_gq.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/atlas-gp-Ak6M5.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/geom-CpSTL5IP.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/fuselage-BqUyaGfP.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/canopy-CoLj7KzN.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/cockpit-Dbn53sEO.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/naca-D1HPdVYJ.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/wing-qd4S7WlG.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/propeller-a76UQlq0.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/gear-IzJye4mb.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/details-DZY2ZZ6N.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/ordnance-CX5fzsFJ.js">
+    <link rel="modulepreload" crossorigin href="/cel-thunder/assets/build-DShZ96_g.js">
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="ui"></div>
+    <div id="boot">
+      <div style="display:grid;place-items:center">
+        <div class="title">셀 썬더</div>
+        <div class="bar"><i id="boot-bar"></i></div>
+        <div class="msg" id="boot-msg">초기화 중…</div>
+      </div>
+    </div>
+  </body>
+</html>

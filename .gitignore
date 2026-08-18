@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.aider*
+.omo/
+.DS_Store
